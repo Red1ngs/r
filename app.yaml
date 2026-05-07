@@ -8,13 +8,13 @@ reader:
   
   reward_slots:
     - name: "scroll"
-      daily_limit: 5
+      daily_limit: 20
       interval_seconds: 3600.0  # 1 година
       reward_keys: ["scroll", "rank", "is_blessed"]
 
     - name: "card"
       daily_limit: 10
-      interval_seconds: 5400.0  # 1.5 години 
+      interval_seconds: 5400.0  # 1 година
       reward_keys: ["id", "name", "image"]
 
   parsing:

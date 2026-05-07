@@ -1,21 +1,15 @@
 """
 InventoryStore — зберігає і завантажує Inventories з БД.
-
-Кожен тип інвентаря — окремий рядок в таблиці inventory (account_id, kind).
-Статистика PersonalInventory — окремі колонки в таблиці accounts.
 """
 from __future__ import annotations
 
 import json
 import logging
 import sqlite3
+from typing import Any
 
-from src.core.inventory.model import (
-    INVENTORY_REGISTRY,
-    BaseInventory,
-    Inventories,
-    PersonalInventory,
-)
+from src.core.inventory.factory import inventory_factory
+from src.core.inventory.model import BaseInventory, DynamicInventories
 
 log = logging.getLogger(__name__)
 
@@ -29,50 +23,59 @@ class InventoryStore:
     # Завантаження
     # ------------------------------------------------------------------
 
-    def load(self) -> Inventories:
-        inventories = Inventories()
+    def load(self) -> DynamicInventories:
+        inventories = inventory_factory.build()
+        registry    = inventory_factory.registry
 
-        # Статистика з accounts → PersonalInventory
-        row = self._conn.execute(
-            "SELECT comments_written, trades_accepted, trades_declined "
-            "FROM accounts WHERE id = ?",
-            (self._account_id,),
-        ).fetchone()
-        if row:
-            inventories.personal.comments_written = row["comments_written"]
-            inventories.personal.trades_accepted  = row["trades_accepted"]
-            inventories.personal.trades_declined  = row["trades_declined"]
+        # Статистика → PersonalInventory
+        personal_entry = registry.get("personal")
+        if personal_entry is not None:
+            personal_attr, _ = personal_entry
+            personal = getattr(inventories, personal_attr, None)
+            if personal is not None:
+                row = self._conn.execute(
+                    "SELECT comments_written, trades_accepted, trades_declined "
+                    "FROM accounts WHERE id = ?",
+                    (self._account_id,),
+                ).fetchone()
+                if row:
+                    personal.comments_written = row["comments_written"]
+                    personal.trades_accepted  = row["trades_accepted"]
+                    personal.trades_declined  = row["trades_declined"]
 
-        # JSON-дані для кожного зареєстрованого типу
+        # JSON-дані для кожного зареєстрованого kind
         rows = self._conn.execute(
             "SELECT kind, data FROM inventory WHERE account_id = ?",
             (self._account_id,),
         ).fetchall()
 
         for row in rows:
-            entry = INVENTORY_REGISTRY.get(row["kind"])
+            entry = registry.get(row["kind"])
             if entry is None:
                 continue
             attr, _ = entry
             inv: BaseInventory = getattr(inventories, attr)
             inv.data = json.loads(row["data"])
 
-        # Незакриті trade-події
-        trade_rows = self._conn.execute(
-            "SELECT payload FROM events "
-            "WHERE account_id = ? AND kind = 'trade' AND status = 'pending' "
-            "ORDER BY created_at",
-            (self._account_id,),
-        ).fetchall()
-        inventories.personal.pending_trades = [
-            json.loads(r["payload"]) for r in trade_rows
-        ]
-
-        if inventories.personal.pending_trades:
-            log.info(
-                f"[{self._account_id}] Відновлено "
-                f"{len(inventories.personal.pending_trades)} незакритих заявок"
-            )
+        # Незакриті trade-події → PersonalInventory.pending_trades
+        if personal_entry is not None:
+            personal_attr, _ = personal_entry
+            personal = getattr(inventories, personal_attr, None)
+            if personal is not None:
+                trade_rows = self._conn.execute(
+                    "SELECT payload FROM events "
+                    "WHERE account_id = ? AND kind = 'trade' AND status = 'pending' "
+                    "ORDER BY created_at",
+                    (self._account_id,),
+                ).fetchall()
+                personal.pending_trades = [
+                    json.loads(r["payload"]) for r in trade_rows
+                ]
+                if personal.pending_trades:
+                    log.info(
+                        f"[{self._account_id}] Відновлено "
+                        f"{len(personal.pending_trades)} незакритих заявок"
+                    )
 
         return inventories
 
@@ -80,27 +83,36 @@ class InventoryStore:
     # Збереження
     # ------------------------------------------------------------------
 
-    def save(self, inventories: Inventories) -> None:
+    def save(self, inventories: DynamicInventories) -> None:
         """Зберігає всі інвентарі. Викликається після кожної задачі."""
-        self._save_stats(inventories.personal)
-        for kind, (attr, _) in INVENTORY_REGISTRY.items():
+        registry = inventory_factory.registry
+
+        personal_entry = registry.get("personal")
+        if personal_entry is not None:
+            personal_attr, _ = personal_entry
+            personal = getattr(inventories, personal_attr, None)
+            if personal is not None:
+                self._save_stats(personal)
+
+        for kind, (attr, _) in registry.items():
             inv: BaseInventory = getattr(inventories, attr)
             self._upsert_kind(kind, inv.data)
+
         self._conn.commit()
 
-    def save_kind(self, inventories: Inventories, kind: str) -> None:
-        """Зберігає тільки один тип інвентаря — для часткового оновлення."""
-        entry = INVENTORY_REGISTRY.get(kind)
+    def save_kind(self, inventories: DynamicInventories, kind: str) -> None:
+        """Зберігає тільки один тип інвентаря."""
+        entry = inventory_factory.get(kind)
         if entry is None:
             raise ValueError(f"Невідомий тип інвентаря: {kind!r}")
         attr, _ = entry
         inv: BaseInventory = getattr(inventories, attr)
         if kind == "personal":
-            self._save_stats(inventories.personal)
+            self._save_stats(inv)
         self._upsert_kind(kind, inv.data)
         self._conn.commit()
 
-    def _save_stats(self, personal: PersonalInventory) -> None:
+    def _save_stats(self, personal: Any) -> None:
         self._conn.execute(
             """
             UPDATE accounts
@@ -117,7 +129,7 @@ class InventoryStore:
             ),
         )
 
-    def _upsert_kind(self, kind: str, data: dict) -> None:
+    def _upsert_kind(self, kind: str, data: dict[str, Any]) -> None:
         self._conn.execute(
             """
             INSERT INTO inventory (account_id, kind, data) VALUES (?, ?, ?)
@@ -130,7 +142,7 @@ class InventoryStore:
     # Події
     # ------------------------------------------------------------------
 
-    def persist_trade(self, trade: dict) -> None:
+    def persist_trade(self, trade: dict[str, Any]) -> None:
         self._conn.execute(
             "INSERT INTO events (account_id, kind, payload) VALUES (?, 'trade', ?)",
             (self._account_id, json.dumps(trade, ensure_ascii=False)),

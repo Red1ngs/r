@@ -31,7 +31,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
-    from src.core.account_pull import AccountPull
+    from src.core.account import AccountPull
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ class Task(_RetryMixin):
     fn:          Callable[["AccountPull"], Any] = field(default=lambda b: None,    compare=False)
     max_retries: int                            = field(default=3,                 compare=False)
     _retries:    int                            = field(default=0,                 compare=False, init=False)
-    meta:        dict                           = field(default_factory=dict,      compare=False)
+    meta:        dict[str, Any]                           = field(default_factory=dict,      compare=False)
     delay:       float                          = field(default=0.0,               compare=False)
     run_at:      Any                            = field(default=None,              compare=False)
 
@@ -103,7 +103,7 @@ class LoopTask(_RetryMixin):
     interval:    float                                   = field(default=0.0,                compare=False)
     max_retries: int                                     = field(default=3,                  compare=False)
     _retries:    int                                     = field(default=0,                  compare=False, init=False)
-    meta:        dict                                    = field(default_factory=dict,       compare=False)
+    meta:        dict[str, Any]                                    = field(default_factory=dict,       compare=False)
     delay:       float                                   = field(default=0.0,                compare=False)
     run_at:      Any                                     = field(default=None,               compare=False)
 
@@ -134,12 +134,12 @@ class ReactiveTask(_RetryMixin):
     _seq:        int   = field(default_factory=lambda: next(_seq), compare=True, init=False)
 
     name:        str                                          = field(default="reactive",            compare=False)
-    source:      Callable[["AccountPull"], list]              = field(default=lambda b: [],          compare=False)
+    source:      Callable[["AccountPull"], list[Any]]              = field(default=lambda b: [],          compare=False)
     handler:     Callable[[Any, "AccountPull"], Any]          = field(default=lambda e, b: None,     compare=False)
     requeue:     bool                                         = field(default=True,                  compare=False)
     max_retries: int                                          = field(default=3,                     compare=False)
     _retries:    int                                          = field(default=0,                     compare=False, init=False)
-    meta:        dict                                         = field(default_factory=dict,          compare=False)
+    meta:        dict[str, Any]                                         = field(default_factory=dict,          compare=False)
     delay:       float                                        = field(default=0.0,                   compare=False)
     run_at:      Any                                          = field(default=None,                  compare=False)
 
@@ -165,7 +165,7 @@ class TargetedTask(_RetryMixin):
     fn:          Callable[[Any, "AccountPull"], Any]     = field(default=lambda t, b: None,      compare=False)
     max_retries: int                                     = field(default=3,                      compare=False)
     _retries:    int                                     = field(default=0,                      compare=False, init=False)
-    meta:        dict                                    = field(default_factory=dict,            compare=False)
+    meta:        dict[str, Any]                                    = field(default_factory=dict,            compare=False)
     delay:       float                                   = field(default=0.0,                    compare=False)
     run_at:      Any                                     = field(default=None,                   compare=False)
 

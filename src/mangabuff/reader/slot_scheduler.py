@@ -44,7 +44,7 @@ from datetime import date
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from src.core.inventory.model import ReaderInventory, SlotProgress
+    from src.mangabuff.reader.inventory import ReaderInventory, SlotProgress
 
 log = logging.getLogger(__name__)
 
@@ -249,7 +249,8 @@ class SlotScheduler:
     # ── Внутрішнє ────────────────────────────────────────────────────────────
 
     def _raw_schedule(self) -> dict[str, float]:
-        return self._inv.data.setdefault(_SCHEDULE_KEY, {})
+        from typing import cast as _cast
+        return _cast(dict[str, float], self._inv.data.setdefault(_SCHEDULE_KEY, {}))
 
     def _find_slot(self, name: str) -> Optional["SlotProgress"]:
         for s in self._inv.all_slots():

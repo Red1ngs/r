@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup, Tag
 
-from src.core.inventory.model import Chapter, Manga
+from src.mangabuff.reader.models import Chapter, Manga
 
 log = logging.getLogger(__name__)
 

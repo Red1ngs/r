@@ -10,10 +10,10 @@ import logging
 from typing import TYPE_CHECKING
 
 from src.utils.time import today_utc
-from src.core.task import Priority, Task
+from src.core.tasks.base import Priority, Task
 
 if TYPE_CHECKING:
-    from src.core.account_pull import AccountPull
+    from src.core.account import AccountPull
 
 # Ключ у personal.data
 _LAST_CLAIMED_KEY = "last_bonus_claimed"   # зберігаємо "YYYY-MM-DD" UTC

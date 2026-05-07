@@ -4,7 +4,7 @@ import sqlite3
 import threading
 from typing import Any, Optional
 
-from src.core.database.DTO.manga import ChapterRow, MangaRow
+from src.database.DTO.manga import ChapterRow, MangaRow
 
 
 class MangaRepository:

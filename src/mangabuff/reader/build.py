@@ -1,61 +1,68 @@
 """
-build.py — Професія «Читач манги».
+reader/build.py — Професія «Читач манги».
 
-Архітектура після рефакторингу
-──────────────────────────────
-Pipeline відповідає за ЩО: fetch → parse → action (один цикл).
-Trigger відповідає за КОЛИ: dynamic_next = delay_until_next() зі SlotScheduler.
-
-Схема одного циклу:
-    [FETCH] fetch_next_chapter
-        │
-        ├── глава є ──► [ACTION] read_chapter
-        │                   scheduler.mark_done(slot)   ← завжди
-        │                   record_reward(keys)          ← лише при reward
-        │                   push_item_received()         ← лише при closed slot
-        │                   trigger.advance(bot)         ← знімає in-flight,
-        │                                                   рахує наступний fire
-        │
-        └── глав немає → PARSE-ланцюг:
-               Step 1: find_stale_or_new_mangas
-               Step 2: fetch_manga_updates
-               Step 3a: save_discovered_mangas
-               Step 3b: save_discovered_chapters
-            → знову [FETCH]
-            (якщо parse_retries вичерпано → Scheduler сам викличе advance)
-
-Гарантія "один цикл за раз":
-    trigger.dispatch() блокує is_due() на час виконання.
-    trigger.advance()  знімає блок після завершення action.
-    Це унеможливлює накопичення дублікатів у черзі воркера.
+Ключова логіка fetch:
+  _SLOT_NOT_READY  — слот ще не готовий за часом.
+                     Pipeline отримує "дані" (не None) → НЕ запускає parse.
+                     Action бачить sentinel → викликає on_cycle_done і виходить.
+  None             — слот готовий, але глав у БД немає → Pipeline запускає parse.
+  dict             — все є, читаємо.
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
-from src.core.account_pull import AccountPull
-from src.core.inventory.model import Chapter, ItemReceivedEvent, ReaderWork
-from src.core.pipeline import Step, pipeline
-from src.core.task import AnyTask, Priority
-from src.mangabuff.parsers.reader import parse_catalog, parse_chapters
+from src.core.account import AccountPull
+from src.core.scheduling.schedule import BaseTrigger
+from src.core.tasks.base import AnyTask, Priority
+from src.core.tasks.pipeline import Step, pipeline
+
+from src.mangabuff.reader.parsers import parse_catalog, parse_chapters
+from src.mangabuff.reader.models import Chapter, ItemReceivedEvent, ReaderWork
+from src.mangabuff.reader.stats import RewardStats
 
 log = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from src.core.scheduling.profession import Profession
+
+
+# ── Sentinel ──────────────────────────────────────────────────────────────────
+# Унікальний об'єкт — identity check через `is`, не `==`.
+# fetch повертає його коли слот ще не готовий.
+# action його бачить → одразу викликає on_cycle_done без читання і без parse.
+_SLOT_NOT_READY: dict[str, Any] = {}
+
 
 # ═══════════════════════════════════════════════════════════════
-# Ініціалізація (startup — один раз при старті воркера)
+# ReaderTrigger
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class ReaderTrigger(BaseTrigger):
+    """
+    Тригер читача. Наслідує BaseTrigger — не потребує interval.
+    Інтервал визначається SlotScheduler.delay_until_next().
+    """
+    _producer: Callable[[AccountPull], Iterable[AnyTask]]
+
+    def next_delay(self, bot: AccountPull) -> float:
+        return bot.inventory.reader.slot_scheduler.delay_until_next()
+
+    def producer(self, bot: AccountPull) -> Iterable[AnyTask]:
+        return self._producer(bot)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Ініціалізація
 # ═══════════════════════════════════════════════════════════════
 
 def init_reader(bot: AccountPull) -> list[AnyTask]:
-    """
-    Ініціалізує слоти і SlotScheduler.
-    Використовується як Profession.startup функція.
-    Повертає порожній список — задач при ініціалізації немає.
-    """
     inv = bot.inventory.reader
     inv.init_slots(bot.app_config.reader.reward_slots)
-    inv.scheduler.initialize()
+    inv.slot_scheduler.initialize()
     log.info(
         f"[{bot.account_id}] Reader ініціалізовано: "
         f"slots={[s.slot_name for s in inv.all_slots()]} "
@@ -65,21 +72,29 @@ def init_reader(bot: AccountPull) -> list[AnyTask]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# FETCH — наступна непрочитана глава з БД
+# FETCH
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_next_chapter(bot: AccountPull) -> Optional[dict[str, Any]]:
     """
-    Повертає {\"sequence\": [...], \"slot_name\": \"...\"} або None.
+    Три можливих результати:
 
-    None → немає готового слота або немає глав у БД (→ parse-chain).
+    _SLOT_NOT_READY  — слот не готовий за часом.
+                       Pipeline отримує ненульове значення → action,
+                       action бачить sentinel → on_cycle_done → кінець.
+                       Parse НЕ запускається.
+
+    None             — слот готовий, але глав у БД немає.
+                       Pipeline → parse steps → нові глави → fetch знову.
+
+    dict             — є слот і глави → action читає.
     """
     inv  = bot.inventory.reader
-    slot = inv.scheduler.current()
+    slot = inv.slot_scheduler.current()
 
     if slot is None:
-        log.info(f"[{bot.account_id}] Немає готового слота")
-        return None
+        log.debug(f"[{bot.account_id}] Слот не готовий → чекаємо")
+        return _SLOT_NOT_READY
 
     sequence, mangas = bot.app_config.chapter_repo.get_chapter_sequence(
         account_id=bot.account_id,
@@ -93,7 +108,7 @@ def fetch_next_chapter(bot: AccountPull) -> Optional[dict[str, Any]]:
         )
         return {"sequence": sequence, "mangas": mangas, "slot_name": slot.slot_name}
 
-    log.info(f"[{bot.account_id}] Непрочитаних глав у БД немає → парсинг")
+    log.info(f"[{bot.account_id}] [{slot.slot_name}] Непрочитаних глав у БД немає → парсинг")
     return None
 
 
@@ -102,7 +117,6 @@ def fetch_next_chapter(bot: AccountPull) -> Optional[dict[str, Any]]:
 # ═══════════════════════════════════════════════════════════════
 
 def find_stale_or_new_mangas(bot: AccountPull) -> None:
-    """Step 1: вибір стратегії. Без HTTP."""
     cfg   = bot.app_config.reader
     stale = bot.app_config.manga_repo.get_stale_mangas(
         days=cfg.update_interval_days, limit=5
@@ -116,7 +130,6 @@ def find_stale_or_new_mangas(bot: AccountPull) -> None:
 
 
 def fetch_manga_updates(bot: AccountPull) -> None:
-    """Step 2: HTTP — завантаження даних."""
     work = bot.inventory.reader.work
     if not work:
         log.warning(f"[{bot.account_id}] fetch_manga_updates: work порожній")
@@ -169,7 +182,6 @@ def _fetch_catalog(bot: AccountPull, work: ReaderWork) -> None:
 
 
 def save_discovered_mangas(bot: AccountPull) -> None:
-    """Step 3a: зберегти манги, резолвити ext_id → db_id."""
     work = bot.inventory.reader.work
     if not work or not work.mangas_to_save:
         return
@@ -187,7 +199,6 @@ def save_discovered_mangas(bot: AccountPull) -> None:
 
 
 def save_discovered_chapters(bot: AccountPull) -> None:
-    """Step 3b: зберегти глави, очистити work."""
     work = bot.inventory.reader.work
     if not work:
         return
@@ -198,40 +209,29 @@ def save_discovered_chapters(bot: AccountPull) -> None:
                 for ch in work.chapters_to_save
                 if ch.manga_id is not None
             ])
-        log.info(
-            f"[{bot.account_id}] Збережено {len(work.chapters_to_save)} глав"
-        )
+        log.info(f"[{bot.account_id}] Збережено {len(work.chapters_to_save)} глав")
     finally:
         bot.inventory.reader.clear_work()
 
 
 # ═══════════════════════════════════════════════════════════════
-# ACTION — прочитати главу і записати нагороду
+# ACTION
 # ═══════════════════════════════════════════════════════════════
 
 def _make_read_chapter(
     on_cycle_done: Callable[[AccountPull], None],
+    stats:         RewardStats,
 ) -> Callable[[dict[str, Any], AccountPull], None]:
-    """
-    Фабрика action-функції.
 
-    on_cycle_done — callback що викликається в кінці action.
-    Використовується для trigger.advance(bot) — знімає in-flight блок
-    і рахує наступний _next_fire вже після mark_done() і record_reward(),
-    тому dynamic_next(bot) бачить актуальний стан SlotScheduler.
-    """
     def read_chapter(data: dict[str, Any], bot: AccountPull) -> None:
-        """
-        Надсилає /addHistory, записує нагороду.
+        # Sentinel: слот не був готовий — просто завершуємо цикл
+        if data is _SLOT_NOT_READY:
+            on_cycle_done(bot)
+            return
 
-        scheduler.mark_done() — ЗАВЖДИ (час витрачено).
-        record_reward()       — тільки якщо reward непустий.
-        push_item_received()  — тільки якщо слот закрився.
-        on_cycle_done()       — завжди в кінці (trigger.advance).
-        """
         inv       = bot.inventory.reader
         sequence  = data.get("sequence", [])
-        slot_name = data.get("slot_name")
+        slot_name = data.get("slot_name", "")
 
         if not sequence:
             on_cycle_done(bot)
@@ -249,13 +249,15 @@ def _make_read_chapter(
                 bot.account_id, int(ch["chapter_id"])
             )
 
-        # Завжди — час читання витрачено
         if slot_name:
-            inv.scheduler.mark_done(slot_name)
+            inv.slot_scheduler.mark_done(slot_name)
+
+        # Записуємо в статистику (і reward=None і reward=dict)
+        stats.record(slot_name=slot_name, reward=reward if reward else None)
 
         if not reward:
             log.info(f"[{bot.account_id}] [{slot_name}] Прочитано (без нагороди)")
-            on_cycle_done(bot)   # ← advance ПІСЛЯ mark_done
+            on_cycle_done(bot)
             return
 
         reward_keys: frozenset[str] = frozenset(reward.keys())
@@ -274,7 +276,6 @@ def _make_read_chapter(
                     slot_name=closed,
                     reward=reward,
                 ))
-
             log.info(
                 f"[{bot.account_id}] [{slot_name}] Нагорода: {reward} | "
                 f"pending={len(inv.pending_slots())} слотів"
@@ -282,37 +283,28 @@ def _make_read_chapter(
             if inv.goal_reached():
                 log.info(f"[{bot.account_id}] 🎯 Всі слоти закриті на сьогодні")
 
-        on_cycle_done(bot)   # ← advance ПІСЛЯ mark_done + record_reward
+        on_cycle_done(bot)
 
     return read_chapter
 
 
 # ═══════════════════════════════════════════════════════════════
-# Producer для Trigger
+# Producer
 # ═══════════════════════════════════════════════════════════════
 
 def make_reader_producer(
-    bot: AccountPull,
-    trigger_ref: "list",   # list з одним елементом — Trigger (заповнюється після)
-) -> "Callable[[AccountPull], list[AnyTask]]":
-    """
-    Будує pipeline-producer прив'язаний до конкретного бота.
+    trigger_ref: list[Any],
+    stats:       RewardStats,
+) -> Callable[[AccountPull], Iterable[AnyTask]]:
 
-    trigger_ref — mutable контейнер [Trigger | None].
-    Заповнюється після створення Trigger-а (нижче в build_reader_profession).
-    on_cycle_done викликає trigger.advance(bot) — знімає in-flight після action.
-
-    Кожен виклик producer(bot) → один цикл читання:
-        fetch → (parse якщо треба) → action → on_cycle_done → завершено.
-    """
-    def on_cycle_done(b: AccountPull) -> None:
+    def on_cycle_done(bot: AccountPull) -> None:
         trigger = trigger_ref[0]
         if trigger is not None:
-            trigger.advance(b)
+            trigger.advance(bot)
 
-    read_chapter = _make_read_chapter(on_cycle_done)
+    read_chapter = _make_read_chapter(on_cycle_done, stats)
 
-    reader_pipeline = pipeline(
+    reader_pipeline: Callable[[AccountPull], Iterable[AnyTask]] = pipeline(
         name   = "manga_reader",
         fetch  = fetch_next_chapter,
         parse  = [
@@ -324,7 +316,6 @@ def make_reader_producer(
         action            = read_chapter,
         max_parse_retries = 3,
     )
-
     return reader_pipeline
 
 
@@ -332,44 +323,25 @@ def make_reader_producer(
 # Збірка Profession
 # ═══════════════════════════════════════════════════════════════
 
-def build_reader_profession(bot: AccountPull) -> "Profession":  # type: ignore[name-defined]
-    """
-    Будує повну Profession для читача.
+def build_reader_profession(bot: AccountPull) -> "tuple[Profession, RewardStats]":
+    from src.core.scheduling.conditions import has, not_
+    from src.core.scheduling.profession import Profession
 
-    Використання в main.py:
-        from src.mangabuff.professions.reader.build import build_reader_profession
-        reader = build_reader_profession(bot_01)
-        scheduler = Scheduler(workers={"acc_01": AccountEntry(worker, [reader])})
+    trigger_ref: list[Any] = [None]
+    stats   = RewardStats()
+    producer = make_reader_producer(trigger_ref, stats)
 
-    Profession містить:
-        startup  = [init_reader]          — ініціалізація слотів одноразово
-        triggers = [SlotTrigger]          — Scheduler викликає producer за розкладом
-        guard    = not_(has("is_banned"))
-    """
-    from src.core.conditions import has, not_
-    from src.core.profession import Profession
-    from src.core.schedule import Trigger
-
-    # Mutable контейнер для посилання на тригер.
-    # Заповнюється після створення Trigger — producer замикається на нього.
-    trigger_ref: list = [None]
-
-    producer = make_reader_producer(bot, trigger_ref)
-
-    trigger = Trigger(
-        name         = "reader_slot",
-        account_id   = "",   # заповнює Scheduler при реєстрації
-        interval     = 0,
-        producer     = producer,
-        # dynamic_next викликається в trigger.advance() — після mark_done().
-        # Тому delay_until_next() повертає коректне значення.
-        dynamic_next = lambda b: b.inventory.reader.scheduler.delay_until_next(),
+    trigger = ReaderTrigger(
+        name       = "reader_slot",
+        account_id = "",
+        _producer  = producer,
     )
-    trigger_ref[0] = trigger   # замикаємо посилання
+    trigger_ref[0] = trigger
 
-    return Profession(
+    profession = Profession(
         name     = "reader",
         startup  = [init_reader],
         triggers = [trigger],
         guard    = not_(has("is_banned")),
     )
+    return profession, stats

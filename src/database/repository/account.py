@@ -6,7 +6,7 @@ import threading
 from typing import Any, Optional
 
 from src.core.inventory.model import INVENTORY_REGISTRY
-from src.core.database.DTO.account import AccountRow
+from src.database.DTO.account import AccountRow
 
 
 class AccountRepository:

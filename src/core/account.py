@@ -1,52 +1,50 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING, Optional
 
-from typing import Optional
-
-from src.core.config import BotConfig, AppConfig
-from src.core.inventory.model import Inventories
+from src.core.config.app import AppConfig
+from src.core.config.bot import BotConfig
+from src.core.inventory.model import DynamicInventories as Inventories
 from src.core.inventory.store import InventoryStore
 from src.core.status import AccountStatus
 from src.core.logging.loggers import get_account_logger
 
+if TYPE_CHECKING:
+    from src.mangabuff.session import BotSession
+
 
 class AccountPull:
-    """
-    Стан одного акаунта.
-    bot.inventories.personal.want_list
-    bot.inventories.alliance.shared_items
-    bot.inventories.library.reading_progress
-    """
-
-    def __init__(self, account_id: str, bot_config: BotConfig, app_config: AppConfig, store: InventoryStore):
+    def __init__(
+        self,
+        account_id: str,
+        bot_config:  BotConfig,
+        app_config:  AppConfig,
+        store:       InventoryStore,
+    ):
         self.account_id  = account_id
         self.bot_config  = bot_config
         self.app_config  = app_config
         self.store       = store
         self.status      = AccountStatus.IDLE
         self.error:      Optional[str] = None
-
-        self.inventories: Inventories = store.load()
-        self._session    = None
-
-        # Власний логер акаунта → logs/accounts/{account_id}.log
+        self.inventories: Inventories  = store.load()
+        self._session:   Optional["BotSession"] = None
         self._log = get_account_logger(account_id)
 
     @property
-    def inventory(self) -> "Inventories":
+    def inventory(self) -> Inventories:
         return self.inventories
 
     @property
-    def session(self):
+    def session(self) -> "BotSession":
         assert self._session is not None, f"[{self.account_id}] Сесія не встановлена"
         return self._session
-
-    # ------------------------------------------------------------------
 
     def connect(self) -> bool:
         try:
             from src.mangabuff.session import BotSession
-            self._session = BotSession(self.bot_config, self.app_config)
-            self._session.authenticate()
+            session = BotSession(self.bot_config, self.app_config)
+            session.authenticate()
+            self._session = session
             self.status   = AccountStatus.IDLE
             self.error    = None
             self._log.info("✅ Підключено")

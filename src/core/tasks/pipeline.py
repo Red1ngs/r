@@ -47,10 +47,10 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Union, TYPE_CHECKING
 
-from src.core.task import AnyTask, Priority, Task, extract_spawned
+from src.core.tasks.base import AnyTask, Priority, Task, extract_spawned
 
 if TYPE_CHECKING:
-    from src.core.account_pull import AccountPull
+    from src.core.account import AccountPull
 
 log = logging.getLogger(__name__)
 
@@ -105,18 +105,18 @@ def _normalize_parse(parse: ParseArg, name: str) -> list[Step]:
 def _make_step_chain(
     pipeline_name: str,
     steps:         list[Step],
-    after:         Task,
-) -> list[Task]:
+    after:         AnyTask,
+) -> list[AnyTask]:
     """Будує [step_0, ..., step_n-1, after]. Кожен крок породжує наступний."""
     if not steps:
         return [after]
 
-    tasks: list[Task] = [after]
+    tasks: list[AnyTask] = [after]
     for step in reversed(steps):
         next_task = tasks[-1]
 
-        def make_fn(s: Step, nxt: Task) -> Callable[["AccountPull"], list[Task]]:
-            def _fn(bot: "AccountPull") -> list[Task]:
+        def make_fn(s: Step, nxt: AnyTask) -> Callable[["AccountPull"], list[AnyTask]]:
+            def _fn(bot: "AccountPull") -> list[AnyTask]:
                 s.fn(bot)
                 return [nxt]
             return _fn
