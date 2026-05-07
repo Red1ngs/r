@@ -1,22 +1,3 @@
-"""
-core/logging/setup.py — центральна точка налаштування логування.
-
-Викликається ОДИН РАЗ першим рядком у main.py:
-    from src.core.logging.setup import setup_logging
-    setup_logging()
-
-Структура файлів після запуску:
-    logs/
-      system.log          ← scheduler, monitor, глобальні INFO+
-      errors.log          ← ERROR+ з усіх джерел (агрегований)
-      scheduler.log       ← окремий файл для src.core.scheduler
-      accounts/
-        acc_01.log        ← все що стосується акаунта (INFO+)
-      tasks/
-        acc_01_tasks.log  ← деталі тасків і HTTP (DEBUG+)
-
-Ротація: 10 MB × 5 backup-файлів на кожному handler-і.
-"""
 from __future__ import annotations
 
 import logging
@@ -26,7 +7,10 @@ from pathlib import Path
 _FMT_FULL  = "%(asctime)s  %(levelname)-8s  [%(name)s]  %(message)s"
 _FMT_SHORT = "%(asctime)s  %(levelname)-8s  %(message)s"
 _DATE_FMT  = "%Y-%m-%d %H:%M:%S"
-_MAX_BYTES    = 10 * 1024 * 1024   # 10 MB
+
+# Налаштування часу: ротація кожну добу (D), зберігати 5 останніх файлів
+_WHEN = "D"
+_INTERVAL = 1
 _BACKUP_COUNT = 5
 
 
@@ -34,13 +18,17 @@ def _make_handler(
     path: Path,
     fmt: str = _FMT_FULL,
     level: int = logging.DEBUG,
-) -> logging.handlers.RotatingFileHandler:
+) -> logging.handlers.TimedRotatingFileHandler:
     path.parent.mkdir(parents=True, exist_ok=True)
-    h = logging.handlers.RotatingFileHandler(
-        path,
-        maxBytes=_MAX_BYTES,
+    
+    # Використовуємо TimedRotatingFileHandler для обмеження за часом
+    h = logging.handlers.TimedRotatingFileHandler(
+        filename=str(path),
+        when=_WHEN,
+        interval=_INTERVAL,
         backupCount=_BACKUP_COUNT,
         encoding="utf-8",
+        atTime=None  # можна вказати datetime.time(), щоб ротація була рівно о півночі
     )
     h.setLevel(level)
     h.setFormatter(logging.Formatter(fmt, datefmt=_DATE_FMT))
@@ -53,11 +41,7 @@ def setup_logging(
     console_level: int = logging.WARNING,
 ) -> None:
     """
-    Налаштовує всю систему логування.
-
-    log_dir       : корінь папки з логами (default: "logs/")
-    console       : чи виводити у консоль (default: False)
-    console_level : рівень консолі якщо увімкнено
+    Налаштовує всю систему логування з ротацією за часом (5 днів).
     """
     root = Path(log_dir)
 
@@ -83,5 +67,5 @@ def setup_logging(
         root_logger.addHandler(ch)
 
     logging.getLogger("src.core.logging").info(
-        f"Logging initialized → {root.resolve()}"
+        f"Logging initialized (Retention: 5 days) → {root.resolve()}"
     )

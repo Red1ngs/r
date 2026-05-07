@@ -1,10 +1,9 @@
-import logging
 import time
 from typing import List, Dict, Any
 
 # ── 0. Логування ──────────────────────────────────────────────────────────
 from src.core.logging.setup import setup_logging
-setup_logging(log_dir="logs", console=True, console_level=logging.DEBUG)
+setup_logging(log_dir="logs")
 
 from src.core.logging.loggers import get_scheduler_logger
 log = get_scheduler_logger()
