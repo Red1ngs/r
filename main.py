@@ -27,10 +27,11 @@ from src.mangabuff.reader.build import build_reader_profession
 
 # СПИСОК АКАУНТІВ
 ACCOUNTS_DATA = [
-    {"id": "acc_01", "email": "jo.mefar.i.t1.4@gmail.com", "password": "Yuki_char.png"},
+    {"id": "acc_02", "email": "kun.d.e.rta.rme.l@gmail.com", "password": "", "proxy": ""},
+    {"id": "acc_03", "email": "p.r.ic.e00.2.5@gmail.com", "password": "", "proxy": ""},
 ]
 
-def create_bot_config(email: str, password: str) -> BotConfig:
+def create_bot_config(email: str, password: str, proxy: str) -> BotConfig:
     return BotConfig(
         client=ClientConfig(
             base_url="https://mangabuff.ru",
@@ -45,7 +46,7 @@ def create_bot_config(email: str, password: str) -> BotConfig:
             accept_encoding="gzip, deflate, br, zstd",
             dnt="1",
         ),
-        network=NetworkConfig(proxy=None, timeout=15),
+        network=NetworkConfig(proxy=proxy if proxy else None, timeout=15),
     )
 
 conn    = get_db()
@@ -63,6 +64,7 @@ for acc in ACCOUNTS_DATA:
     acc_id = str(acc["id"])
     email = str(acc["email"])
     password = str(acc["password"])
+    proxy = str(acc["proxy"])
 
     # Реєструємо в БД
     app_cfg.account_repo.upsert(
@@ -71,8 +73,8 @@ for acc in ACCOUNTS_DATA:
 
     # Створюємо інстанс бота
     store = InventoryStore(conn, acc_id)
-    bot = AccountPull(acc_id, create_bot_config(email, password), app_cfg, store)
-    bot.inventory.reader.target_slots = ["card"]
+    bot = AccountPull(acc_id, create_bot_config(email, password, proxy), app_cfg, store)
+    bot.inventory.reader.target_slots = ["card", "scroll"]
 
     # Будуємо професію
     reader_profession, reward_stats = build_reader_profession(bot)

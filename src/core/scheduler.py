@@ -65,12 +65,12 @@ class AccountEntry:
     guard       : умова «акаунт живий» — False → негайна зупинка
     """
     worker:      BotWorker
-    professions: list[Profession]      = field(default_factory=list)
+    professions: list[Profession]      = field(default_factory=lambda: [])
     guard:       Optional[Condition]   = None
 
     # (trigger → profession_name) — для точного видалення при guard fail
-    _triggers:         list[TriggerProtocol]        = field(default_factory=list, init=False, repr=False)
-    _trigger_owner:    dict[int, str]               = field(default_factory=dict, init=False, repr=False)
+    _triggers:         list[TriggerProtocol]        = field(default_factory=lambda: [], init=False, repr=False)
+    _trigger_owner:    dict[int, str]               = field(default_factory=lambda: {}, init=False, repr=False)
 
     def check_account_guard(self, inv: Inventories) -> bool:
         return self.guard is None or self.guard(inv)
