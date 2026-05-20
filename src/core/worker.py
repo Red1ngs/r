@@ -2,7 +2,7 @@ from __future__ import annotations
 import heapq, itertools, threading, time
 from typing import Callable, Optional
 
-from src.core.account import AccountPull
+from src.core.account import Account
 from src.core.logging.loggers import get_account_logger, get_task_logger
 from src.core.tasks.base import AnyTask, LoopTask, ReactiveTask, TaskResult, extract_spawned
 from src.core.utils.timing import to_monotonic
@@ -15,9 +15,9 @@ class BotWorker:
 
     def __init__(
         self,
-        bot:      AccountPull,
-        on_dead:  Optional[Callable[[AccountPull], None]] = None,
-        on_error: Optional[Callable[[AccountPull], None]] = None,
+        bot:      Account,
+        on_dead:  Optional[Callable[[Account], None]] = None,
+        on_error: Optional[Callable[[Account], None]] = None,
     ):
         self._bot     = bot
         self._on_dead  = on_dead
@@ -32,7 +32,7 @@ class BotWorker:
         self._task_log = get_task_logger(bot.account_id)
 
     @property
-    def bot(self) -> AccountPull:
+    def bot(self) -> Account:
         return self._bot
 
     def assign(self, *tasks: AnyTask) -> None:
@@ -67,12 +67,16 @@ class BotWorker:
         with self._lock:
             return len(self._waiting) + len(self._ready)
 
-    def start(self) -> None:
+    def start(self) -> None:                          # метод класу BotWorker
         if not self._bot.connect():
             self._notify_dead()
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name=f"worker-{self._bot.account_id}", daemon=True)
+        self._thread = threading.Thread(              # новий об'єкт кожного разу
+            target=self._loop,
+            name=f"worker-{self._bot.account_id}",
+            daemon=True,
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -80,7 +84,7 @@ class BotWorker:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=30)
         self._bot.disconnect()
-        self._bot.store.save(self._bot.inventory)
+        self._bot.repo.inventory.save(self._bot.account_id, self._bot.inventory)
 
     def run_once(self) -> Optional[TaskResult]:
         self._drain_waiting()
@@ -89,6 +93,13 @@ class BotWorker:
                 return None
             _, _, task = heapq.heappop(self._ready)
         return self._execute(task)
+    
+    def set_error_callback(                           # метод класу BotWorker
+        self,
+        callback: "Callable[[Account], None]",
+    ) -> None:
+        """Публічний setter для _on_error. Викликається з Scheduler._init_entry."""
+        self._on_error = callback
 
     def _loop(self) -> None:
         set_http_logger(self._task_log)
@@ -136,7 +147,7 @@ class BotWorker:
             if self._on_error:
                 self._on_error(self._bot)
         finally:
-            self._bot.store.save(self._bot.inventory)
+            self._bot.repo.inventory.save(self._bot.account_id, self._bot.inventory)
             self._bot.mark_idle()
         if isinstance(task, ReactiveTask) and task.requeue and result.success:
             self.assign(task)
@@ -148,6 +159,7 @@ class BotWorker:
             self.assign(task)
         else:
             self._log.error(f"'{task.name}' failed permanently")
+            self._bot.mark_dead(f"Task '{task.name}' failed: {error}")
         if self._is_session_error(error):
             self._try_recover()
 
@@ -168,6 +180,7 @@ class BotWorker:
     def _notify_dead(self) -> None:
         if self._on_dead:
             self._on_dead(self._bot)
+        self._bot.mark_dead("No connection and recovery attempts exhausted")
 
     @staticmethod
     def _is_session_error(error: Exception) -> bool:

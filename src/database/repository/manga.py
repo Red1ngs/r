@@ -157,7 +157,7 @@ class ChapterRepository:
     def upsert(
         self,
         data_id: int,
-        manga_id: int,       # внутрішній id манги (mangas.id)
+        manga_id: int,
         chapter_num: float,
         volume: int,
         date: Optional[str] = None
@@ -173,7 +173,7 @@ class ChapterRepository:
                     volume      = excluded.volume,
                     date        = excluded.date
                 """,
-                (data_id, manga_id, chapter_num, volume, date),
+                (data_id, manga_id, float(chapter_num), int(volume), date),
             )
             self._conn.commit()
 
@@ -184,8 +184,10 @@ class ChapterRepository:
         """
         Масове збереження глав. Очікує список кортежів:
         (data_id, manga_id, chapter_num, volume, date)
-        де manga_id — внутрішній id манги (mangas.id).
+        Перед записом автоматично сортує глави: спочатку за volume, потім за chapter_num.
         """
+        sorted_chapters = sorted(chapters_data, key=lambda x: (x[3], x[2]))
+
         with self._lock:
             self._conn.executemany(
                 """
@@ -196,7 +198,7 @@ class ChapterRepository:
                     volume      = excluded.volume,
                     date        = excluded.date
                 """,
-                chapters_data
+                sorted_chapters
             )
             self._conn.commit()
 

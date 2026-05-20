@@ -9,7 +9,7 @@ reader/stats.py — in-memory статистика нагород.
   - розподіл по годинах доби
 
 Використання:
-    stats = RewardStats()
+    stats = ReaderRewardStats()
     stats.record(slot_name="card", reward={"id": 1, ...})   # нагорода
     stats.record(slot_name="scroll", reward=None)            # без нагороди
     stats.dump()                                             # при зупинці
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -33,11 +33,10 @@ class ReadEvent:
     reward_type: Optional[str]  # який тип нагороди реально випав (None = без нагороди)
 
 
-class RewardStats:
+class ReaderRewardStats:
     """
-    In-memory збір статистики нагород за сесію.
-
-    Не персистується — тільки лог при dump().
+    збір статистики нагород за сесію.
+    
     """
 
     def __init__(self) -> None:
@@ -116,7 +115,7 @@ class RewardStats:
         Викликати при зупинці програми.
         """
         if not self._events:
-            log.info("[RewardStats] Немає даних за сесію")
+            log.info("[ReaderRewardStats] Немає даних за сесію")
             return
 
         total_reads   = len(self._events)
@@ -125,7 +124,7 @@ class RewardStats:
         duration_min  = (self._events[-1].ts - self._events[0].ts) / 60
 
         log.info("=" * 60)
-        log.info("[RewardStats] ЗВІТ ЗА СЕСІЮ")
+        log.info("[ReaderRewardStats] ЗВІТ ЗА СЕСІЮ")
         log.info(f"  Початок : {session_start:%Y-%m-%d %H:%M:%S}")
         log.info(f"  Кінець  : {session_end:%Y-%m-%d %H:%M:%S}")
         log.info(f"  Тривалість : {duration_min:.0f} хв")
@@ -148,7 +147,7 @@ class RewardStats:
         for reward_type in sorted(reward_counts):
             count = reward_counts[reward_type]
             log.info("-" * 60)
-            log.info(f"[RewardStats] {reward_type.upper()}")
+            log.info(f"[ReaderRewardStats] {reward_type.upper()}")
 
             # Інтервали між нагородами
             intervals = self._intervals_for(reward_type)

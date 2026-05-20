@@ -4,7 +4,8 @@ from typing import TYPE_CHECKING, Optional
 from src.core.config.app import AppConfig
 from src.core.config.bot import BotConfig
 from src.core.inventory.model import DynamicInventories as Inventories
-from src.core.inventory.store import InventoryStore
+from src.core.tasks.stats import stats_factory, DynamicStats as Stats
+from src.database.repository.factory import Repositories
 from src.core.status import AccountStatus
 from src.core.logging.loggers import get_account_logger
 
@@ -12,21 +13,22 @@ if TYPE_CHECKING:
     from src.mangabuff.session import BotSession
 
 
-class AccountPull:
+class Account:
     def __init__(
         self,
         account_id: str,
         bot_config:  BotConfig,
         app_config:  AppConfig,
-        store:       InventoryStore,
+        repo:       Repositories,
     ):
         self.account_id  = account_id
-        self.bot_config  = bot_config
-        self.app_config  = app_config
-        self.store       = store
         self.status      = AccountStatus.IDLE
         self.error:      Optional[str] = None
-        self.inventories: Inventories  = store.load()
+        self.bot_config  = bot_config
+        self.app_config  = app_config
+        self.repo       = repo
+        self.inventories: Inventories  = self.repo.inventory.load(self.account_id)
+        self.recorder: Stats = stats_factory.build()
         self._session:   Optional["BotSession"] = None
         self._log = get_account_logger(account_id)
 
@@ -83,7 +85,7 @@ class AccountPull:
 
     def __repr__(self) -> str:
         return (
-            f"<AccountPull id={self.account_id!r} "
+            f"<Account id={self.account_id!r} "
             f"status={self.status.name} | "
             f"{self.inventories.personal}>"
         )

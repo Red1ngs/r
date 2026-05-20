@@ -320,18 +320,31 @@ class BotSession(BotTransport):
             log.error(f"  → /balance error: {e}")
             return None
 
-    def claim_daily(self, day: int | str) -> bool:
+    def claim_calendar(self, day: int | str) -> tuple[bool, dict[str, Any]]:
         try:
-            url = self.daily.url_claim.format(day)
+            url = self.daily.url_calendar_claim.format(day)
             r = self.post(url, timeout=15)
             if r.status_code == 200:
                 log.info("  → отримано")
-                return True
+                return True, r.json()
             log.warning(f"  → {r.status_code} {r.json().get('message', '')}")
-            return False
+            return False, r.json()
         except Exception as e:
             log.error(f"  → claim error: {e}")
-            return False
+            return False, {}
+        
+    def claim_daily(self) -> tuple[bool, dict[str, Any]]:
+        try:
+            url = self.daily.url_ping
+            r = self.post(url, timeout=15)
+            if r.status_code == 200:
+                log.info("  → отримано")
+                return True, r.json()
+            log.warning(f"  → {r.status_code} {r.json().get('message', '')}")
+            return False, r.json()
+        except Exception as e:
+            log.error(f"  → claim error: {e}")
+            return False, {}
 
     # ── Reader ───────────────────────────────────────────────────────
 

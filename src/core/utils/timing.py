@@ -55,6 +55,9 @@ def _parse_wall(run_at: RunAt) -> float:
 
     # "HH:MM" або "HH:MM:SS" — локальний час (будь-який tz-naive рядок вважається локальною датою/годиною).
     if len(s) <= 8 and s.count(":") in (1, 2) and "T" not in s and "-" not in s:
+        if s.find(":") == 1:
+            s = "0" + s 
+            
         t = datetime.time.fromisoformat(s)
         return next_wall_for_time(t)
 

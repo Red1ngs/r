@@ -1,7 +1,7 @@
 """
 Task types.
 
-A task's run() receives the full AccountPull — it contains both
+A task's run() receives the full Account — it contains both
   bot.inventory  (Inventories)
   bot.session    (BotSession)
 
@@ -31,7 +31,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
-    from src.core.account import AccountPull
+    from src.core.account import Account
 
 log = logging.getLogger(__name__)
 
@@ -74,14 +74,14 @@ class Task(_RetryMixin):
     _seq:        int   = field(default_factory=lambda: next(_seq), compare=True, init=False)
 
     name:        str                            = field(default="task",            compare=False)
-    fn:          Callable[["AccountPull"], Any] = field(default=lambda b: None,    compare=False)
+    fn:          Callable[["Account"], Any] = field(default=lambda b: None,    compare=False)
     max_retries: int                            = field(default=3,                 compare=False)
     _retries:    int                            = field(default=0,                 compare=False, init=False)
     meta:        dict[str, Any]                           = field(default_factory=dict,      compare=False)
     delay:       float                          = field(default=0.0,               compare=False)
     run_at:      Any                            = field(default=None,              compare=False)
 
-    def run(self, bot: "AccountPull") -> Any:
+    def run(self, bot: "Account") -> Any:
         return self.fn(bot)
 
 
@@ -98,8 +98,8 @@ class LoopTask(_RetryMixin):
     _seq:        int   = field(default_factory=lambda: next(_seq), compare=True, init=False)
 
     name:        str                                     = field(default="loop",             compare=False)
-    fn:          Callable[["AccountPull"], Any]          = field(default=lambda b: None,     compare=False)
-    condition:   Callable[["AccountPull"], bool]         = field(default=lambda b: False,    compare=False)
+    fn:          Callable[["Account"], Any]          = field(default=lambda b: None,     compare=False)
+    condition:   Callable[["Account"], bool]         = field(default=lambda b: False,    compare=False)
     interval:    float                                   = field(default=0.0,                compare=False)
     max_retries: int                                     = field(default=3,                  compare=False)
     _retries:    int                                     = field(default=0,                  compare=False, init=False)
@@ -107,7 +107,7 @@ class LoopTask(_RetryMixin):
     delay:       float                                   = field(default=0.0,                compare=False)
     run_at:      Any                                     = field(default=None,               compare=False)
 
-    def run(self, bot: "AccountPull") -> None:
+    def run(self, bot: "Account") -> None:
         import threading
         stop: threading.Event = self.meta.get("stop_event") or threading.Event()
         while not stop.is_set() and self.condition(bot):
@@ -134,8 +134,8 @@ class ReactiveTask(_RetryMixin):
     _seq:        int   = field(default_factory=lambda: next(_seq), compare=True, init=False)
 
     name:        str                                          = field(default="reactive",            compare=False)
-    source:      Callable[["AccountPull"], list[Any]]              = field(default=lambda b: [],          compare=False)
-    handler:     Callable[[Any, "AccountPull"], Any]          = field(default=lambda e, b: None,     compare=False)
+    source:      Callable[["Account"], list[Any]]              = field(default=lambda b: [],          compare=False)
+    handler:     Callable[[Any, "Account"], Any]          = field(default=lambda e, b: None,     compare=False)
     requeue:     bool                                         = field(default=True,                  compare=False)
     max_retries: int                                          = field(default=3,                     compare=False)
     _retries:    int                                          = field(default=0,                     compare=False, init=False)
@@ -143,7 +143,7 @@ class ReactiveTask(_RetryMixin):
     delay:       float                                        = field(default=0.0,                   compare=False)
     run_at:      Any                                          = field(default=None,                  compare=False)
 
-    def run(self, bot: "AccountPull") -> list[Any]:
+    def run(self, bot: "Account") -> list[Any]:
         events = self.source(bot)
         return [self.handler(event, bot) for event in events]
 
@@ -162,14 +162,14 @@ class TargetedTask(_RetryMixin):
 
     name:        str                                     = field(default="targeted",             compare=False)
     target:      Any                                     = field(default=None,                   compare=False)
-    fn:          Callable[[Any, "AccountPull"], Any]     = field(default=lambda t, b: None,      compare=False)
+    fn:          Callable[[Any, "Account"], Any]     = field(default=lambda t, b: None,      compare=False)
     max_retries: int                                     = field(default=3,                      compare=False)
     _retries:    int                                     = field(default=0,                      compare=False, init=False)
     meta:        dict[str, Any]                                    = field(default_factory=dict,            compare=False)
     delay:       float                                   = field(default=0.0,                    compare=False)
     run_at:      Any                                     = field(default=None,                   compare=False)
 
-    def run(self, bot: "AccountPull") -> Any:
+    def run(self, bot: "Account") -> Any:
         return self.fn(self.target, bot)
 
 

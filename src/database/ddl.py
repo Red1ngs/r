@@ -7,13 +7,8 @@ DDL = """
 -- Існуючі таблиці (Accounts, Inventory, Events)
 CREATE TABLE IF NOT EXISTS accounts (
     id                TEXT PRIMARY KEY,
-    email             TEXT NOT NULL,
-    base_url          TEXT NOT NULL,
+    email             TEXT NOT NULL UNIQUE,
     profession        TEXT,
-    is_active         INTEGER NOT NULL DEFAULT 1,
-    comments_written  INTEGER NOT NULL DEFAULT 0,
-    trades_accepted   INTEGER NOT NULL DEFAULT 0,
-    trades_declined   INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );

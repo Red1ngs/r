@@ -26,14 +26,14 @@
 ```python
 from src.core.task import Task, Priority
 from src.core.worker import BotWorker
-from src.account_pull import AccountPull
+from src.account_pull import Account
 from src.core.inventory import Inventories
 from unittest.mock import MagicMock  # Для тестів
 
 # Створюємо бота (з конфігом)
 config = Config(...)  # Див. bot_configs.py
 store = InventoryStore(db, "test_bot")
-bot = AccountPull("test_bot", config, store)
+bot = Account("test_bot", config, store)
 bot._session = MagicMock()  # Мок-сесія для тестів
 worker = BotWorker(bot)
 
@@ -133,10 +133,10 @@ worker.run_once()  # Обробляє подію, породжує нове за
 
 ```python
 from src.core.task import Task, LoopTask, ReactiveTask
-from src.account_pull import AccountPull
+from src.account_pull import Account
 from src.core.inventory import Inventories
 
-def my_trader_profession(bot: AccountPull):
+def my_trader_profession(bot: Account):
     """
     Професія трейдера: синхронізація, ферма коментарів, обробка торгів.
     """
@@ -182,7 +182,7 @@ repo = AccountRepository(db)
 repo.upsert("acc_01", "email@example.com", "https://mangabuff.ru", profession="trader")
 
 # Функція при смерті бота
-def on_bot_dead(bot: AccountPull):
+def on_bot_dead(bot: Account):
     print(f"Бот {bot.account_id} мертвий: {bot.error}")
 
 # Створюємо scheduler
@@ -445,7 +445,7 @@ def call_api(inv: Inventories):
         raise ValueError("API error")
 
 # Тест з моками
-@patch('src.account_pull.AccountPull.session')
+@patch('src.account_pull.Account.session')
 def test_api_call(mock_session):
     mock_session.post.return_value.status_code = 200
     task = Task(name="api", fn=call_api)
@@ -458,7 +458,7 @@ def test_api_call(mock_session):
 Ситуація: Додати професію для модератора, що видаляє спам-коментарі.
 
 ```python
-def moderator_profession(bot: AccountPull):
+def moderator_profession(bot: Account):
     def check_spam(inv: Inventories):
         # Логіка перевірки спаму
         spam_count = inv.personal.get("spam_detected", 0)

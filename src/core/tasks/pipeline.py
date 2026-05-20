@@ -31,9 +31,9 @@ Pipeline НЕ знає КОЛИ його запускати і скільки р
     # У Trigger.producer   — запускається за розкладом Scheduler-а
 
 Сигнатури:
-    fetch  : (bot: AccountPull) -> Any | None
-    parse  : (bot: AccountPull) -> None        (один крок або список)
-    action : (data: Any, bot: AccountPull) -> Any
+    fetch  : (bot: Account) -> Any | None
+    parse  : (bot: Account) -> None        (один крок або список)
+    action : (data: Any, bot: Account) -> Any
 
 parse може бути:
     Callable              — один крок
@@ -50,7 +50,7 @@ from typing import Any, Callable, Union, TYPE_CHECKING
 from src.core.tasks.base import AnyTask, Priority, Task, extract_spawned
 
 if TYPE_CHECKING:
-    from src.core.account import AccountPull
+    from src.core.account import Account
 
 log = logging.getLogger(__name__)
 
@@ -64,20 +64,20 @@ class Step:
     """
     Один крок у parse-ланцюгу.
 
-    fn          : (bot: AccountPull) -> None
+    fn          : (bot: Account) -> None
     priority    : пріоритет у черзі воркера
     max_retries : кількість спроб при помилці (0 = без retry)
     delay       : пауза перед виконанням у секундах
     """
-    fn:          Callable[["AccountPull"], None]
+    fn:          Callable[["Account"], None]
     priority:    int   = Priority.HIGH
     max_retries: int   = 0
     delay:       float = 0.0
 
 
 ParseArg = Union[
-    Callable[["AccountPull"], None],
-    list[Union[Callable[["AccountPull"], None], "Step"]],
+    Callable[["Account"], None],
+    list[Union[Callable[["Account"], None], "Step"]],
 ]
 
 
@@ -115,8 +115,8 @@ def _make_step_chain(
     for step in reversed(steps):
         next_task = tasks[-1]
 
-        def make_fn(s: Step, nxt: AnyTask) -> Callable[["AccountPull"], list[AnyTask]]:
-            def _fn(bot: "AccountPull") -> list[AnyTask]:
+        def make_fn(s: Step, nxt: AnyTask) -> Callable[["Account"], list[AnyTask]]:
+            def _fn(bot: "Account") -> list[AnyTask]:
                 s.fn(bot)
                 return [nxt]
             return _fn
@@ -139,9 +139,9 @@ def _make_step_chain(
 
 def _make_fetch_task(
     name:            str,
-    fetch:           Callable[["AccountPull"], Any],
+    fetch:           Callable[["Account"], Any],
     steps:           list[Step],
-    action:          Callable[[Any, "AccountPull"], Any],
+    action:          Callable[[Any, "Account"], Any],
     parse_retries:   list[int],   # [залишилось] — мутабельний контейнер
     fetch_priority:  int,
     action_priority: int,
@@ -153,7 +153,7 @@ def _make_fetch_task(
     Дані  → ActionTask → завершено.
     """
 
-    def _run(bot: "AccountPull") -> list[AnyTask]:
+    def _run(bot: "Account") -> list[AnyTask]:
         data = fetch(bot)
 
         if data is None:
@@ -171,7 +171,7 @@ def _make_fetch_task(
 
         captured = data
 
-        def _action_run(bot: "AccountPull") -> list[AnyTask]:
+        def _action_run(bot: "Account") -> list[AnyTask]:
             result = action(captured, bot)
             log.info(f"[Pipeline:{name}] виконано")
             return extract_spawned(result)
@@ -198,13 +198,13 @@ def _make_fetch_task(
 
 def pipeline(
     name:               str,
-    fetch:              Callable[["AccountPull"], Any],
+    fetch:              Callable[["Account"], Any],
     parse:              ParseArg,
-    action:             Callable[[Any, "AccountPull"], Any],
+    action:             Callable[[Any, "Account"], Any],
     max_parse_retries:  int = 3,
     fetch_priority:     int = Priority.NORMAL,
     action_priority:    int = Priority.NORMAL,
-) -> Callable[["AccountPull"], list[AnyTask]]:
+) -> Callable[["Account"], list[AnyTask]]:
     """
     Повертає producer-функцію: (bot) -> [AnyTask].
 
@@ -216,7 +216,7 @@ def pipeline(
     """
     steps = _normalize_parse(parse, name)
 
-    def producer(bot: "AccountPull") -> list[AnyTask]:
+    def producer(bot: "Account") -> list[AnyTask]:
         log.info(f"[Pipeline:{name}] запуск")
         return [_make_fetch_task(
             name, fetch, steps, action,

@@ -14,14 +14,14 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
-from src.core.account import AccountPull
+from src.core.account import Account
 from src.core.scheduling.schedule import BaseTrigger
 from src.core.tasks.base import AnyTask, Priority
 from src.core.tasks.pipeline import Step, pipeline
 
 from src.mangabuff.reader.parsers import parse_catalog, parse_chapters
 from src.mangabuff.reader.models import Chapter, ItemReceivedEvent, ReaderWork
-from src.mangabuff.reader.stats import RewardStats
+from src.mangabuff.reader.stats import ReaderRewardStats
 
 log = logging.getLogger(__name__)
 
@@ -46,12 +46,12 @@ class ReaderTrigger(BaseTrigger):
     Тригер читача. Наслідує BaseTrigger — не потребує interval.
     Інтервал визначається SlotScheduler.delay_until_next().
     """
-    _producer: Callable[[AccountPull], Iterable[AnyTask]]
+    _producer: Callable[[Account], Iterable[AnyTask]]
 
-    def next_delay(self, bot: AccountPull) -> float:
+    def next_delay(self, bot: Account) -> float:
         return bot.inventory.reader.slot_scheduler.delay_until_next()
 
-    def producer(self, bot: AccountPull) -> Iterable[AnyTask]:
+    def producer(self, bot: Account) -> Iterable[AnyTask]:
         return self._producer(bot)
 
 
@@ -59,7 +59,7 @@ class ReaderTrigger(BaseTrigger):
 # Ініціалізація
 # ═══════════════════════════════════════════════════════════════
 
-def init_reader(bot: AccountPull) -> list[AnyTask]:
+def init_reader(bot: Account) -> list[AnyTask]:
     inv = bot.inventory.reader
     inv.init_slots(bot.app_config.reader.reward_slots)
     inv.slot_scheduler.initialize()
@@ -75,7 +75,7 @@ def init_reader(bot: AccountPull) -> list[AnyTask]:
 # FETCH
 # ═══════════════════════════════════════════════════════════════
 
-def fetch_next_chapter(bot: AccountPull) -> Optional[dict[str, Any]]:
+def fetch_next_chapter(bot: Account) -> Optional[dict[str, Any]]:
     """
     Три можливих результати:
 
@@ -96,7 +96,7 @@ def fetch_next_chapter(bot: AccountPull) -> Optional[dict[str, Any]]:
         log.debug(f"[{bot.account_id}] Слот не готовий → чекаємо")
         return _SLOT_NOT_READY
 
-    sequence, mangas = bot.app_config.chapter_repo.get_chapter_sequence(
+    sequence, mangas = bot.repo.chapters.get_chapter_sequence(
         account_id=bot.account_id,
         limit=2,
     )
@@ -116,9 +116,9 @@ def fetch_next_chapter(bot: AccountPull) -> Optional[dict[str, Any]]:
 # PARSE: Steps
 # ═══════════════════════════════════════════════════════════════
 
-def find_stale_or_new_mangas(bot: AccountPull) -> None:
+def find_stale_or_new_mangas(bot: Account) -> None:
     cfg   = bot.app_config.reader
-    stale = bot.app_config.manga_repo.get_stale_mangas(
+    stale = bot.repo.mangas.get_stale_mangas(
         days=cfg.update_interval_days, limit=5
     )
     if stale:
@@ -129,7 +129,7 @@ def find_stale_or_new_mangas(bot: AccountPull) -> None:
         log.info(f"[{bot.account_id}] Стратегія: catalog")
 
 
-def fetch_manga_updates(bot: AccountPull) -> None:
+def fetch_manga_updates(bot: Account) -> None:
     work = bot.inventory.reader.work
     if not work:
         log.warning(f"[{bot.account_id}] fetch_manga_updates: work порожній")
@@ -140,7 +140,7 @@ def fetch_manga_updates(bot: AccountPull) -> None:
         _fetch_catalog(bot, work)
 
 
-def _fetch_stale(bot: AccountPull, work: ReaderWork) -> None:
+def _fetch_stale(bot: Account, work: ReaderWork) -> None:
     if not work.targets:
         return
     for manga_row in work.targets:
@@ -160,7 +160,7 @@ def _fetch_stale(bot: AccountPull, work: ReaderWork) -> None:
             ))
 
 
-def _fetch_catalog(bot: AccountPull, work: ReaderWork) -> None:
+def _fetch_catalog(bot: Account, work: ReaderWork) -> None:
     last = work.targets[-1] if work.targets else None
     page = max(1, last.id // 30) if last else 1
     html = bot.session.fetch_manga_catalog(page=page)
@@ -181,13 +181,13 @@ def _fetch_catalog(bot: AccountPull, work: ReaderWork) -> None:
             ))
 
 
-def save_discovered_mangas(bot: AccountPull) -> None:
+def save_discovered_mangas(bot: Account) -> None:
     work = bot.inventory.reader.work
     if not work or not work.mangas_to_save:
         return
     mapping: dict[int, int] = {}
     for m in work.mangas_to_save:
-        db_id = bot.app_config.manga_repo.upsert(
+        db_id = bot.repo.mangas.upsert(
             m.data_id, m.translit_name, m.name,
             m.rating or "", m.info or "", m.image or "",
         )
@@ -198,13 +198,13 @@ def save_discovered_mangas(bot: AccountPull) -> None:
     log.info(f"[{bot.account_id}] Збережено {len(work.mangas_to_save)} манг")
 
 
-def save_discovered_chapters(bot: AccountPull) -> None:
+def save_discovered_chapters(bot: Account) -> None:
     work = bot.inventory.reader.work
     if not work:
         return
     try:
         if work.chapters_to_save:
-            bot.app_config.chapter_repo.upsert_many([
+            bot.repo.chapters.upsert_many([
                 (ch.data_id, ch.manga_id, ch.chapter_num, ch.volume, ch.date)
                 for ch in work.chapters_to_save
                 if ch.manga_id is not None
@@ -219,11 +219,11 @@ def save_discovered_chapters(bot: AccountPull) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 def _make_read_chapter(
-    on_cycle_done: Callable[[AccountPull], None],
-    stats:         RewardStats,
-) -> Callable[[dict[str, Any], AccountPull], None]:
+    on_cycle_done: Callable[[Account], None],
+    stats:         ReaderRewardStats,
+) -> Callable[[dict[str, Any], Account], None]:
 
-    def read_chapter(data: dict[str, Any], bot: AccountPull) -> None:
+    def read_chapter(data: dict[str, Any], bot: Account) -> None:
         # Sentinel: слот не був готовий — просто завершуємо цикл
         if data is _SLOT_NOT_READY:
             on_cycle_done(bot)
@@ -245,7 +245,7 @@ def _make_read_chapter(
         ])
 
         for ch in sequence:
-            bot.app_config.chapter_repo.mark_chapter_read(
+            bot.repo.chapters.mark_chapter_read(
                 bot.account_id, int(ch["chapter_id"])
             )
 
@@ -294,17 +294,17 @@ def _make_read_chapter(
 
 def make_reader_producer(
     trigger_ref: list[Any],
-    stats:       RewardStats,
-) -> Callable[[AccountPull], Iterable[AnyTask]]:
+    stats:       ReaderRewardStats,
+) -> Callable[[Account], Iterable[AnyTask]]:
 
-    def on_cycle_done(bot: AccountPull) -> None:
+    def on_cycle_done(bot: Account) -> None:
         trigger = trigger_ref[0]
         if trigger is not None:
             trigger.advance(bot)
 
     read_chapter = _make_read_chapter(on_cycle_done, stats)
 
-    reader_pipeline: Callable[[AccountPull], Iterable[AnyTask]] = pipeline(
+    reader_pipeline: Callable[[Account], Iterable[AnyTask]] = pipeline(
         name   = "manga_reader",
         fetch  = fetch_next_chapter,
         parse  = [
@@ -323,12 +323,12 @@ def make_reader_producer(
 # Збірка Profession
 # ═══════════════════════════════════════════════════════════════
 
-def build_reader_profession(bot: AccountPull) -> "tuple[Profession, RewardStats]":
+def build_reader_profession(bot: Account) -> "tuple[Profession, ReaderRewardStats]":
     from src.core.scheduling.conditions import has, not_
     from src.core.scheduling.profession import Profession
 
     trigger_ref: list[Any] = [None]
-    stats   = RewardStats()
+    stats   = ReaderRewardStats()
     producer = make_reader_producer(trigger_ref, stats)
 
     trigger = ReaderTrigger(

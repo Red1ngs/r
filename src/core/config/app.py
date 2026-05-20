@@ -1,13 +1,9 @@
 from __future__ import annotations
-import sqlite3
 
 import yaml
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Any
-
-from src.database.repository.account import AccountRepository
-from src.database.repository.manga import MangaRepository, ChapterRepository
 
 
 @dataclass(frozen=True)
@@ -78,18 +74,20 @@ class ReaderAppCfg:
 
 
 @dataclass(frozen=True)
-class DailyStreakCfg:
+class DailyCfg:
     url_balance: str
-    url_claim: str
+    url_ping: str
+    url_calendar_claim: str
     item_selector: str
     claim_text: str
     day_attr: str
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "DailyStreakCfg":
+    def from_dict(cls, d: dict[str, Any]) -> "DailyCfg":
         return cls(
             url_balance=str(d.get("url_balance", "/balance")),
-            url_claim=str(d.get("url_claim", "/balance/claim/{}")),
+            url_ping=str(d.get("url_ping", "/visit/ping")),
+            url_calendar_claim=str(d.get("url_calendar_claim", "/balance/claim/{}")),
             item_selector=str(d.get("item_selector", ".daily-rewards .daily-rewards-item")),
             claim_text=str(d.get("claim_text", "Забрать")),
             day_attr=str(d.get("day_attr", "data-day"))
@@ -99,16 +97,12 @@ class DailyStreakCfg:
 @dataclass(frozen=True)
 class AppConfig:
     reader:    ReaderAppCfg
-    daily: DailyStreakCfg
-    account_repo: AccountRepository
-    manga_repo:   MangaRepository
-    chapter_repo: ChapterRepository
+    daily: DailyCfg
 
     @classmethod
     def from_yaml(
         cls, 
-        path: str | Path, 
-        conn: sqlite3.Connection,
+        path: str | Path
     ) -> AppConfig:
         p = Path(path)
         if not p.exists():
@@ -120,8 +114,5 @@ class AppConfig:
 
         return cls(
             reader=ReaderAppCfg.from_dict(raw_data.get("reader", {})),
-            daily=DailyStreakCfg.from_dict(raw_data.get("daily", {})),
-            account_repo=AccountRepository(conn),
-            manga_repo=MangaRepository(conn),
-            chapter_repo=ChapterRepository(conn)
+            daily=DailyCfg.from_dict(raw_data.get("daily", {}))
         )

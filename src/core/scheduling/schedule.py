@@ -14,7 +14,7 @@ schedule.py — протокол тригерів і базові реаліза
 Кастомні тригери в прикладному шарі:
     @dataclass
     class MyTrigger(BaseTrigger):
-        def next_delay(self, bot: AccountPull) -> float:
+        def next_delay(self, bot: Account) -> float:
             return ...   # будь-яка логіка
 
 Lifecycle одного циклу (гарантія "один цикл за раз")
@@ -39,7 +39,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from src.core.account import AccountPull
+    from src.core.account import Account
     from src.core.inventory.model import Inventories
     from src.core.tasks.base import AnyTask
 
@@ -65,8 +65,8 @@ class TriggerProtocol(Protocol):
     def is_expired(self, inv: "Inventories") -> bool: ...
     def seconds_until(self) -> float: ...
     def dispatch(self) -> None: ...
-    def advance(self, bot: "AccountPull") -> None: ...
-    def producer(self, bot: "AccountPull") -> Iterable["AnyTask"]: ...
+    def advance(self, bot: "Account") -> None: ...
+    def producer(self, bot: "Account") -> Iterable["AnyTask"]: ...
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,7 +115,7 @@ class BaseTrigger:
         self._in_flight = True
         self._next_fire = float("inf")
 
-    def advance(self, bot: "AccountPull") -> None:
+    def advance(self, bot: "Account") -> None:
         """
         Рахує наступний _next_fire через next_delay() і знімає блок.
         Не перевизначай — перевизнач next_delay().
@@ -124,12 +124,12 @@ class BaseTrigger:
         self._in_flight = False
 
     @abstractmethod
-    def producer(self, bot: "AccountPull") -> Iterable["AnyTask"]: ...
+    def producer(self, bot: "Account") -> Iterable["AnyTask"]: ...
 
     # ── Розширювані точки ─────────────────────────────────────────────────────
 
     @abstractmethod
-    def next_delay(self, bot: "AccountPull") -> float:
+    def next_delay(self, bot: "Account") -> float:
         """Скільки секунд чекати після advance(). Реалізується в підкласі."""
         ...
 
@@ -162,13 +162,13 @@ class IntervalTrigger(BaseTrigger):
     until     : якщо until(inv) → True — тригер видаляється
     """
     interval:  float
-    _producer: Callable[["AccountPull"], Iterable["AnyTask"]]
+    _producer: Callable[["Account"], Iterable["AnyTask"]]
     until:     Optional[Callable[["Inventories"], bool]] = None
 
-    def next_delay(self, bot: "AccountPull") -> float:
+    def next_delay(self, bot: "Account") -> float:
         return self.interval
 
-    def producer(self, bot: "AccountPull") -> Iterable["AnyTask"]:
+    def producer(self, bot: "Account") -> Iterable["AnyTask"]:
         return self._producer(bot)
 
     def is_expired(self, inv: "Inventories") -> bool:
@@ -194,7 +194,7 @@ class ScheduleDef:
         ScheduleDef(3600,  daily_bonus, until=has("is_banned"))
     """
     interval: float
-    producer: Callable[["AccountPull"], Iterable["AnyTask"]]
+    producer: Callable[["Account"], Iterable["AnyTask"]]
     until:    Optional[Callable[["Inventories"], bool]] = None
     at:       Optional[RunAt]                           = None
 
@@ -214,8 +214,3 @@ class ScheduleDef:
     def to_entry(self, account_id: str) -> IntervalTrigger:
         """Alias для зворотної сумісності."""
         return self.to_trigger(account_id)
-
-
-# Aliases — зворотна сумісність
-Trigger        = IntervalTrigger
-ScheduledEntry = IntervalTrigger
