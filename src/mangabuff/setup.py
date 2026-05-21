@@ -6,7 +6,7 @@ mangabuff/setup.py — реєстрація інвентарів та профе
 from __future__ import annotations
 
 from src.core.inventory.factory import inventory_factory
-from src.core.scheduling.profession import profession_factory
+from src.core.runtime.profession import profession_factory
 from src.core.tasks.stats import stats_factory
 
 # Інвентарі
@@ -16,8 +16,8 @@ from src.mangabuff.alliance.inventory import AllianceInventory
 from src.mangabuff.personal.inventory import PersonalInventory
 
 # Професії (Білдери)
-from src.mangabuff.reader.build import build_reader_profession
-from src.mangabuff.daily.build import build_daily_profession
+from src.mangabuff.reader.build import ReaderProfession
+from src.mangabuff.daily.build import DailyProfession
 
 # Статистика
 from src.mangabuff.daily.stats import DailyRewardStats
@@ -29,8 +29,8 @@ def register_inventories() -> None:
     inventory_factory.register("daily",    "daily",    DailyInventory)
 
 def register_professions() -> None:
-    profession_factory.register("reader", build_reader_profession)
-    profession_factory.register("daily", build_daily_profession)
-    
+    profession_factory.register("reader", ReaderProfession)
+    profession_factory.register("daily", DailyProfession)
+
 def register_recorders() -> None:
     stats_factory.register("daily_rewards", "daily_rewards", DailyRewardStats)

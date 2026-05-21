@@ -2,14 +2,6 @@
 bot/admin/services/scheduler_service.py
 
 Тонкий фасад між адмін-ботом і Scheduler-сінглтоном.
-
-Відповідальності цього модуля:
-  1. .env — зберігання пароля і проксі (ніколи в БД / пам'яті довше ніж потрібно).
-  2. DTO  — AccountInfo, SchedulerSnapshot (бот не бачить живих об'єктів ядра).
-  3. add_account / remove — повні цикли зі збереженням у .env і БД.
-
-Все інше (pause/resume/list/status/queue) — делегується напряму до Scheduler.
-Не дублюємо методи які вже є в Scheduler і нічого не додають.
 """
 from __future__ import annotations
 
@@ -20,10 +12,9 @@ from typing import Optional
 
 from src.core.config.app import AppConfig
 from src.core.config.bot import AuthConfig, BaseHeaders, BotConfig, ClientConfig, NetworkConfig
-from src.core.scheduler import AccountEntry, Scheduler
+from src.core.runtime.scheduler import EventDrivenScheduler
 from src.core.account import Account
-from src.core.worker import BotWorker
-from src.core.scheduling.profession import profession_factory
+from src.core.runtime.profession import profession_factory
 from src.database.repository.factory import Repositories
 
 _ENV_FILE = Path(".env")
@@ -68,11 +59,10 @@ def _remove_env(key: str) -> None:
 
 def _save_credentials(account_id: str, password: str, proxy: str) -> None:
     _write_env(_pw_key(account_id), password)
-    _write_env(_proxy_key(account_id), proxy)   # "" теж пишемо — явна відсутність проксі
+    _write_env(_proxy_key(account_id), proxy)
 
 
 def _load_credentials(account_id: str) -> tuple[str, str]:
-    """Повертає (password, proxy) з os.environ (куди load_dotenv вже завантажив .env)."""
     return (
         os.environ.get(_pw_key(account_id), ""),
         os.environ.get(_proxy_key(account_id), ""),
@@ -85,7 +75,7 @@ def _erase_credentials(account_id: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DTO  (frozen — бот не може їх мутувати)
+# DTO  (frozen)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -106,10 +96,6 @@ class SchedulerSnapshot:
     accounts:       list[AccountInfo]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Дефолтний браузерний профіль
-# ─────────────────────────────────────────────────────────────────────────────
-
 _DEFAULT_BROWSER = BaseHeaders(
     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -127,24 +113,13 @@ _DEFAULT_BROWSER = BaseHeaders(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SchedulerService:
-    """
-    Фасад для адмін-бота.
-
-    Паролі НІКОЛИ не зберігаються в полях цього класу.
-    Методи які просто делегують до Scheduler (pause/resume/status/queue/…)
-    тут НЕ дублюються — роутери звертаються до Scheduler.get_instance() напряму,
-    або через _scheduler property.
-    """
-
     def __init__(self, repo: Repositories, app_config: AppConfig) -> None:
         self._repo       = repo
         self._app_config = app_config
 
-    # ── Зручний доступ до планувальника ──────────────────────────────────────
-
     @property
-    def _scheduler(self) -> Scheduler:
-        return Scheduler.get_instance()
+    def _scheduler(self) -> EventDrivenScheduler:
+        return EventDrivenScheduler.get_instance()
 
     # ── Читання стану (DTO) ───────────────────────────────────────────────────
 
@@ -160,13 +135,13 @@ class SchedulerService:
     def account_info(self, account_id: str) -> Optional[AccountInfo]:
         return self._build_info(account_id, self._scheduler)
 
-    def _build_info(self, acc_id: str, scheduler: Scheduler) -> Optional[AccountInfo]:
+    def _build_info(self, acc_id: str, scheduler: EventDrivenScheduler) -> Optional[AccountInfo]:
         bot    = scheduler.get_bot(acc_id)
         status = scheduler.status(acc_id)
         if bot is None or status is None:
             return None
 
-        db_acc = self._repo.accounts.get(acc_id)  # для profession і email (можливо, в майбутньому — для інших полів)
+        db_acc = self._repo.accounts.get(acc_id)
         return AccountInfo(
             account_id     = acc_id,
             email          = bot.bot_config.client.auth.email if bot.bot_config.client.auth else "—",
@@ -177,8 +152,6 @@ class SchedulerService:
             next_trigger_s = scheduler.seconds_until_next(acc_id),
             profession     = db_acc.profession if db_acc else None,
         )
-
-    # ── Список id (для перевірки унікальності при додаванні) ─────────────────
 
     def account_ids(self) -> list[str]:
         return self._scheduler.account_ids()
@@ -192,20 +165,10 @@ class SchedulerService:
         password:   str = "",
         proxy:      str = "",
     ) -> tuple[bool, str]:
-        """
-        Реєструє акаунт у БД і Scheduler БЕЗ profession.
-        Profession призначається окремо через assign_profession().
-
-        При новому додаванні (password != ""):
-          - пароль і проксі записуються у .env
-        При відновленні після рестарту (password == ""):
-          - пароль і проксі читаються з .env (завантажених через load_dotenv)
-        """
         scheduler = self._scheduler
         if scheduler.has_account(account_id):
             return False, f"Акаунт {account_id!r} вже існує"
 
-        # 1. .env
         if password:
             _save_credentials(account_id, password, proxy)
             self._repo.accounts.upsert(
@@ -216,7 +179,6 @@ class SchedulerService:
         if not stored_pw:
             return False, f"Пароль для {account_id!r} не знайдено в .env"
 
-        # 2. BotConfig
         bot_config = BotConfig(
             client=ClientConfig(
                 base_url="https://mangabuff.ru",
@@ -226,55 +188,45 @@ class SchedulerService:
             network=NetworkConfig(proxy=stored_proxy or None, timeout=15),
         )
 
-        # 4. Account (без inventory-слотів — profession ще не обрана)
-        bot   = Account(account_id, bot_config, self._app_config, self._repo)
+        bot = Account(account_id, bot_config, self._app_config, self._repo)
 
-        # 5. Scheduler — порожній entry (professions=[])
-        entry = AccountEntry(worker=BotWorker(bot), professions=[])
         try:
-            scheduler.add_account(account_id, entry)
+            # Створюємо акаунт з пустим списком професій
+            scheduler.add_account(account_id, bot, professions=[])
         except ValueError as e:
             return False, str(e)
 
         return True, ""
 
     def assign_profession(self, account_id: str, profession_name: str) -> tuple[bool, str]:
-        """
-        Призначає profession акаунту, що вже існує в Scheduler.
-        Записує profession у БД і додає тригери до живого entry.
-        """
+        """Призначає profession акаунту."""
         scheduler = self._scheduler
-        entry = scheduler.get_entry(account_id)
-        if entry is None:
-            return False, f"Акаунт {account_id!r} не знайдено"
+        bot = scheduler.get_bot(account_id)
+        if bot is None:
+            return False, f"Акаунт {account_id!r} не знайдено в ядрі"
 
-        bot = entry.worker.bot
-
-        # Будуємо profession через factory
         try:
-            result = profession_factory.build(profession_name, bot)
-        except ValueError as e:
-            return False, str(e)
+            profession = profession_factory.build(profession_name)
         except Exception as e:
             return False, f"Помилка збірки profession {profession_name!r}: {e}"
 
-        # build може повертати (Profession, Stats) або просто Profession
-        profession = result[0]
+        try:
+            scheduler.add_profession_to_account(account_id, profession)
+        except Exception as e:
+            return False, f"Не вдалося додати професію в ядро: {e}"
 
-        # Startup tasks
-        tasks = profession.startup_tasks(bot)
-        if tasks:
-            entry.worker.assign(*tasks)
-
-        # Тригери
-        triggers = profession.build_triggers(account_id)
-        entry.add_triggers(triggers, profession.name)
-        entry.professions.append(profession)
-
-        # БД
         self._repo.accounts.set_profession(account_id, profession_name)
-
         return True, ""
+
+    def change_profession(self, account_id: str, new_prof_name: str) -> tuple[bool, str]:
+        """Скидає попередню професію і призначає нову."""
+        scheduler = self._scheduler
+        
+        db_acc = self._repo.accounts.get(account_id)
+        if db_acc and db_acc.profession:
+            scheduler.remove_profession_from_account(account_id, db_acc.profession)
+            
+        return self.assign_profession(account_id, new_prof_name)
 
     # ── Видалення ─────────────────────────────────────────────────────────────
 
@@ -284,21 +236,31 @@ class SchedulerService:
             _erase_credentials(account_id)
         return ok
 
-    # ── Profession-специфічні налаштування (reader slots) ────────────────────
+    # ── Оновлення налаштувань (RequestRouter) ─────────────────────────────────
 
     def update_reader_slots(self, account_id: str, target_slots: list[str]) -> bool:
-        """Оновлює target_slots для reader profession."""
-        bot = self._scheduler.get_bot(account_id)
-        if bot is None:
-            return False
-        reader = getattr(bot.inventory, "reader", None)
-        if reader is None:
-            return False
-        reader.target_slots = target_slots
-        self._repo.inventory.save(account_id, bot.inventory)
-        return True
-
-    # ── Зручний прямий доступ до Scheduler для роутерів ─────────────────────
+        """Оновлює target_slots для reader profession за допомогою ask_sync."""
+        res = self._scheduler.ask_sync(
+            account_id,
+            profession_id="reader",
+            intent="set_targets",
+            data={"targets": target_slots}
+        )
+        if res.approved:
+            bot = self._scheduler.get_bot(account_id)
+            if bot:
+                self._repo.inventory.save(account_id, bot.inventory)
+            return True
+        return False
+    
+    def reschedule_trigger(self, account_id: str, trigger_name: str, run_at: str) -> bool:
+        """
+        Дозволяє адмін-боту зручно перенести будь-який тригер акаунта.
+        Приклад використання:
+            svc.reschedule_trigger("acc_01", "scheduled_04:30", "+15m")
+            svc.reschedule_trigger("acc_01", "reader_slot", "18:00")
+        """
+        return self._scheduler.reschedule_trigger(account_id, trigger_name, run_at)
 
     def pause(self, account_id: str)  -> bool: return self._scheduler.pause_account(account_id)
     def resume(self, account_id: str) -> bool: return self._scheduler.resume_account(account_id)

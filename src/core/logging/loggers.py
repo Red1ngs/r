@@ -108,4 +108,4 @@ def get_task_logger(account_id: str) -> logging.Logger:
 
 def get_scheduler_logger() -> logging.Logger:
     """Спеціальний логер для Scheduler."""
-    return get_logger("scheduler")
+    return get_logger("runtime.scheduler")

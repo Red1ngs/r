@@ -14,7 +14,7 @@ reader:
 
     - name: "card"
       daily_limit: 10
-      interval_seconds: 5400.0  # 1 година
+      interval_seconds: 5400.0
       reward_keys: ["id", "name", "image"]
 
   parsing:

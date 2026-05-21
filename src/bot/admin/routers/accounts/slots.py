@@ -12,7 +12,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from src.bot.admin.services.scheduler_service import SchedulerService
-from src.core.scheduler import Scheduler
+from src.core.runtime.scheduler import EventDrivenScheduler
 from ._common import cancel_add_kb
 
 router = Router(name="accounts:slots")
@@ -24,25 +24,36 @@ class EditSlotsFSM(StatesGroup):
 
 @router.callback_query(F.data.startswith("acc:slots:"))
 async def cb_slots(call: CallbackQuery, state: FSMContext, svc: SchedulerService) -> None:
-    acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]
+    acc_id = call.data.split(":", 2)[2]
     info   = svc.account_info(acc_id)
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return
     if info.profession != "reader":
-        await call.answer("❌ Слоти доступні тільки для reader profession", show_alert=True)
+        await call.answer("❌ Слоти доступні тільки для reader", show_alert=True)
         return
 
-    bot          = Scheduler.get_instance().get_bot(acc_id)
-    reader_inv   = getattr(getattr(bot, "inventory", None), "reader", None)
-    current      = getattr(reader_inv, "target_slots", ["card", "scroll"]) if reader_inv else ["card", "scroll"]
+    # Запитуємо поточний стан слотів через RequestRouter
+    res = EventDrivenScheduler.get_instance().ask_sync(
+        account_id=acc_id,
+        profession_id="reader",
+        intent="get_state",
+        data={}
+    )
+
+    if not res.approved:
+        await call.answer(f"❌ Не вдалося отримати стан: {res.reason}", show_alert=True)
+        return
+
+    slots_data = res.data.get("slots", [])
+    current = [s["name"] for s in slots_data]
 
     await state.set_state(EditSlotsFSM.wait_slots)
     await state.update_data(acc_id=acc_id)
 
-    await call.message.answer(  # type: ignore[union-attr]
+    await call.message.answer(
         f"🎰 <b>Слоти читача для {acc_id}</b>\n\n"
-        f"Поточні: <code>{', '.join(current)}</code>\n\n"
+        f"Поточні: <code>{', '.join(current) or 'немає'}</code>\n\n"
         "Введи нові слоти через кому (наприклад: <code>card, scroll</code>):",
         reply_markup=cancel_add_kb(),
     )

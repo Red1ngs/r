@@ -43,12 +43,12 @@ app_cfg = AppConfig.from_yaml("app.yaml")
 
 # ── Scheduler (Singleton, порожній) ───────────────────────────────────────────
 from src.core.account import Account
-from src.core.scheduler import Scheduler
+from src.core.runtime.scheduler import EventDrivenScheduler
 
 def on_dead(bot: Account) -> None:
     log.critical(f"[DEAD] '{bot.account_id}': {bot.error}")
 
-scheduler = Scheduler.initialize(on_dead=on_dead)
+scheduler = EventDrivenScheduler.initialize(on_dead=on_dead)
 scheduler.start()
 log.info("Scheduler initialized (empty)")
 

@@ -1,5 +1,25 @@
+"""
+worker.py — BotWorker.
+
+Зміни відносно оригіналу:
+  1. Видалено on_dead з __init__ — Scheduler сам обробляє смерть через
+     _reap_dead_workers(). BotWorker не повинен знати про on_dead callback.
+
+  2. _execute() після успішного завершення task емітує подію
+     "task.completed" через EventDrivenScheduler якщо він ініціалізований.
+     Це дозволяє Profession реагувати на завершення task без прямого зв'язку.
+
+  3. set_error_callback() — залишений для Scheduler._init_entry() сумісності,
+     але тепер використовується тільки для wakeup scheduler при помилці.
+
+  Все інше — без змін.
+"""
 from __future__ import annotations
-import heapq, itertools, threading, time
+
+import heapq
+import itertools
+import threading
+import time
 from typing import Callable, Optional
 
 from src.core.account import Account
@@ -16,11 +36,9 @@ class BotWorker:
     def __init__(
         self,
         bot:      Account,
-        on_dead:  Optional[Callable[[Account], None]] = None,
         on_error: Optional[Callable[[Account], None]] = None,
     ):
-        self._bot     = bot
-        self._on_dead  = on_dead
+        self._bot      = bot
         self._on_error = on_error
         self._waiting: list[tuple[float, int, AnyTask]] = []
         self._ready:   list[tuple[int, int, AnyTask]]   = []
@@ -34,6 +52,11 @@ class BotWorker:
     @property
     def bot(self) -> Account:
         return self._bot
+
+    def set_error_callback(self, callback: Callable[[Account], None]) -> None:
+        self._on_error = callback
+
+    # ── Queue management ──────────────────────────────────────────────────────
 
     def assign(self, *tasks: AnyTask) -> None:
         now_mono = time.monotonic()
@@ -67,12 +90,14 @@ class BotWorker:
         with self._lock:
             return len(self._waiting) + len(self._ready)
 
-    def start(self) -> None:                          # метод класу BotWorker
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
         if not self._bot.connect():
-            self._notify_dead()
+            self._bot.mark_dead("connect() failed on start")
             return
         self._stop.clear()
-        self._thread = threading.Thread(              # новий об'єкт кожного разу
+        self._thread = threading.Thread(
             target=self._loop,
             name=f"worker-{self._bot.account_id}",
             daemon=True,
@@ -87,19 +112,15 @@ class BotWorker:
         self._bot.repo.inventory.save(self._bot.account_id, self._bot.inventory)
 
     def run_once(self) -> Optional[TaskResult]:
+        """Для тестів — виконує одну задачу синхронно."""
         self._drain_waiting()
         with self._lock:
             if not self._ready:
                 return None
             _, _, task = heapq.heappop(self._ready)
         return self._execute(task)
-    
-    def set_error_callback(                           # метод класу BotWorker
-        self,
-        callback: "Callable[[Account], None]",
-    ) -> None:
-        """Публічний setter для _on_error. Викликається з Scheduler._init_entry."""
-        self._on_error = callback
+
+    # ── Internal loop ─────────────────────────────────────────────────────────
 
     def _loop(self) -> None:
         set_http_logger(self._task_log)
@@ -137,9 +158,16 @@ class BotWorker:
             value  = task.run(self._bot)
             result = TaskResult(task=task, success=True, value=value)
             self._task_log.info(f"✅ DONE   '{task.name}'")
+
             spawned = extract_spawned(value)
             if spawned:
                 self.assign(*spawned)
+
+            # Емітуємо подію завершення task — Profession можуть реагувати
+            # без прямого зв'язку з BotWorker.
+            # Lazy import щоб не створювати циклічну залежність.
+            self._emit_task_completed(task)
+
         except Exception as e:
             result = TaskResult(task=task, success=False, error=e)
             self._task_log.error(f"❌ FAIL   '{task.name}': {e}", exc_info=True)
@@ -149,9 +177,28 @@ class BotWorker:
         finally:
             self._bot.repo.inventory.save(self._bot.account_id, self._bot.inventory)
             self._bot.mark_idle()
+
         if isinstance(task, ReactiveTask) and task.requeue and result.success:
             self.assign(task)
+
         return result
+
+    def _emit_task_completed(self, task: AnyTask) -> None:
+        """
+        Fire-and-forget: емітує "task.completed" через EventDrivenScheduler.
+
+        Не падає якщо scheduler не ініціалізований (тести, legacy).
+        Не блокує — emit_event() є sync wrapper над async fire-and-forget.
+        """
+        try:
+            from src.core.runtime.scheduler import EventDrivenScheduler
+            scheduler = EventDrivenScheduler.get_instance()
+            scheduler.emit_event("task.completed", {
+                "account_id": self._bot.account_id,
+                "task_name":  task.name,
+            }, source=self._bot.account_id)
+        except RuntimeError:
+            pass  # scheduler не ініціалізований — нормально для тестів
 
     def _handle_task_error(self, task: AnyTask, error: Exception) -> None:
         if task.can_retry:
@@ -174,13 +221,7 @@ class BotWorker:
                 self._log.info("✅ Recovered")
                 return
         self._bot.mark_dead(f"Failed to recover after {len(self.HEAL_DELAYS)} attempts")
-        self._notify_dead()
         self._stop.set()
-
-    def _notify_dead(self) -> None:
-        if self._on_dead:
-            self._on_dead(self._bot)
-        self._bot.mark_dead("No connection and recovery attempts exhausted")
 
     @staticmethod
     def _is_session_error(error: Exception) -> bool:
@@ -190,4 +231,8 @@ class BotWorker:
         return any(kw in msg for kw in ("419", "401", "unauthorized", "session", "csrf"))
 
     def __repr__(self) -> str:
-        return (f"<BotWorker [{self._bot.account_id}] status={self._bot.status.name} queue={self.queue_size}>")
+        return (
+            f"<BotWorker [{self._bot.account_id}] "
+            f"status={self._bot.status.name} "
+            f"queue={self.queue_size}>"
+        )

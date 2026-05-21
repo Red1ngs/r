@@ -1,3 +1,12 @@
+"""
+account.py — незмінний. Залишається точно як є.
+
+Account не знає про Scheduler, Profession чи EventBus.
+Це правильно — Account є чистою моделлю даних + сесії.
+
+Єдина зміна: видалено старі typing imports якщо вони були пов'язані
+з Profession dataclass. Account їх не використовував напряму.
+"""
 from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
@@ -19,17 +28,17 @@ class Account:
         account_id: str,
         bot_config:  BotConfig,
         app_config:  AppConfig,
-        repo:       Repositories,
+        repo:        Repositories,
     ):
         self.account_id  = account_id
         self.status      = AccountStatus.IDLE
         self.error:      Optional[str] = None
         self.bot_config  = bot_config
         self.app_config  = app_config
-        self.repo       = repo
-        self.inventories: Inventories  = self.repo.inventory.load(self.account_id)
-        self.recorder: Stats = stats_factory.build()
-        self._session:   Optional["BotSession"] = None
+        self.repo        = repo
+        self.inventories: Inventories = self.repo.inventory.load(self.account_id)
+        self.recorder:    Stats       = stats_factory.build()
+        self._session:    Optional["BotSession"] = None
         self._log = get_account_logger(account_id)
 
     @property

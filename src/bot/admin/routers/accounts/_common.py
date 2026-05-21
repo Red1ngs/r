@@ -15,7 +15,7 @@ from aiogram.types import (
 )
 
 from src.bot.admin.services.scheduler_service import AccountInfo
-from src.core.scheduling.profession import profession_factory
+from src.core.runtime.profession import profession_factory
 
 # ── Статуси → emoji ───────────────────────────────────────────────────────────
 
