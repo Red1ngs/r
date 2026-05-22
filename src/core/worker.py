@@ -2,15 +2,12 @@
 worker.py — BotWorker.
 
 Зміни відносно оригіналу:
-  1. Видалено on_dead з __init__ — Scheduler сам обробляє смерть через
-     _reap_dead_workers(). BotWorker не повинен знати про on_dead callback.
+  1. set_http_logger() тепер викликається ТАКОЖ в start() перед connect(),
+     щоб HTTP-логи під час авторизації йшли у правильний файл акаунта,
+     а не у дефолтний 'http' logger.
 
-  2. _execute() після успішного завершення task емітує подію
-     "task.completed" через EventDrivenScheduler якщо він ініціалізований.
-     Це дозволяє Profession реагувати на завершення task без прямого зв'язку.
-
-  3. set_error_callback() — залишений для Scheduler._init_entry() сумісності,
-     але тепер використовується тільки для wakeup scheduler при помилці.
+  2. auth_flow() в BotAuth тепер будує новий httpx.Request замість мутації
+     старого — це вирішує проблему з 419 (див. session.py).
 
   Все інше — без змін.
 """
@@ -93,6 +90,11 @@ class BotWorker:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
+        # ВИПРАВЛЕННЯ: встановлюємо HTTP-логер ДО connect(),
+        # щоб логи авторизації (GET /login, POST /login, check_auth)
+        # потрапляли у tasks/{account_id}_tasks.log, а не у 'http' logger.
+        set_http_logger(self._task_log)
+
         if not self._bot.connect():
             self._bot.mark_dead("connect() failed on start")
             return
@@ -163,9 +165,6 @@ class BotWorker:
             if spawned:
                 self.assign(*spawned)
 
-            # Емітуємо подію завершення task — Profession можуть реагувати
-            # без прямого зв'язку з BotWorker.
-            # Lazy import щоб не створювати циклічну залежність.
             self._emit_task_completed(task)
 
         except Exception as e:
@@ -184,12 +183,6 @@ class BotWorker:
         return result
 
     def _emit_task_completed(self, task: AnyTask) -> None:
-        """
-        Fire-and-forget: емітує "task.completed" через EventDrivenScheduler.
-
-        Не падає якщо scheduler не ініціалізований (тести, legacy).
-        Не блокує — emit_event() є sync wrapper над async fire-and-forget.
-        """
         try:
             from src.core.runtime.scheduler import EventDrivenScheduler
             scheduler = EventDrivenScheduler.get_instance()
@@ -198,7 +191,7 @@ class BotWorker:
                 "task_name":  task.name,
             }, source=self._bot.account_id)
         except RuntimeError:
-            pass  # scheduler не ініціалізований — нормально для тестів
+            pass
 
     def _handle_task_error(self, task: AnyTask, error: Exception) -> None:
         if task.can_retry:

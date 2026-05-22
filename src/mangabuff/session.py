@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict, Generator, Optional
 from urllib.parse import unquote
 
 import httpx
 from httpx._types import URLTypes
 
-# Припускаємо, що ці імпорти існують у вашому проєкті
 from src.core.config.bot import BotConfig
 from src.core.config.app import AppConfig
 from src.core.utils.rate_limiter import RateLimiter
@@ -68,43 +68,73 @@ class RequestHeaders:
 
 class BotAuth(httpx.Auth):
     """
-    Автоматична авторизація і оновлення CSRF-токену.
-    Працює ТІЛЬКИ на рівні Транспорту (Level 1).
+    Автоматичне оновлення CSRF-токену при 419.
+
+    ВИПРАВЛЕННЯ: замість спроби мутувати вже відправлений request,
+    при 419 робимо re-login і yield новий request зі свіжими заголовками.
+    Це єдиний надійний спосіб — httpx не гарантує, що мутація headers
+    старого request об'єкта буде застосована до повторного yield.
     """
-    
+
     def __init__(self, transport: "BotTransport"):
         self.transport = transport
-        self._is_relogging = False
+        # Один lock на транспорт — захищає від паралельного re-login
+        # (хоча кожен бот має свій потік, defensively)
+        self._relogin_lock = threading.Lock()
 
     def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         response = yield request
 
-        if response.status_code == 419 and not self._is_relogging:
+        if response.status_code != 419:
+            return
+
+        # Намагаємось отримати lock без блокування — якщо хтось вже
+        # ре-логіниться (не наш кейс, але safe), просто пропускаємо.
+        acquired = self._relogin_lock.acquire(blocking=True, timeout=30)
+        if not acquired:
+            log.error("  → 419: не вдалось отримати relogin lock за 30с")
+            return
+
+        try:
             log.warning("  → 419 CSRF expired — re-logging in")
-            self._is_relogging = True
             success = False
             try:
-                success = self.transport.login()
+                success = self.transport.login(force=True)
             except Exception as e:
                 log.error(f"  → re-login failed: {e}")
-            finally:
-                self._is_relogging = False
 
-            if success:
-                if self.transport.headers.csrf_token:
-                    request.headers["X-CSRF-TOKEN"] = self.transport.headers.csrf_token
-                if self.transport.headers.xsrf_token:
-                    request.headers["X-XSRF-TOKEN"] = self.transport.headers.xsrf_token
-                if self.transport.client:
-                    cookie_str = "; ".join(
-                        f"{k}={v}" for k, v in self.transport.client.cookies.items()
-                    )
-                    if cookie_str:
-                        request.headers["Cookie"] = cookie_str
-                yield request
-            else:
+            if not success:
                 log.error("  → re-login failed, request aborted")
                 raise PermissionError("Session expired and re-login failed")
+
+            # Будуємо новий request з актуальними заголовками та cookies.
+            # НЕ мутуємо старий request — створюємо новий через httpx.Request.
+            new_headers = dict(request.headers)
+
+            # Оновлюємо CSRF-токени
+            if self.transport.headers.csrf_token:
+                new_headers["X-CSRF-TOKEN"] = self.transport.headers.csrf_token
+            if self.transport.headers.xsrf_token:
+                new_headers["X-XSRF-TOKEN"] = self.transport.headers.xsrf_token
+
+            # Оновлюємо cookies з клієнта
+            if self.transport.client:
+                cookie_str = "; ".join(
+                    f"{k}={v}" for k, v in self.transport.client.cookies.items()
+                )
+                if cookie_str:
+                    new_headers["Cookie"] = cookie_str
+
+            new_request = httpx.Request(
+                method=request.method,
+                url=request.url,
+                headers=new_headers,
+                content=request.content,
+            )
+            yield new_request
+
+        finally:
+            self._relogin_lock.release()
 
 
 # ===========================================================================
@@ -118,14 +148,14 @@ class BotTransport:
     - Логін і підтримку авторизації (через BotAuth)
     - Відправку сирих HTTP-запитів (.get, .post)
     """
-    
+
     def __init__(self, bot_config: BotConfig):
         self.bot_config    = bot_config
         self.headers       = RequestHeaders(bot_config)
         self.client:       Optional[httpx.Client] = None
         self.saved_cookies = httpx.Cookies()
         self._rate_limiter = RateLimiter(min_interval=1.0)
-        
+
         self._create_client()
 
     def _create_client(self) -> None:
@@ -141,8 +171,8 @@ class BotTransport:
             timeout=self.bot_config.network.timeout,
             follow_redirects=True,
             cookies=self.saved_cookies,
-            auth=BotAuth(self),  # Впроваджуємо транспорт в auth
-            event_hooks={"request": [log_request], "response":[log_response]},
+            auth=BotAuth(self),
+            event_hooks={"request": [log_request], "response": [log_response]},
         )
 
     def authenticate(self, force: bool = False) -> None:
@@ -151,11 +181,12 @@ class BotTransport:
             raise PermissionError("Authentication failed")
 
     def login(self, force: bool = False) -> bool:
-        if not self.client: return False
-        if self.bot_config.client.cookies: 
+        if not self.client:
+            return False
+        if self.bot_config.client.cookies:
             self._update_cookies(self.bot_config.client.cookies)
-            
-        if not force and self.check_auth(): 
+
+        if not force and self.check_auth():
             return True
 
         auth = self.bot_config.client.auth
@@ -173,32 +204,38 @@ class BotTransport:
             r = self.client.get("/login", headers=self.headers.get_navigation())
             r.raise_for_status()
             token, _ = get_csrf_from_html(r.text)
-            if not token: 
+            if not token:
                 return False
-            
+
             self.headers.csrf_token = token
             xsrf = self.client.cookies.get("XSRF-TOKEN")
-            if xsrf: 
+            if xsrf:
                 self.headers.xsrf_token = unquote(xsrf)
             return True
-        except Exception:
+        except Exception as e:
+            log.error(f"  → _fetch_csrf error: {e}")
             return False
 
     def _submit_login(self) -> bool:
         assert self.client and self.bot_config.client.auth
         self.headers.referer = f"{self.bot_config.client.base_url}/login"
         payload = {
-            "email": self.bot_config.client.auth.email,
+            "email":    self.bot_config.client.auth.email,
             "password": self.bot_config.client.auth.password,
-            "_token": self.headers.csrf_token or "",
+            "_token":   self.headers.csrf_token or "",
         }
         try:
             r = self.client.post("/login", data=payload, headers=self.headers.get_ajax(is_post=True))
-            if r.status_code not in (200, 204, 302): 
+            if r.status_code not in (200, 204, 302):
+                log.warning(f"  → login POST returned {r.status_code}")
                 return False
             self._update_cookies(self.client.cookies)
-            return self.check_auth()
-        except Exception:
+            ok = self.check_auth()
+            if not ok:
+                log.warning("  → login POST ok але check_auth провалився")
+            return ok
+        except Exception as e:
+            log.error(f"  → _submit_login error: {e}")
             return False
 
     def check_auth(self) -> bool:
@@ -209,15 +246,20 @@ class BotTransport:
             token, user_name = get_csrf_from_html(r.text)
             if token and user_name:
                 self.headers.csrf_token = token
+                # Оновлюємо XSRF з cookies після успішного GET
+                xsrf = self.client.cookies.get("XSRF-TOKEN")
+                if xsrf:
+                    self.headers.xsrf_token = unquote(xsrf)
                 log.info(f"  → ✅ {user_name}")
                 return True
             return False
-        except Exception:
+        except Exception as e:
+            log.error(f"  → check_auth error: {e}")
             return False
 
     def _update_cookies(self, new_cookies: dict[str, str] | httpx.Cookies) -> None:
         self.saved_cookies.update(new_cookies)
-        if self.client: 
+        if self.client:
             self.client.cookies.update(new_cookies)
 
     def close(self) -> None:
@@ -227,16 +269,12 @@ class BotTransport:
             self.client = None
 
     # ------------------------------------------------------------------
-    # Внутрішні методи HTTP (Нащадки мають юзати саме їх)
+    # Внутрішні методи HTTP
     # ------------------------------------------------------------------
 
     def get(self, url: URLTypes, external: bool = False, **kwargs: Any) -> httpx.Response:
-        """
-        :param url: Шлях (/api/v1/..) або абсолютний URL (https://...).
-        :param external: Якщо True - відключає BotAuth та CSRF-заголовки.
-        """
         assert self.client
-        
+
         if external:
             kwargs.setdefault("headers", self.bot_config.browser.to_dict())
             kwargs["auth"] = None
@@ -244,12 +282,12 @@ class BotTransport:
             if xsrf := self.client.cookies.get("XSRF-TOKEN"):
                 self.headers.xsrf_token = unquote(xsrf)
             kwargs.setdefault("headers", self.headers.get_navigation())
-            
+
         return self.client.get(url, **kwargs)
 
     def post(self, url: URLTypes, external: bool = False, **kwargs: Any) -> httpx.Response:
         assert self.client
-        
+
         if external:
             kwargs.setdefault("headers", self.bot_config.browser.to_dict())
             kwargs["auth"] = None
@@ -257,7 +295,7 @@ class BotTransport:
             if xsrf := self.client.cookies.get("XSRF-TOKEN"):
                 self.headers.xsrf_token = unquote(xsrf)
             kwargs.setdefault("headers", self.headers.get_ajax(is_post=True))
-            
+
         return self.client.post(url, **kwargs)
 
 
@@ -268,29 +306,22 @@ class BotTransport:
 class BotSession(BotTransport):
     """
     Високорівневий клас, який містить виключно бізнес-методи (API).
-    Використовує успадковані методи транспорту .get() та .post() для запитів.
-    Таски взаємодіють ТІЛЬКИ з методами цього класу.
     """
 
     def __init__(self, bot_config: BotConfig, app_config: AppConfig):
-        # Ініціалізуємо транспортний рівень
         super().__init__(bot_config)
-        
+
         self.app_config = app_config
-        self.daily = self.app_config.daily
+        self.daily  = self.app_config.daily
         self.reader = self.app_config.reader
 
     # ── Utils / Proxy ────────────────────────────────────────────────
 
     def check_proxy(self) -> bool:
-        """GET external /ip — перевірити чи працює проксі через сторонній сервіс."""
         try:
-            # Використовуємо external=True, щоб не злити CSRF токени на інший сервер
             r = self.get("https://api.ipify.org", external=True, timeout=10)
             r.raise_for_status()
-            
-            text = r.text.strip()
-            log.info(f"  → Proxy IP: {text}")
+            log.info(f"  → Proxy IP: {r.text.strip()}")
             return True
         except Exception as e:
             log.error(f"  → Proxy check failed: {e}")
@@ -303,17 +334,17 @@ class BotSession(BotTransport):
             url = self.daily.url_balance
             r = self.get(url, timeout=15)
             r.raise_for_status()
-            
+
             day = get_claimable_day(
-                r.text, 
-                item_selector=self.daily.item_selector, 
+                r.text,
+                item_selector=self.daily.item_selector,
                 claim_text=self.daily.claim_text,
-                day_attr=self.daily.day_attr
+                day_attr=self.daily.day_attr,
             )
             if day is not None:
                 log.info(f"  → день {day} доступний")
                 return int(day)
-                
+
             log.info("  → бонус недоступний сьогодні")
             return None
         except Exception as e:
@@ -330,9 +361,9 @@ class BotSession(BotTransport):
             log.warning(f"  → {r.status_code} {r.json().get('message', '')}")
             return False, r.json()
         except Exception as e:
-            log.error(f"  → claim error: {e}")
+            log.error(f"  → claim_calendar error: {e}")
             return False, {}
-        
+
     def claim_daily(self) -> tuple[bool, dict[str, Any]]:
         try:
             url = self.daily.url_ping
@@ -343,7 +374,7 @@ class BotSession(BotTransport):
             log.warning(f"  → {r.status_code} {r.json().get('message', '')}")
             return False, r.json()
         except Exception as e:
-            log.error(f"  → claim error: {e}")
+            log.error(f"  → claim_daily error: {e}")
             return False, {}
 
     # ── Reader ───────────────────────────────────────────────────────
@@ -351,18 +382,17 @@ class BotSession(BotTransport):
     def submit_add_history(self, items: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
         try:
             body = {
-                f"items[{i}][{k}]": v 
-                for i, item in enumerate(items) 
+                f"items[{i}][{k}]": v
+                for i, item in enumerate(items)
                 for k, v in item.items()
             }
             r = self.post(self.reader.url_add_history, data=body)
-            
             if r.status_code == 200 and r.content:
                 return r.json()
             return None
         except Exception:
             return None
-        
+
     def fetch_manga_catalog(self, page: int = 1) -> Optional[str]:
         try:
             url = self.reader.parsing.url_catalog
@@ -372,12 +402,11 @@ class BotSession(BotTransport):
         except Exception as e:
             log.error(f"  → fetch_manga_catalog error: {e}")
             return None
-        
+
     def fetch_manga_chapters(self, translit_name: str, manga_data_id: int) -> Optional[str]:
         page_html = self._fetch_manga_page(translit_name)
-        if not page_html: 
+        if not page_html:
             return None
-        
         more_html = self._fetch_more_chapters(manga_data_id)
         return page_html + more_html
 
