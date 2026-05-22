@@ -156,24 +156,38 @@ class BaseTrigger:
 
 @dataclass
 class ScheduleTrigger(BaseTrigger):
-    """
-    Конкретний тригер, який створюється на основі конфігурації ScheduleDef.
-    """
     interval:  int
-    _producer: Callable[[Account], Iterable[AnyTask]]
+    _producer: Callable[["Account"], Iterable["AnyTask"]]
     at:        Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.at:
-            self.reschedule(self.at)
+            self._next_fire = parse_run_at(self.at)
         else:
             self._next_fire = time.time()
 
-    def next_delay(self, bot: Account) -> float:
+    def next_delay(self, bot: "Account") -> float:
         return float(self.interval)
 
-    def producer(self, bot: Account) -> Iterable[AnyTask]:
+    def producer(self, bot: "Account") -> Iterable["AnyTask"]:
         return self._producer(bot)
+
+    def advance_to_next_day_at(self, at: str) -> None:
+        """
+        Ставить _next_fire на завтра о заданому часі (HH:MM UTC).
+        Завжди у майбутньому — навіть якщо час ще не настав сьогодні.
+        Використовується restore_state() коли бонус вже зібрано сьогодні.
+        """
+        h, m   = map(int, at.split(":"))
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        target = datetime.datetime.combine(
+            now_dt.date(),
+            datetime.time(hour=h, minute=m),
+            tzinfo=datetime.timezone.utc,
+        )
+        target += datetime.timedelta(days=1)  # завжди завтра
+        self._next_fire = target.timestamp()
+        self._in_flight = False
 
 
 # ── Schedule Configurator (Builder) ───────────────────────────────────────────
@@ -181,10 +195,10 @@ class ScheduleTrigger(BaseTrigger):
 @dataclass(frozen=True)
 class ScheduleDef:
     interval:  int
-    producer:  Callable[[Account], Iterable[AnyTask]]
+    producer:  Callable[["Account"], Iterable["AnyTask"]]
     at:        Optional[str] = None
 
-    def to_trigger(self, account_id: str) -> TriggerProtocol:
+    def to_trigger(self, account_id: str) -> "ScheduleTrigger":  # ← був TriggerProtocol
         name = f"scheduled_{self.at}" if self.at else f"interval_{self.interval}"
         return ScheduleTrigger(
             name=name,
