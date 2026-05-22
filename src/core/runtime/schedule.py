@@ -5,13 +5,13 @@ src/core/runtime/schedule.py
 """
 from __future__ import annotations
 
-import datetime
-import time
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING, Callable, Iterable, Optional, Protocol, runtime_checkable,
 )
+
+from src.utils.time import now_ts, parse_to_ts
 
 if TYPE_CHECKING:
     from src.core.account import Account
@@ -42,7 +42,7 @@ def parse_run_at(run_at: RunAt) -> float:
         try:
             unit = val[-1].lower()
             amount = float(val[1:-1])
-            now = time.time()
+            now = now_ts()
             if unit == "s": return now + amount
             if unit == "m": return now + amount * 60
             if unit == "h": return now + amount * 3600
@@ -53,16 +53,7 @@ def parse_run_at(run_at: RunAt) -> float:
     # 2. Точний час у форматі "HH:MM"
     if ":" in val and len(val) <= 5:
         try:
-            h, m = map(int, val.split(":"))
-            now_dt = datetime.datetime.now(datetime.timezone.utc)
-            target = datetime.datetime.combine(
-                now_dt.date(),
-                datetime.time(hour=h, minute=m),
-                tzinfo=datetime.timezone.utc
-            )
-            if target <= now_dt:
-                target += datetime.timedelta(days=1)
-            return target.timestamp()
+            return parse_to_ts(val)
         except Exception:
             pass
 
@@ -107,7 +98,7 @@ class BaseTrigger:
     # ── TriggerProtocol ───────────────────────────────────────────────────────
 
     def is_due(self) -> bool:
-        return not self._in_flight and time.time() >= self._next_fire
+        return not self._in_flight and now_ts() >= self._next_fire
 
     def is_expired(self, inv: "Inventories") -> bool:
         return False
@@ -115,14 +106,14 @@ class BaseTrigger:
     def seconds_until(self) -> float:
         if self._in_flight:
             return float("inf")
-        return max(0.0, self._next_fire - time.time())
+        return max(0.0, self._next_fire - now_ts())
 
     def dispatch(self) -> None:
         self._in_flight = True
         self._next_fire = float("inf")
 
     def advance(self, bot: "Account") -> None:
-        self._next_fire = time.time() + max(0.0, self.next_delay(bot))
+        self._next_fire =  now_ts() + max(0.0, self.next_delay(bot))
         self._in_flight = False
 
     def reschedule(self, run_at: RunAt) -> None:
@@ -164,7 +155,7 @@ class ScheduleTrigger(BaseTrigger):
         if self.at:
             self._next_fire = parse_run_at(self.at)
         else:
-            self._next_fire = time.time()
+            self._next_fire = now_ts()
 
     def next_delay(self, bot: "Account") -> float:
         return float(self.interval)
@@ -174,19 +165,11 @@ class ScheduleTrigger(BaseTrigger):
 
     def advance_to_next_day_at(self, at: str) -> None:
         """
-        Ставить _next_fire на завтра о заданому часі (HH:MM UTC).
+        Ставить _next_fire на завтра о заданому часі (HH:MM).
         Завжди у майбутньому — навіть якщо час ще не настав сьогодні.
         Використовується restore_state() коли бонус вже зібрано сьогодні.
         """
-        h, m   = map(int, at.split(":"))
-        now_dt = datetime.datetime.now(datetime.timezone.utc)
-        target = datetime.datetime.combine(
-            now_dt.date(),
-            datetime.time(hour=h, minute=m),
-            tzinfo=datetime.timezone.utc,
-        )
-        target += datetime.timedelta(days=1)  # завжди завтра
-        self._next_fire = target.timestamp()
+        self._next_fire = next_day_timestamp_for_time(at)
         self._in_flight = False
 
 

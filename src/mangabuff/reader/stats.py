@@ -19,8 +19,9 @@ from __future__ import annotations
 import logging
 import statistics
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional
+
+from src.utils.time import format_ts, now_ts
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +57,6 @@ class ReaderRewardStats:
         slot_name : який слот планувався (card / scroll / …)
         reward    : dict від сайту якщо нагорода є, None якщо не випала
         """
-        import time
         reward_type: Optional[str] = None
         if reward:
             # Визначаємо тип за ключами відповіді сайту
@@ -70,7 +70,7 @@ class ReaderRewardStats:
                 reward_type = next(iter(keys), "unknown")
 
         self._events.append(ReadEvent(
-            ts          = ts or time.time(),
+            ts          = ts or now_ts(),
             slot_name   = slot_name,
             reward_type = reward_type,
         ))
@@ -91,7 +91,7 @@ class ReaderRewardStats:
         dist: dict[int, int] = {}
         for e in self._events:
             if e.reward_type == reward_type:
-                hour = datetime.fromtimestamp(e.ts).hour
+                hour = int(format_ts(e.ts, "%H"))
                 dist[hour] = dist.get(hour, 0) + 1
         return dist
 
@@ -119,14 +119,14 @@ class ReaderRewardStats:
             return
 
         total_reads   = len(self._events)
-        session_start = datetime.fromtimestamp(self._events[0].ts)
-        session_end   = datetime.fromtimestamp(self._events[-1].ts)
+        session_start = format_ts(self._events[0].ts,  "%Y-%m-%d %H:%M:%S")
+        session_end   = format_ts(self._events[-1].ts, "%Y-%m-%d %H:%M:%S")
         duration_min  = (self._events[-1].ts - self._events[0].ts) / 60
 
         log.info("=" * 60)
         log.info("[ReaderRewardStats] ЗВІТ ЗА СЕСІЮ")
-        log.info(f"  Початок : {session_start:%Y-%m-%d %H:%M:%S}")
-        log.info(f"  Кінець  : {session_end:%Y-%m-%d %H:%M:%S}")
+        log.info(f"  Початок : {session_start}")
+        log.info(f"  Кінець  : {session_end}")
         log.info(f"  Тривалість : {duration_min:.0f} хв")
         log.info(f"  Читань всього : {total_reads}")
 

@@ -18,7 +18,7 @@ slot_scheduler.py — планувальник читань по слотах.
 
 Добовий скид collected:
     Разом зі slot_schedule в inventory.data зберігається ключ
-    "slot_reset_date" — рядок "YYYY-MM-DD" (локальна дата машини).
+    "slot_reset_date" — рядок "YYYY-MM-DD" (налаштована дата проекту).
 
     При кожному виклику _maybe_daily_reset():
       якщо поточна дата != slot_reset_date →
@@ -38,10 +38,11 @@ from __future__ import annotations
 
 import logging
 import random
-import time
 from dataclasses import dataclass
-from datetime import date
 from typing import TYPE_CHECKING, Optional
+
+# Використовуємо єдину точку отримання часу в проекті
+from src.utils.time import now_ts, seconds_until_midnight, today
 
 if TYPE_CHECKING:
     from src.mangabuff.reader.inventory import ReaderInventory, SlotProgress
@@ -91,11 +92,11 @@ class SlotScheduler:
         """
         self._maybe_daily_reset()
 
-        now      = time.time()
+        now_val  = now_ts()
         schedule = self._raw_schedule()
         for slot in self._inv.all_slots():
             if slot.slot_name not in schedule:
-                schedule[slot.slot_name] = now
+                schedule[slot.slot_name] = now_val
         self._inv.data[_SCHEDULE_KEY] = schedule
 
         log.debug(f"SlotScheduler initialized: {list(schedule.keys())}")
@@ -111,12 +112,12 @@ class SlotScheduler:
         """
         self._maybe_daily_reset()
 
-        now      = time.time()
+        now_val  = now_ts()
         schedule = self._raw_schedule()
 
         ready = [
             s for s in self._inv.pending_slots()
-            if schedule.get(s.slot_name, 0.0) <= now
+            if schedule.get(s.slot_name, 0.0) <= now_val
         ]
 
         if not ready:
@@ -125,7 +126,7 @@ class SlotScheduler:
         winner = ready[0]
         for collider in ready[1:]:
             jitter = random.uniform(JITTER_MIN, JITTER_MAX)
-            schedule[collider.slot_name] = now + jitter
+            schedule[collider.slot_name] = now_val + jitter
             log.debug(
                 f"SlotScheduler collision: '{collider.slot_name}' "
                 f"deferred {jitter:.1f}s"
@@ -144,7 +145,7 @@ class SlotScheduler:
             return
 
         schedule            = self._raw_schedule()
-        schedule[slot_name] = time.time() + slot.interval
+        schedule[slot_name] = now_ts() + slot.interval
         self._inv.data[_SCHEDULE_KEY] = schedule
 
         log.debug(
@@ -158,23 +159,18 @@ class SlotScheduler:
         Варіанти відповіді:
           > 0   — чекати N секунд до наступного слота
           = 0   — є готовий слот прямо зараз → можна читати
-          сек до опівночі — всі слоти закриті на сьогодні,
+          > 0   — сек до опівночі — всі слоти закриті на сьогодні,
                             наступний цикл починається завтра
-
-        Це значення використовується як Trigger.dynamic_next:
-            Trigger(dynamic_next=lambda bot: bot.inventory.reader.scheduler.delay_until_next())
-        Тому воно НІКОЛИ не повертає 0.0 якщо немає pending-слотів —
-        інакше Trigger спінитиметься вічно.
         """
         self._maybe_daily_reset()
 
-        now           = time.time()
+        now_val       = now_ts()
         schedule      = self._raw_schedule()
         pending_names = {s.slot_name for s in self._inv.pending_slots()}
 
         if not pending_names:
-            # Всі слоти закриті — спимо до початку наступного дня
-            return self._seconds_until_midnight()
+            # Всі слоти закриті — спимо до початку наступного дня за допомогою утиліти
+            return seconds_until_midnight()
 
         upcoming = [
             schedule[name]
@@ -184,23 +180,12 @@ class SlotScheduler:
         if not upcoming:
             return 0.0
 
-        return max(0.0, min(upcoming) - now)
-
-    def _seconds_until_midnight(self) -> float:
-        """Секунд від зараз до 00:00:00 наступного дня (локальний час)."""
-        import datetime as _dt
-        now_local = _dt.datetime.now().astimezone()
-        tomorrow  = (now_local + _dt.timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        delta = (tomorrow - now_local).total_seconds()
-        # Мінімум 60 секунд — щоб не спінитись у граничних ситуаціях
-        return max(60.0, delta)
+        return max(0.0, min(upcoming) - now_val)
 
     def reset(self) -> None:
         """Примусово скидає розклад — всі слоти стартують з now."""
-        now      = time.time()
-        schedule = {s.slot_name: now for s in self._inv.all_slots()}
+        now_val  = now_ts()
+        schedule = {s.slot_name: now_val for s in self._inv.all_slots()}
         self._inv.data[_SCHEDULE_KEY] = schedule
         log.info("SlotScheduler reset — all slots fire immediately")
 
@@ -212,25 +197,25 @@ class SlotScheduler:
 
         Логіка:
           - читаємо "slot_reset_date" з inventory.data
-          - порівнюємо з date.today().isoformat()
+          - порівнюємо з today() (отримано з урахуванням конфігурації таймзони)
           - якщо відрізняється → скидаємо collected у всіх SlotProgress,
             оновлюємо дату, скидаємо schedule (щоб слоти стартували з now)
         """
-        today     = date.today().isoformat()   # "YYYY-MM-DD"
-        last_date = self._inv.data.get(_RESET_DATE_KEY, "")
+        current_today = today()   # "YYYY-MM-DD"
+        last_date     = self._inv.data.get(_RESET_DATE_KEY, "")
 
-        if last_date == today:
+        if last_date == current_today:
             return  # той самий день — нічого не робимо
 
         # ── Новий день ────────────────────────────────────────────────────────
         if last_date:
             log.info(
-                f"SlotScheduler: новий день ({last_date} → {today}), "
+                f"SlotScheduler: новий день ({last_date} → {current_today}), "
                 f"скидаємо collected"
             )
         else:
             log.debug(
-                f"SlotScheduler: перший запуск, ініціалізуємо дату {today}"
+                f"SlotScheduler: перший запуск, ініціалізуємо дату {current_today}"
             )
 
         # Скидаємо тільки collected — таймінги слотів не чіпаємо.
@@ -244,7 +229,7 @@ class SlotScheduler:
         self._inv.data["slots"] = raw_slots
 
         # Зберігаємо нову дату
-        self._inv.data[_RESET_DATE_KEY] = today
+        self._inv.data[_RESET_DATE_KEY] = current_today
 
     # ── Внутрішнє ────────────────────────────────────────────────────────────
 

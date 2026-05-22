@@ -42,7 +42,8 @@ from src.core.tasks.base import AnyTask, Priority
 from src.core.tasks.pipeline import Step, pipeline
 from src.mangabuff.daily.inventory import DailyInventory
 from src.mangabuff.daily.stats import DailyRewardStats
-from src.utils.time import today_utc
+
+from src.utils.time import format_ts, now_ts, today
 
 if TYPE_CHECKING:
     from src.core.account import Account
@@ -91,10 +92,10 @@ def get_stable_random_time(base_time: str, account_id: str, max_jitter_minutes: 
 
 def _fetch_bonus_status(bot: "Account") -> Any:
     inv   = bot.inventory.daily  # type: ignore[attr-defined]
-    today = today_utc()
+    to_day = today()
 
-    needs_daily    = inv.last_daily_claimed    != today
-    needs_calendar = inv.last_calendar_claimed != today
+    needs_daily    = inv.last_daily_claimed    != to_day
+    needs_calendar = inv.last_calendar_claimed != to_day
 
     if not needs_daily and not needs_calendar:
         log.info(f"[{bot.account_id}] 🎁 Всі бонуси на сьогодні вже зібрано")
@@ -114,7 +115,7 @@ def _parse_calendar_day(bot: "Account") -> None:
     if day is None:
         log.info(f"[{bot.account_id}] 🎁 Календарний бонус зараз недоступний")
         inv.can_claim_calendar    = False
-        inv.last_calendar_claimed = today_utc()
+        inv.last_calendar_claimed = today()
         return
 
     log.info(f"[{bot.account_id}] 🎁 Календар: день {day}")
@@ -153,14 +154,12 @@ class DailyProfession(BaseProfession):
         scheduler.subscribe("account.unbanned", self._on_account_unbanned)
 
     async def restore_state(self, bot: "Account") -> None:
-        import time as _time
-        import datetime
 
         inv: DailyInventory = bot.inventory.daily  # type: ignore[attr-defined]
-        today = today_utc()
+        to_day = today()
 
-        daily_done    = inv.last_daily_claimed    == today
-        calendar_done = inv.last_calendar_claimed == today
+        daily_done    = inv.last_daily_claimed    == to_day
+        calendar_done = inv.last_calendar_claimed == to_day
         all_done      = daily_done and calendar_done
 
         log.info(
@@ -177,17 +176,15 @@ class DailyProfession(BaseProfession):
             # Бонус вже зібрано — переносимо тригер на завтра.
             # Без цього _next_fire в минулому → is_due()=True → негайний повторний запуск.
             self._trigger.advance_to_next_day_at(self._scheduled_at)
-            next_dt = datetime.datetime.fromtimestamp(
-                self._trigger._next_fire, tz=datetime.timezone.utc
-            )
+            next_dt = format_ts(self._trigger._next_fire)
             log.info(
                 f"[{self._account_id}] 🎁 Бонус вже зібрано — "
-                f"наступний запуск: {next_dt.strftime('%Y-%m-%d %H:%M')} UTC"
+                f"наступний запуск: {next_dt}"
             )
-        elif self._trigger._next_fire < _time.time():
+        elif self._trigger._next_fire < now_ts():
             # Бонус не зібрано, але запланований час вже пройшов (бот упав до збору).
             # Запускаємо негайно на наступному тіку scheduler.
-            self._trigger._next_fire = _time.time()
+            self._trigger._next_fire = now_ts()
             self._trigger._in_flight = False
             log.info(
                 f"[{self._account_id}] 🎁 Пропущений запуск виявлено — запуск негайно"
@@ -236,12 +233,12 @@ class DailyProfession(BaseProfession):
 
     async def _handle_get_status(self, ctx: "RequestContext") -> RequestResult:
         inv: DailyInventory = ctx.bot.inventory.daily  # type: ignore[attr-defined]
-        today = today_utc()
+        to_day = today()
         return RequestResult.approve(data={
             "last_daily_claimed":    inv.last_daily_claimed,
             "last_calendar_claimed": inv.last_calendar_claimed,
-            "daily_done":            inv.last_daily_claimed == today,
-            "calendar_done":         inv.last_calendar_claimed == today,
+            "daily_done":            inv.last_daily_claimed == to_day,
+            "calendar_done":         inv.last_calendar_claimed == to_day,
             "calendar_day":          inv.day,
             "can_claim_calendar":    inv.can_claim_calendar,
             "stats":                 self._stats.data,
@@ -304,7 +301,7 @@ class DailyProfession(BaseProfession):
                 return
 
             inv: DailyInventory = bot.inventory.daily  # type: ignore[attr-defined]
-            today       = today_utc()
+            to_day       = today()
             claimed_any = False
 
             if plan.get("do_daily"):
@@ -312,7 +309,7 @@ class DailyProfession(BaseProfession):
                 success, result = bot.session.claim_daily()
                 self._stats.daily_results = result
                 if success:
-                    inv.last_daily_claimed = today
+                    inv.last_daily_claimed = to_day
                     claimed_any = True
                     log.info(f"[{bot.account_id}] ✅ Звичайний бонус зібрано: {result}")
 
@@ -322,7 +319,7 @@ class DailyProfession(BaseProfession):
                 success, result = bot.session.claim_calendar(day)
                 self._stats.calendar_results = result
                 if success:
-                    inv.last_calendar_claimed = today
+                    inv.last_calendar_claimed = to_day
                     inv.can_claim_calendar    = False
                     claimed_any = True
                     log.info(f"[{bot.account_id}] ✅ Календарний бонус зібрано: {result}")
@@ -331,15 +328,15 @@ class DailyProfession(BaseProfession):
 
             if self._scheduler is not None and claimed_any:
                 both_done = (
-                    inv.last_daily_claimed    == today
-                    and inv.last_calendar_claimed == today
+                    inv.last_daily_claimed    == to_day
+                    and inv.last_calendar_claimed == to_day
                 )
                 self._scheduler.emit_event(
                     "daily.all_claimed" if both_done else "daily.claimed",
                     {
                         "account_id":    bot.account_id,
-                        "daily_done":    inv.last_daily_claimed == today,
-                        "calendar_done": inv.last_calendar_claimed == today,
+                        "daily_done":    inv.last_daily_claimed == to_day,
+                        "calendar_done": inv.last_calendar_claimed == to_day,
                         "calendar_day":  inv.day,
                     },
                     source=bot.account_id,

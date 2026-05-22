@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Iterator
 
+from src.utils.time import now
+
 
 class LogReader:
     def __init__(self, log_dir: str | Path = "logs"):
@@ -82,7 +84,7 @@ class LogReader:
         if not path.exists():
             return []
 
-        cutoff  = datetime.now() - timedelta(hours=since_hours)
+        cutoff  = now() - timedelta(hours=since_hours)
         pattern = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
         result: list[str] = []
 
@@ -92,7 +94,7 @@ class LogReader:
                 if m:
                     try:
                         ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-                        if ts >= cutoff:
+                        if ts.replace(tzinfo=cutoff.tzinfo) >= cutoff:
                             result.append(line.rstrip("\n"))
                     except ValueError:
                         pass
