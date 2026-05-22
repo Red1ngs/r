@@ -57,21 +57,26 @@ from src.bot.admin.services.scheduler_service import SchedulerService
 from src.database.repository.account import AccountRepository
 
 def restore_accounts_from_db(
-    service: SchedulerService, 
-    repository: AccountRepository
+    service:    SchedulerService,
+    repository: AccountRepository,
 ) -> int:
-    """Завантажує всі активні акаунти з бази в шедулер."""
     restored = 0
-    accounts_map = repository.get_all_accounts()
+    for row in repository.get_all_accounts():
+        ok, err = service.add_account(row.id, row.email)
+        if not ok:
+            log.warning(f"[restore] '{row.id}' пропущено: {err}")
+            continue
 
-    for acc_id, email in accounts_map.items():
-        ok, err = service.add_account(acc_id, email)
-        if ok:
-            restored += 1
-            log.info(f"[restore] '{acc_id}' відновлено")
+        if row.profession:
+            ok2, err2 = service.assign_profession(row.id, row.profession)
+            if ok2:
+                log.info(f"[restore] '{row.id}' → profession={row.profession!r}")
+            else:
+                log.error(f"[restore] '{row.id}' profession failed: {err2}")
         else:
-            log.warning(f"[restore] '{acc_id}' пропущено: {err}")
-            
+            log.warning(f"[restore] '{row.id}' без profession — тригерів не буде")
+
+        restored += 1
     return restored
 
 # ── Admin Telegram Bot ────────────────────────────────────────────────────────

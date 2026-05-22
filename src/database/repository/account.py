@@ -32,8 +32,12 @@ class AccountRepository:
         ).fetchone()
         return self._to_model(row) if row else None
     
-    def get_all_accounts(self) -> dict[str, str]:
-        return dict(self._conn.execute("SELECT id, email FROM accounts").fetchall())
+    def get_all_accounts(self) -> list[AccountRow]:
+        """Всі акаунти з БД для відновлення при старті."""
+        rows = self._conn.execute(
+            "SELECT * FROM accounts ORDER BY id"
+        ).fetchall()
+        return [self._to_model(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Writes
