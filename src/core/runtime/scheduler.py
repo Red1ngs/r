@@ -332,10 +332,13 @@ class EventDrivenScheduler:
             self._router.register(account_id, profession)
 
             triggers = profession.build_triggers(account_id)
+
+            # restore_state() може мутувати _next_fire / _in_flight тригера,
+            # тому реєструємо тригери тільки ПІСЛЯ відновлення стану.
+            await profession.restore_state(bot)
+
             if triggers:
                 entry.add_triggers(triggers, profession.profession_id)
-
-            await profession.restore_state(bot)
 
             tasks = profession.startup_tasks(bot)
             if tasks:
@@ -348,21 +351,39 @@ class EventDrivenScheduler:
 
     def remove_profession_from_account(self, account_id: str, profession_id: str) -> None:
         """Видаляє професію з акаунта, знімає її тригери та видаляє з роутера запитів."""
+        profession_obj = None
         with self._lock:
             entry = self._entries.get(account_id)
             professions = self._professions.get(account_id, [])
-            
+
             if entry:
                 # Очищаємо тригери цієї конкретної професії
                 entry.remove_profession_triggers(profession_id)
                 entry.worker.clear()
 
-            # Видаляємо об'єкт професії зі списку
-            self._professions[account_id] = [p for p in professions if p.profession_id != profession_id]
+            # Знаходимо та видаляємо об'єкт професії зі списку
+            remaining = []
+            for p in professions:
+                if p.profession_id == profession_id:
+                    profession_obj = p
+                else:
+                    remaining.append(p)
+            self._professions[account_id] = remaining
+
+        # Викликаємо teardown() ПОЗА локом, щоб уникнути дедлоку.
+        # Це звільняє підписки на EventBus та інші ресурси profession.
+        if profession_obj is not None:
+            self._run_async(self._teardown_professions(account_id, [profession_obj]))
 
         self._router.unregister(account_id, profession_id)
         log.info(f"[{account_id}] profession {profession_id!r} dynamically removed")
         
+    def wakeup(self) -> None:
+        """Публічний метод для примусового пробудження monitor loop.
+        Використовується profession-ами замість прямого доступу до _wakeup.
+        """
+        self._wakeup.set()
+
     def reschedule_trigger(self, account_id: str, trigger_name: str, run_at: RunAt) -> bool:
         """
         Знаходить тригер акаунта за назвою та змінює його запланований час.
@@ -528,10 +549,14 @@ class EventDrivenScheduler:
                 self._router.register(account_id, profession)
 
                 triggers = profession.build_triggers(account_id)
+
+                # restore_state() може мутувати _next_fire / _in_flight тригера,
+                # тому реєструємо тригери тільки ПІСЛЯ відновлення стану —
+                # щоб monitor loop не побачив тригер до того як він готовий.
+                await profession.restore_state(bot)
+
                 if triggers:
                     entry.add_triggers(triggers, profession.profession_id)
-
-                await profession.restore_state(bot)
 
                 tasks = profession.startup_tasks(bot)
                 if tasks:
@@ -558,10 +583,13 @@ class EventDrivenScheduler:
                 self._router.register(account_id, profession)
 
                 triggers = profession.build_triggers(account_id)
+
+                # restore_state() може мутувати _next_fire / _in_flight тригера,
+                # тому реєструємо тригери тільки ПІСЛЯ відновлення стану.
+                await profession.restore_state(bot)
+
                 if triggers:
                     entry.add_triggers(triggers, profession.profession_id)
-
-                await profession.restore_state(bot)
 
                 tasks = profession.startup_tasks(bot)
                 if tasks:

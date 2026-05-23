@@ -174,18 +174,17 @@ class DailyProfession(BaseProfession):
 
         if all_done:
             # Бонус вже зібрано — переносимо тригер на завтра.
-            # Без цього _next_fire в минулому → is_due()=True → негайний повторний запуск.
+            # Без цього next_fire в минулому → is_due()=True → негайний повторний запуск.
             self._trigger.advance_to_next_day_at(self._scheduled_at)
-            next_dt = format_ts(self._trigger._next_fire)
+            next_dt = format_ts(self._trigger.next_fire)
             log.info(
                 f"[{self._account_id}] 🎁 Бонус вже зібрано — "
                 f"наступний запуск: {next_dt}"
             )
-        elif self._trigger._next_fire < now_ts():
+        elif self._trigger.next_fire < now_ts():
             # Бонус не зібрано, але запланований час вже пройшов (бот упав до збору).
             # Запускаємо негайно на наступному тіку scheduler.
-            self._trigger._next_fire = now_ts()
-            self._trigger._in_flight = False
+            self._trigger.reschedule("+0s")
             log.info(
                 f"[{self._account_id}] 🎁 Пропущений запуск виявлено — запуск негайно"
             )
@@ -245,8 +244,6 @@ class DailyProfession(BaseProfession):
         })
 
     async def _handle_force_claim(self, ctx: "RequestContext") -> RequestResult:
-        import time as _time
-
         inv: DailyInventory = ctx.bot.inventory.daily  # type: ignore[attr-defined]
         inv.last_daily_claimed    = None  # type: ignore[assignment]
         inv.last_calendar_claimed = None  # type: ignore[assignment]
@@ -254,8 +251,8 @@ class DailyProfession(BaseProfession):
         ctx.bot.repo.inventory.save(ctx.account_id, ctx.bot.inventory)
 
         if self._trigger is not None:
-            self._trigger._next_fire = _time.time()
-            self._trigger._in_flight = False
+            # Використовуємо публічне API: reschedule скидає _in_flight та ставить час
+            self._trigger.reschedule("+0s")
 
         log.info(f"[{ctx.account_id}] DailyProfession: force_claim → стан скинуто, тригер активовано")
         return RequestResult.approve(data={"status": "reset, will claim on next tick"})

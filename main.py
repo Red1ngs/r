@@ -41,6 +41,11 @@ from src.core.config.app import AppConfig
 
 app_cfg = AppConfig.from_yaml("app.yaml")
 
+# ─── Налаштування часової зони (─────────────────────────────────────────
+from src.utils.time import set_timezone
+
+set_timezone("Europe/Kiev")  # або "UTC+3", або "Europe/Kiev" (якщо встановлено zoneinfo/pytz)
+
 # ── Scheduler (Singleton, порожній) ───────────────────────────────────────────
 from src.core.account import Account
 from src.core.runtime.scheduler import EventDrivenScheduler

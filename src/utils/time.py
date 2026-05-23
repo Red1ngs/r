@@ -26,21 +26,28 @@ def set_timezone(tz: str | datetime.timezone | None) -> None:
         _tz = datetime.timezone.utc
         return
 
+    # 1. Пробуємо ZoneInfo (вимагає pip install tzdata на Windows)
     try:
-        from zoneinfo import ZoneInfo
-        _tz = ZoneInfo(s)  # type: ignore
-        return
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            _tz = ZoneInfo(s)  # type: ignore
+            return
+        except ZoneInfoNotFoundError:
+            pass # Йдемо далі до pytz
     except ImportError:
         pass
+
+    # 2. Пробуємо pytz (як запасний варіант)
     try:
         import pytz
         _tz = pytz.timezone(s)  # type: ignore
         return
-    except ImportError:
+    except (ImportError, Exception):
         pass
 
-    raise ValueError(f"Не вдалося розпізнати timezone {tz!r}")
-
+    raise ValueError(f"Не вдалося розпізнати timezone {tz!r}. "
+                     f"Порада: встановіть 'tzdata' (pip install tzdata)")
+    
 def _parse_offset(s: str) -> datetime.timezone:
     s = s.strip()
     sign = -1 if s.startswith("-") else 1
@@ -72,6 +79,18 @@ def next_timestamp_for_time(hh_mm: str) -> float:
     if target <= n:
         target += datetime.timedelta(days=1)
     return target.timestamp()
+
+def next_day_timestamp_for_time(hh_mm: str) -> float:
+    """Повертає Unix timestamp завтрашнього дня о заданому часі HH:MM.
+    На відміну від next_timestamp_for_time — завжди завтра, навіть якщо час ще не настав сьогодні.
+    Використовується щоб не повторити тригер в той самий день після restore_state().
+    """
+    h, m = map(int, hh_mm.split(":"))
+    n = now()
+    tomorrow = (n + datetime.timedelta(days=1)).replace(
+        hour=h, minute=m, second=0, microsecond=0
+    )
+    return tomorrow.timestamp()
 
 def parse_to_ts(s: str) -> float:
     """

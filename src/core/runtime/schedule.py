@@ -11,7 +11,7 @@ from typing import (
     TYPE_CHECKING, Callable, Iterable, Optional, Protocol, runtime_checkable,
 )
 
-from src.utils.time import now_ts, parse_to_ts
+from src.utils.time import now_ts, next_timestamp_for_time, next_day_timestamp_for_time
 
 if TYPE_CHECKING:
     from src.core.account import Account
@@ -53,7 +53,7 @@ def parse_run_at(run_at: RunAt) -> float:
     # 2. Точний час у форматі "HH:MM"
     if ":" in val and len(val) <= 5:
         try:
-            return parse_to_ts(val)
+            return next_timestamp_for_time(val)
         except Exception:
             pass
 
@@ -92,12 +92,33 @@ class BaseTrigger:
     """
     name:       str
     account_id: str
-    _next_fire: float = field(default=0.0, init=False)
-    _in_flight: bool  = field(default=False, init=False)
+    _next_fire:    float = field(default=0.0, init=False)
+    _in_flight:    bool  = field(default=False, init=False)
+    _dispatch_ts:  float = field(default=0.0, init=False)
+
+    # Максимальний час перебування в стані in_flight.
+    # Якщо pipeline впав і on_cycle_done() так і не викликався —
+    # watchdog скине _in_flight щоб тригер не завис назавжди.
+    FLIGHT_TIMEOUT: float = field(default=3600.0, init=False)
 
     # ── TriggerProtocol ───────────────────────────────────────────────────────
 
+    @property
+    def next_fire(self) -> float:
+        """Unix timestamp наступного запуску (read-only для зовнішнього коду)."""
+        return self._next_fire
+
+    @property
+    def in_flight(self) -> bool:
+        """True якщо тригер наразі виконується (задачі ще не завершені)."""
+        return self._in_flight
+
     def is_due(self) -> bool:
+        if self._in_flight:
+            # Watchdog: якщо тригер завис у in_flight довше ніж FLIGHT_TIMEOUT —
+            # скидаємо прапор щоб уникнути вічного заморожування.
+            if now_ts() - self._dispatch_ts > self.FLIGHT_TIMEOUT:
+                self._in_flight = False
         return not self._in_flight and now_ts() >= self._next_fire
 
     def is_expired(self, inv: "Inventories") -> bool:
@@ -110,6 +131,7 @@ class BaseTrigger:
 
     def dispatch(self) -> None:
         self._in_flight = True
+        self._dispatch_ts = now_ts()
         self._next_fire = float("inf")
 
     def advance(self, bot: "Account") -> None:

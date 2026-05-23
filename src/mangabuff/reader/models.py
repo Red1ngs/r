@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import  Any, Literal, Optional
 
 from src.database.repository.manga import MangaRow
+from src.utils.time import now_ts
 
 
 @dataclass
@@ -14,7 +14,7 @@ class ItemReceivedEvent:
     account_id:  str
     slot_name:   str
     reward:      dict[str, Any]
-    received_at: float = field(default_factory=time.time)
+    received_at: float = field(default_factory=now_ts)
 
 
 @dataclass

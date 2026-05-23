@@ -15,10 +15,11 @@ RateGuard  — вбудований rate-limiter.
 from __future__ import annotations
 
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
+
+from src.utils.time import monotonic
 
 if TYPE_CHECKING:
     from src.core.inventory.model import Inventories
@@ -87,14 +88,14 @@ class RateGuard:
 
     def tick(self) -> None:
         """Реєструє один виклик. Викликати перед або після кожного запиту."""
-        now = time.monotonic()
+        now = monotonic()
         with self._lock:
             self._calls.append(now)
             self._trim(now)
 
     def is_ok(self) -> bool:
         """True якщо кількість викликів за window не перевищує max_calls."""
-        now = time.monotonic()
+        now = monotonic()
         with self._lock:
             self._trim(now)
             return len(self._calls) < self.max_calls
@@ -106,7 +107,7 @@ class RateGuard:
     @property
     def current_rate(self) -> int:
         """Кількість викликів за поточне вікно."""
-        now = time.monotonic()
+        now = monotonic()
         with self._lock:
             self._trim(now)
             return len(self._calls)

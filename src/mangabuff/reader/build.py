@@ -21,7 +21,7 @@ from src.mangabuff.reader.inventory import ReaderInventory
 from src.mangabuff.reader.models import Chapter, ItemReceivedEvent, ReaderWork
 from src.mangabuff.reader.parsers import parse_catalog, parse_chapters
 from src.mangabuff.reader.stats import ReaderRewardStats
-from src.utils.time import today_utc
+from src.utils.time import today
 
 if TYPE_CHECKING:
     from src.core.account import Account
@@ -57,14 +57,14 @@ class ReaderTrigger(BaseTrigger):
 
     def next_delay(self, bot: "Account") -> float:
         scheduler = EventDrivenScheduler.get_instance()
-        today     = today_utc()
+        to_day     = today()
 
         # Якщо акаунту призначено професію Daily...
         if scheduler.has_profession(bot.account_id, "daily_claimer"):
             daily_inv = getattr(bot.inventory, "daily", None)
             
             # ...і бонус сьогодні ще НЕ зібрано
-            if daily_inv and daily_inv.last_daily_claimed != today:
+            if daily_inv and daily_inv.last_daily_claimed != to_day:
                 log.info(
                     f"[{bot.account_id}] ReaderTrigger: Щоденний бонус ще не зібрано. "
                     f"Засинаємо до події daily.claimed..."
@@ -342,7 +342,7 @@ class ReaderProfession(BaseProfession):
             # Переносимо запуск тригера на «зараз» і штовхаємо планувальник
             self._trigger.reschedule("+0s")
             if self._scheduler is not None:
-                self._scheduler._wakeup.set()
+                self._scheduler.wakeup()
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
 
