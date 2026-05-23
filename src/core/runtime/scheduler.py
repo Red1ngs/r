@@ -5,8 +5,8 @@ scheduler.py — EventDrivenScheduler. Єдиний Scheduler в системі.
 Старий клас Profession (dataclass) — більше не підтримується.
 
 Що є:
-  - AccountEntry                — тільки worker + triggers. Без professions list.
-  - EventDrivenScheduler        — singleton, runtime kernel.
+  - AccountContainer             — тільки worker + triggers.
+  - EventDrivenScheduler         — singleton, runtime kernel.
       monitor loop (sync thread) — dispatch triggers, check guards, reap dead
       async loop (daemon thread) — EventBus, RequestRouter
       BaseProfession registry    — setup/restore/teardown lifecycle
@@ -17,7 +17,7 @@ Lifecycle акаунта:
     → async: _setup_professions()
         → profession.setup()                (підписки на events)
         → profession.restore_state(bot)     (відновлення з Inventories)
-        → triggers з profession реєструються в entry
+        → triggers з profession реєструються в container
         → startup tasks → worker.assign()
     → _wakeup.set()                         (monitor прокидається)
 
@@ -50,6 +50,7 @@ from src.core.logging.loggers import get_scheduler_logger
 from src.core.runtime.event_bus import EventBus, EventCallback
 from src.core.runtime.request_router import RequestContext, RequestRouter
 from src.core.runtime.conditions import Condition
+from src.core.runtime.profession import BaseProfession
 from src.core.runtime.schedule import RunAt, TriggerProtocol
 from src.core.status import AccountStatus
 from src.core.tasks.base import AnyTask
@@ -61,59 +62,83 @@ _MAX_SLEEP = 30.0
 _MIN_SLEEP = 0.5
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AccountEntry — без Profession dataclass
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
-class AccountEntry:
+class AccountContainer:
     """
     Контейнер стану одного акаунта в Scheduler.
 
-    worker  — виконує tasks
-    guard   — account-level умова; False → kill account
-    triggers, trigger_owner — керуються Scheduler і BaseProfession
-
-    Немає поля professions: list[Profession] — видалено разом з legacy.
-    BaseProfession реєструються окремо в Scheduler._professions.
+    worker      — виконує tasks
+    guard       — account-level умова; False → kill account
+    professions — profession → її власні triggers (ownership закодований у ключі)
     """
-    worker: BotWorker
-    guard:  Optional[Condition] = None
-
-    triggers:      list[TriggerProtocol] = field(default_factory=list, init=False, repr=False)
-    trigger_owner: dict[int, str]        = field(default_factory=dict, init=False, repr=False)
+    worker:     BotWorker
+    guard:      Optional[Condition] = None
+    professions: dict["BaseProfession", list[TriggerProtocol]] = field(
+        default_factory=lambda: {}, init=False, repr=False
+    )
 
     def check_account_guard(self, inv: Inventories) -> bool:
         return self.guard is None or self.guard(inv)
 
-    def add_triggers(self, new_triggers: list[TriggerProtocol], owner: str) -> None:
-        for t in new_triggers:
-            self.triggers.append(t)
-            self.trigger_owner[id(t)] = owner
+    # ── Triggers ──────────────────────────────────────────────────────────────
 
-    def remove_profession_triggers(self, owner: str) -> int:
-        to_remove = [t for t in self.triggers if self.trigger_owner.get(id(t)) == owner]
-        for t in to_remove:
-            self.triggers.remove(t)
-            self.trigger_owner.pop(id(t), None)
-        return len(to_remove)
+    @property
+    def triggers(self) -> list[TriggerProtocol]:
+        """Всі тригери акаунта (з усіх profession)."""
+        return [t for ts in self.professions.values() for t in ts]
+
+    def add_profession(
+        self,
+        profession: "BaseProfession",
+        triggers: list[TriggerProtocol],
+    ) -> None:
+        self.professions[profession] = list(triggers)
+
+    def remove_profession(self, profession: "BaseProfession") -> int:
+        removed = self.professions.pop(profession, [])
+        return len(removed)
+
+    def remove_profession_by_id(self, profession_id: str) -> int:
+        target = next(
+            (p for p in self.professions if p.profession_id == profession_id), None
+        )
+        if target is None:
+            return 0
+        return self.remove_profession(target)
 
     def remove_trigger(self, trigger: TriggerProtocol) -> None:
-        try:
-            self.triggers.remove(trigger)
-        except ValueError:
-            pass
-        self.trigger_owner.pop(id(trigger), None)
+        for ts in self.professions.values():
+            try:
+                ts.remove(trigger)
+                return
+            except ValueError:
+                continue
 
     def remove_all_triggers(self) -> None:
-        self.triggers.clear()
-        self.trigger_owner.clear()
+        for ts in self.professions.values():
+            ts.clear()
+
+    def get_profession(self, profession_id: str) -> Optional["BaseProfession"]:
+        return next(
+            (p for p in self.professions if p.profession_id == profession_id), None
+        )
+
+    def has_profession(self, profession_id: str) -> bool:
+        return any(p.profession_id == profession_id for p in self.professions)
+
+    def profession_list(self) -> list["BaseProfession"]:
+        return list(self.professions.keys())
+
+    # ── Timing ────────────────────────────────────────────────────────────────
 
     def trigger_names(self) -> list[str]:
         return [t.name for t in self.triggers]
 
     def next_trigger_in(self) -> float:
-        finite = [s for t in self.triggers if (s := t.seconds_until()) != float("inf")]
+        finite = [
+            s for t in self.triggers
+            if (s := t.seconds_until()) != float("inf")
+        ]
         return min(finite) if finite else _MAX_SLEEP
 
 
@@ -165,8 +190,7 @@ class EventDrivenScheduler:
     def _init(self, on_dead: Optional[Callable[[Account], None]]) -> None:
         self._on_dead = on_dead
 
-        # Sync state
-        self._entries:    dict[str, AccountEntry]      = {}
+        self._containers:    dict[str, AccountContainer] = {}
         self._lock        = threading.Lock()
         self._stop        = threading.Event()
         self._wakeup      = threading.Event()
@@ -176,14 +200,10 @@ class EventDrivenScheduler:
             name="scheduler-monitor",
         )
 
-        # Async state
         self._event_bus   = EventBus()
         self._router      = RequestRouter()
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
-
-        # BaseProfession registry: account_id → list[BaseProfession]
-        self._professions: dict[str, list[Any]] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -211,7 +231,7 @@ class EventDrivenScheduler:
             self._loop_thread.join(timeout=10)
 
         with self._lock:
-            entries = dict(self._entries)
+            entries = dict(self._containers)
         for entry in entries.values():
             entry.worker.stop()
 
@@ -227,24 +247,22 @@ class EventDrivenScheduler:
         self,
         account_id:  str,
         bot:         Account,
-        professions: list[Any],
+        professions: list[BaseProfession],
         guard:       Optional[Condition] = None,
     ) -> None:
         worker = BotWorker(bot, on_error=lambda b: self._wakeup.set())
-        entry  = AccountEntry(worker=worker, guard=guard)
+        container  = AccountContainer(worker=worker, guard=guard)
 
         with self._lock:
-            if account_id in self._entries:
+            if account_id in self._containers:
                 raise ValueError(f"Акаунт {account_id!r} вже існує")
-            self._entries[account_id]    = entry
-            self._professions[account_id] = list(professions)
+            self._containers[account_id] = container
 
         worker.start()
 
         if bot.status == AccountStatus.DEAD:
             with self._lock:
-                self._entries.pop(account_id, None)
-                self._professions.pop(account_id, None)
+                self._containers.pop(account_id, None)
             if self._on_dead:
                 self._on_dead(bot)
             return
@@ -255,11 +273,11 @@ class EventDrivenScheduler:
 
     def remove_account(self, account_id: str) -> bool:
         with self._lock:
-            entry       = self._entries.pop(account_id, None)
-            professions = self._professions.pop(account_id, [])
+            entry = self._containers.pop(account_id, None)
         if entry is None:
             return False
 
+        professions = entry.profession_list()
         self._run_async(self._teardown_professions(account_id, professions))
         self._router.unregister_account(account_id)
         entry.remove_all_triggers()
@@ -269,7 +287,7 @@ class EventDrivenScheduler:
 
     def pause_account(self, account_id: str) -> bool:
         with self._lock:
-            entry = self._entries.get(account_id)
+            entry = self._containers.get(account_id)
         if entry is None or entry.worker.bot.status == AccountStatus.SUSPENDED:
             return False
         entry.worker.clear()
@@ -281,20 +299,21 @@ class EventDrivenScheduler:
 
     def resume_account(self, account_id: str) -> bool:
         with self._lock:
-            entry       = self._entries.get(account_id)
-            professions = self._professions.get(account_id, [])
-        if entry is None or entry.worker.bot.status != AccountStatus.SUSPENDED:
+            container = self._containers.get(account_id)
+        if container is None or container.worker.bot.status != AccountStatus.SUSPENDED:
             return False
 
-        entry.worker.bot.status = AccountStatus.IDLE
-        entry.worker.start()
+        professions = container.profession_list()
 
-        if entry.worker.bot.status == AccountStatus.DEAD:
+        container.worker.bot.status = AccountStatus.IDLE
+        container.worker.start()
+
+        if container.worker.bot.status == AccountStatus.DEAD:
             log.error(f"[{account_id}] resume: connect() провалився")
             return False
 
         self._run_async(
-            self._restore_professions(account_id, entry.worker.bot, professions, entry)
+            self._restore_professions(account_id, container.worker.bot, professions, container)
         )
         self._wakeup.set()
         log.info(f"[{account_id}] відновлено")
@@ -302,76 +321,54 @@ class EventDrivenScheduler:
 
     # ── Dynamic Profession Management ─────────────────────────────────────────
 
-    def add_profession_to_account(self, account_id: str, profession: "BaseProfession") -> None:
-        """Динамічно додає нову професію до вже існуючого акаунта."""
+    def add_profession_to_account(self, account_id: str, profession: BaseProfession) -> None:
         with self._lock:
-            if account_id not in self._entries:
+            container = self._containers.get(account_id)
+            if container is None:
                 raise ValueError(f"Акаунт {account_id!r} не знайдено")
-            entry = self._entries[account_id]
-            if account_id not in self._professions:
-                self._professions[account_id] = []
-            
-            # Уникаємо дублювання однієї професії
-            if any(p.profession_id == profession.profession_id for p in self._professions[account_id]):
+            if container.has_profession(profession.profession_id):
                 log.warning(f"[{account_id}] profession {profession.profession_id!r} already registered")
                 return
-                
-            self._professions[account_id].append(profession)
 
-        self._run_async(self._setup_single_profession(account_id, entry.worker.bot, profession, entry))
+        self._run_async(self._setup_single_profession(account_id, container.worker.bot, profession, container))
 
     async def _setup_single_profession(
-        self, 
-        account_id: str, 
-        bot: Account, 
-        profession: "BaseProfession", 
-        entry: AccountEntry
+        self,
+        account_id: str,
+        bot:        Account,
+        profession: BaseProfession,
+        container:      AccountContainer,
     ) -> None:
         try:
             await profession.setup(self, account_id)
             self._router.register(account_id, profession)
 
             triggers = profession.build_triggers(account_id)
-
-            # restore_state() може мутувати _next_fire / _in_flight тригера,
-            # тому реєструємо тригери тільки ПІСЛЯ відновлення стану.
             await profession.restore_state(bot)
 
-            if triggers:
-                entry.add_triggers(triggers, profession.profession_id)
+            container.add_profession(profession, triggers)
 
             tasks = profession.startup_tasks(bot)
             if tasks:
-                entry.worker.assign(*tasks)
+                container.worker.assign(*tasks)
 
             self._wakeup.set()
             log.info(f"[{account_id}] dynamic setup of {profession.profession_id!r} complete")
         except Exception as e:
-            log.error(f"[{account_id}] dynamic setup of {profession.profession_id!r} failed: {e}", exc_info=True)
+            log.error(
+                f"[{account_id}] dynamic setup of {profession.profession_id!r} failed: {e}",
+                exc_info=True,
+            )
 
     def remove_profession_from_account(self, account_id: str, profession_id: str) -> None:
-        """Видаляє професію з акаунта, знімає її тригери та видаляє з роутера запитів."""
         profession_obj = None
         with self._lock:
-            entry = self._entries.get(account_id)
-            professions = self._professions.get(account_id, [])
+            container = self._containers.get(account_id)
+            if container is not None:
+                profession_obj = container.get_profession(profession_id)
+                container.remove_profession_by_id(profession_id)
+                container.worker.clear()
 
-            if entry:
-                # Очищаємо тригери цієї конкретної професії
-                entry.remove_profession_triggers(profession_id)
-                entry.worker.clear()
-
-            # Знаходимо та видаляємо об'єкт професії зі списку
-            remaining = []
-            for p in professions:
-                if p.profession_id == profession_id:
-                    profession_obj = p
-                else:
-                    remaining.append(p)
-            self._professions[account_id] = remaining
-
-        # Викликаємо teardown() ПОЗА локом, щоб уникнути дедлоку.
-        # Це звільняє підписки на EventBus та інші ресурси profession.
         if profession_obj is not None:
             self._run_async(self._teardown_professions(account_id, [profession_obj]))
 
@@ -390,11 +387,11 @@ class EventDrivenScheduler:
         Після цього миттєво сигналізує монітору планувальника перерахувати час сну.
         """
         with self._lock:
-            entry = self._entries.get(account_id)
-        if not entry:
+            container = self._containers.get(account_id)
+        if not container:
             return False
             
-        for trigger in list(entry.triggers):
+        for trigger in list(container.triggers):
             if trigger.name == trigger_name:
                 trigger.reschedule(run_at)
                 log.info(f"[{account_id}] Тригер {trigger_name!r} успішно перенесено на {run_at}")
@@ -410,7 +407,7 @@ class EventDrivenScheduler:
 
     def push_task(self, account_id: str, task: AnyTask) -> bool:
         with self._lock:
-            entry = self._entries.get(account_id)
+            entry = self._containers.get(account_id)
         if entry is None:
             return False
         entry.worker.assign(task)
@@ -418,52 +415,49 @@ class EventDrivenScheduler:
 
     def has_account(self, account_id: str) -> bool:
         with self._lock:
-            return account_id in self._entries
+            return account_id in self._containers
         
     def has_profession(self, account_id: str, profession_id: str) -> bool:
-        """
-        Перевіряє, чи активна конкретна професія для акаунта в поточний момент.
-        """
         with self._lock:
-            profs = self._professions.get(account_id, [])
-        return any(p.profession_id == profession_id for p in profs)
+            container = self._containers.get(account_id)
+        return container.has_profession(profession_id) if container else False
 
     def get_bot(self, account_id: str) -> Optional[Account]:
         with self._lock:
-            entry = self._entries.get(account_id)
-        return entry.worker.bot if entry else None
+            container = self._containers.get(account_id)
+        return container.worker.bot if container else None
 
-    def get_entry(self, account_id: str) -> Optional[AccountEntry]:
+    def get_entry(self, account_id: str) -> Optional[AccountContainer]:
         with self._lock:
-            return self._entries.get(account_id)
+            return self._containers.get(account_id)
 
     def account_ids(self) -> list[str]:
         with self._lock:
-            return list(self._entries.keys())
+            return list(self._containers.keys())
 
     def status(self, account_id: str) -> Optional[AccountStatus]:
         with self._lock:
-            entry = self._entries.get(account_id)
+            entry = self._containers.get(account_id)
         return entry.worker.bot.status if entry else None
 
     def all_statuses(self) -> dict[str, AccountStatus]:
         with self._lock:
-            entries = dict(self._entries)
+            entries = dict(self._containers)
         return {aid: e.worker.bot.status for aid, e in entries.items()}
 
     def queue_size(self, account_id: str) -> Optional[int]:
         with self._lock:
-            entry = self._entries.get(account_id)
+            entry = self._containers.get(account_id)
         return entry.worker.queue_size if entry else None
 
     def trigger_names(self, account_id: str) -> list[str]:
         with self._lock:
-            entry = self._entries.get(account_id)
+            entry = self._containers.get(account_id)
         return entry.trigger_names() if entry else []
 
     def seconds_until_next(self, account_id: str) -> Optional[float]:
         with self._lock:
-            entry = self._entries.get(account_id)
+            entry = self._containers.get(account_id)
         return entry.next_trigger_in() if entry else None
 
     # ── EventBus API ──────────────────────────────────────────────────────────
@@ -536,11 +530,11 @@ class EventDrivenScheduler:
         self,
         account_id:  str,
         bot:         Account,
-        professions: list[Any],
+        professions: list[BaseProfession],
     ) -> None:
         with self._lock:
-            entry = self._entries.get(account_id)
-        if entry is None:
+            container = self._containers.get(account_id)
+        if container is None:
             return
 
         for profession in professions:
@@ -549,18 +543,13 @@ class EventDrivenScheduler:
                 self._router.register(account_id, profession)
 
                 triggers = profession.build_triggers(account_id)
-
-                # restore_state() може мутувати _next_fire / _in_flight тригера,
-                # тому реєструємо тригери тільки ПІСЛЯ відновлення стану —
-                # щоб monitor loop не побачив тригер до того як він готовий.
                 await profession.restore_state(bot)
 
-                if triggers:
-                    entry.add_triggers(triggers, profession.profession_id)
+                container.add_profession(profession, triggers)
 
                 tasks = profession.startup_tasks(bot)
                 if tasks:
-                    entry.worker.assign(*tasks)
+                    container.worker.assign(*tasks)
 
                 log.info(f"[{account_id}] {profession.profession_id!r} ready")
             except Exception as e:
@@ -575,25 +564,21 @@ class EventDrivenScheduler:
         self,
         account_id:  str,
         bot:         Account,
-        professions: list[Any],
-        entry:       AccountEntry,
+        professions: list[BaseProfession],
+        container:       AccountContainer,
     ) -> None:
         for profession in professions:
             try:
                 self._router.register(account_id, profession)
 
                 triggers = profession.build_triggers(account_id)
-
-                # restore_state() може мутувати _next_fire / _in_flight тригера,
-                # тому реєструємо тригери тільки ПІСЛЯ відновлення стану.
                 await profession.restore_state(bot)
 
-                if triggers:
-                    entry.add_triggers(triggers, profession.profession_id)
+                container.add_profession(profession, triggers)
 
                 tasks = profession.startup_tasks(bot)
                 if tasks:
-                    entry.worker.assign(*tasks)
+                    container.worker.assign(*tasks)
 
                 log.info(f"[{account_id}] {profession.profession_id!r} resumed")
             except Exception as e:
@@ -605,7 +590,7 @@ class EventDrivenScheduler:
     async def _teardown_professions(
         self,
         account_id:  str,
-        professions: list[Any],
+        professions: list[BaseProfession],
     ) -> None:
         for profession in professions:
             try:
@@ -629,10 +614,9 @@ class EventDrivenScheduler:
 
     def _check_guards(self) -> None:
         with self._lock:
-            entries     = dict(self._entries)
-            professions = {k: list(v) for k, v in self._professions.items()}
+            containers = dict(self._containers)
 
-        for account_id, entry in entries.items():
+        for account_id, entry in containers.items():
             bot = entry.worker.bot
             inv = bot.inventory
 
@@ -641,9 +625,9 @@ class EventDrivenScheduler:
                 self._kill_account(account_id, entry)
                 continue
 
-            for profession in professions.get(account_id, []):
+            for profession in entry.profession_list():
                 if not profession.check_guard(bot):
-                    removed = entry.remove_profession_triggers(profession.profession_id)
+                    removed = entry.remove_profession(profession)
                     entry.worker.clear()
                     log.info(
                         f"[{account_id}] {profession.profession_id!r} guard failed "
@@ -652,7 +636,7 @@ class EventDrivenScheduler:
 
     def _dispatch_triggers(self) -> float:
         with self._lock:
-            entries = dict(self._entries)
+            entries = dict(self._containers)
         next_wakeup = _MAX_SLEEP
 
         for account_id, entry in entries.items():
@@ -700,33 +684,31 @@ class EventDrivenScheduler:
 
     def _reap_dead_workers(self) -> None:
         with self._lock:
-            entries = dict(self._entries)
+            containers = dict(self._containers)
 
-        for account_id, entry in entries.items():
+        for account_id, entry in containers.items():
             if entry.worker.bot.status != AccountStatus.DEAD:
                 continue
             log.warning(f"[{account_id}] dead → cleanup")
             entry.remove_all_triggers()
             entry.worker.stop()
             with self._lock:
-                self._entries.pop(account_id, None)
-                self._professions.pop(account_id, None)
+                self._containers.pop(account_id, None)
             self._router.unregister_account(account_id)
             if self._on_dead:
                 self._on_dead(entry.worker.bot)
 
-    def _kill_account(self, account_id: str, entry: AccountEntry) -> None:
-        entry.worker.clear()
-        entry.remove_all_triggers()
-        entry.worker.bot.mark_dead("account guard failed")
-        entry.worker.bot.repo.inventory.save(account_id, entry.worker.bot.inventory)
-        entry.worker.stop()
+    def _kill_account(self, account_id: str, container: AccountContainer) -> None:
+        container.worker.clear()
+        container.remove_all_triggers()
+        container.worker.bot.mark_dead("account guard failed")
+        container.worker.bot.repo.inventory.save(account_id, container.worker.bot.inventory)
+        container.worker.stop()
         with self._lock:
-            self._entries.pop(account_id, None)
-            self._professions.pop(account_id, None)
+            self._containers.pop(account_id, None)
         self._router.unregister_account(account_id)
         if self._on_dead:
-            self._on_dead(entry.worker.bot)
+            self._on_dead(container.worker.bot)
 
     # ── Async bridge ──────────────────────────────────────────────────────────
 

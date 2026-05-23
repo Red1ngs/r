@@ -143,7 +143,7 @@ class BotWorker:
         now = time.monotonic()
         with self._lock:
             while self._waiting and self._waiting[0][0] <= now:
-                run_at, seq, task = heapq.heappop(self._waiting)
+                _run_at, seq, task = heapq.heappop(self._waiting)
                 heapq.heappush(self._ready, (task.priority, seq, task))
 
     def _next_wake(self) -> float:
@@ -155,7 +155,7 @@ class BotWorker:
 
     def _execute(self, task: AnyTask) -> TaskResult:
         self._bot.mark_working()
-        self._task_log.info(f"▶ START  '{task.name}'  retry={task._retries}/{task.max_retries}")
+        self._task_log.info(f"▶ START  '{task.name}'  retry={task.retries}/{task.max_retries}")
         try:
             value  = task.run(self._bot)
             result = TaskResult(task=task, success=True, value=value)

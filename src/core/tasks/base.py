@@ -52,6 +52,10 @@ class _RetryMixin:
     @property
     def can_retry(self) -> bool:
         return self._retries < self.max_retries
+    
+    @property
+    def retries(self) -> bool:
+        return self._retries < self.max_retries
 
     def increment_retry(self) -> None:
         self._retries += 1
