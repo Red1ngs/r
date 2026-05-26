@@ -9,8 +9,15 @@ class RateLimiter:
 
     def wait(self) -> None:
         with self._lock:
-            elapsed = time.monotonic() - self._last_call
-            wait    = self._min_interval - elapsed
+            now = time.monotonic()
+            elapsed = now - self._last_call
+            wait = self._min_interval - elapsed
+            
             if wait > 0:
-                time.sleep(wait)
-            self._last_call = time.monotonic()
+                self._last_call = now + wait
+            else:
+                wait = 0.0
+                self._last_call = now
+
+        if wait > 0:
+            time.sleep(wait)

@@ -29,8 +29,9 @@ async def cb_slots(call: CallbackQuery, state: FSMContext, svc: SchedulerService
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return
-    if info.profession != "reader":
-        await call.answer("❌ Слоти доступні тільки для reader", show_alert=True)
+    
+    if "reader" not in info.professions:
+        await call.answer("❌ Слоти доступні тільки для акаунтів з reader", show_alert=True)
         return
 
     # Запитуємо поточний стан слотів через RequestRouter

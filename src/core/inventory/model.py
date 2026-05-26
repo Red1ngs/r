@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from src.mangabuff.personal.inventory import PersonalInventory
     from src.mangabuff.alliance.inventory import AllianceInventory
     from src.mangabuff.daily.inventory import DailyInventory
+    from src.mangabuff.quiz.inventory import QuizInventory
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +54,7 @@ class DynamicInventories:
         alliance: "AllianceInventory"
         reader:   "ReaderInventory"
         daily:    "DailyInventory"
+        quiz:     "QuizInventory"
 
     def __repr__(self) -> str:
         parts = " ".join(

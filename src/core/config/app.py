@@ -71,6 +71,21 @@ class ReaderAppCfg:
             if slot.matches(reward):
                 return slot
         return None
+    
+
+@dataclass(frozen=True)
+class QuizCfg:
+    mode:         str
+    answer_limit: int   
+    answer_delay: float
+ 
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "QuizCfg":
+        return cls(
+            mode=str(d.get("mode", "daily")),
+            answer_limit=int(d.get("answer_limit", 5)),
+            answer_delay=float(d.get("answer_delay", 8.0)),
+        )
 
 
 @dataclass(frozen=True)
@@ -96,9 +111,10 @@ class DailyCfg:
 
 @dataclass(frozen=True)
 class AppConfig:
-    reader:    ReaderAppCfg
+    reader: ReaderAppCfg
     daily: DailyCfg
-
+    quiz: QuizCfg
+    
     @classmethod
     def from_yaml(
         cls, 
@@ -114,5 +130,6 @@ class AppConfig:
 
         return cls(
             reader=ReaderAppCfg.from_dict(raw_data.get("reader", {})),
-            daily=DailyCfg.from_dict(raw_data.get("daily", {}))
+            daily=DailyCfg.from_dict(raw_data.get("daily", {})),
+            quiz=QuizCfg.from_dict(raw_data.get("quiz", {}))
         )

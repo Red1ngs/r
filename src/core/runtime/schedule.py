@@ -99,7 +99,7 @@ class BaseTrigger:
     # Максимальний час перебування в стані in_flight.
     # Якщо pipeline впав і on_cycle_done() так і не викликався —
     # watchdog скине _in_flight щоб тригер не завис назавжди.
-    FLIGHT_TIMEOUT: float = field(default=3600.0, init=False)
+    FLIGHT_TIMEOUT: float = field(default=300.0, init=False)
 
     # ── TriggerProtocol ───────────────────────────────────────────────────────
 
@@ -139,9 +139,7 @@ class BaseTrigger:
         self._in_flight = False
 
     def reschedule(self, run_at: RunAt) -> None:
-        """
-        Дозволяє у будь-який момент примусово змінити запланований час запуску.
-        """
+        """Дозволяє у будь-який момент примусово змінити запланований час запуску."""
         self._next_fire = parse_run_at(run_at)
         self._in_flight = False  # Розблоковуємо, якщо тригер був заморожений
 

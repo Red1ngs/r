@@ -11,8 +11,8 @@ from httpx._types import URLTypes
 from src.core.config.bot import BotConfig
 from src.core.config.app import AppConfig
 from src.core.utils.rate_limiter import RateLimiter
-from src.mangabuff.parsers.csrf_token import get_csrf_from_html
-from src.mangabuff.parsers.daily import get_claimable_day
+from src.mangabuff.csrf_token import get_csrf_from_html
+from src.mangabuff.daily.parser import get_claimable_day
 from src.utils.log_section import section
 from src.utils.logging import log_request, log_response
 
@@ -201,7 +201,7 @@ class BotTransport:
         assert self.client
         self.headers.referer = self.bot_config.client.base_url
         try:
-            r = self.client.get("/login", headers=self.headers.get_navigation())
+            r = self.get("/login", headers=self.headers.get_navigation())
             r.raise_for_status()
             token, _ = get_csrf_from_html(r.text)
             if not token:
@@ -225,7 +225,7 @@ class BotTransport:
             "_token":   self.headers.csrf_token or "",
         }
         try:
-            r = self.client.post("/login", data=payload, headers=self.headers.get_ajax(is_post=True))
+            r = self.post("/login", data=payload, headers=self.headers.get_ajax(is_post=True))
             if r.status_code not in (200, 204, 302):
                 log.warning(f"  → login POST returned {r.status_code}")
                 return False
@@ -241,7 +241,7 @@ class BotTransport:
     def check_auth(self) -> bool:
         assert self.client
         try:
-            r = self.client.get(self.bot_config.client.base_url, headers=self.headers.get_navigation())
+            r = self.get(self.bot_config.client.base_url, headers=self.headers.get_navigation())
             r.raise_for_status()
             token, user_name = get_csrf_from_html(r.text)
             if token and user_name:
@@ -275,6 +275,9 @@ class BotTransport:
     def get(self, url: URLTypes, external: bool = False, **kwargs: Any) -> httpx.Response:
         assert self.client
 
+        if not external:
+            self._rate_limiter.wait()
+
         if external:
             kwargs.setdefault("headers", self.bot_config.browser.to_dict())
             kwargs["auth"] = None
@@ -287,6 +290,9 @@ class BotTransport:
 
     def post(self, url: URLTypes, external: bool = False, **kwargs: Any) -> httpx.Response:
         assert self.client
+
+        if not external:
+            self._rate_limiter.wait()
 
         if external:
             kwargs.setdefault("headers", self.bot_config.browser.to_dict())
@@ -430,3 +436,40 @@ class BotSession(BotTransport):
         except Exception as e:
             log.warning(f"  → fetch_more_chapters error: {e}")
             return ""
+        
+    # ── Quiz ───────────────────────────────────────────────────────
+    
+    def quiz_start(self) -> Optional[dict[str, Any]]:
+        """
+        POST /quiz/start — відкриває нову сесію та повертає перше питання.
+        Повертає dict питання або None при помилці.
+        """
+        try:
+            r = self.post("/quiz/start", timeout=15)
+            if r.status_code == 200:
+                return r.json().get("question")
+            log.warning(f"  → quiz_start: {r.status_code}")
+            return None
+        except Exception as e:
+            log.error(f"  → quiz_start error: {e}")
+            return None
+        
+    def quiz_answer(self, answer: str) -> Optional[dict[str, Any]]:
+        """
+        POST /quiz/answer  body: answer=<текст>
+        Повертає повну відповідь сервера або None при мережевій помилці.
+        """
+        try:
+            r = self.post(
+                "/quiz/answer",
+                data={"answer": answer},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                return r.json()
+            log.warning(f"  → quiz_answer: {r.status_code}")
+            return None
+        except Exception as e:
+            log.error(f"  → quiz_answer error: {e}")
+            return None
+ 

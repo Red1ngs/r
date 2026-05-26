@@ -65,6 +65,11 @@ def restore_accounts_from_db(
     service:    SchedulerService,
     repository: AccountRepository,
 ) -> int:
+    """
+    Відновлює акаунти після рестарту.
+    add_account() вже читає professions з БД і передає їх у scheduler —
+    тому тут НЕ треба викликати add_profession окремо.
+    """
     restored = 0
     for row in repository.get_all_accounts():
         ok, err = service.add_account(row.id, row.email)
@@ -72,12 +77,8 @@ def restore_accounts_from_db(
             log.warning(f"[restore] '{row.id}' пропущено: {err}")
             continue
 
-        if row.profession:
-            ok2, err2 = service.assign_profession(row.id, row.profession)
-            if ok2:
-                log.info(f"[restore] '{row.id}' → profession={row.profession!r}")
-            else:
-                log.error(f"[restore] '{row.id}' profession failed: {err2}")
+        if row.professions:
+            log.info(f"[restore] '{row.id}' → professions={row.professions}")
         else:
             log.warning(f"[restore] '{row.id}' без profession — тригерів не буде")
 

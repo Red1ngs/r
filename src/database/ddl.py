@@ -4,11 +4,12 @@ import sqlite3
 from pathlib import Path
 
 DDL = """
--- Існуючі таблиці (Accounts, Inventory, Events)
+-- Accounts
 CREATE TABLE IF NOT EXISTS accounts (
     id                TEXT PRIMARY KEY,
     email             TEXT NOT NULL UNIQUE,
-    profession        TEXT,
+    -- JSON array: '["reader","daily"]'  (замінює старе TEXT profession)
+    professions       TEXT NOT NULL DEFAULT '[]',
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -31,13 +32,10 @@ CREATE TABLE IF NOT EXISTS events (
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
--- ==========================================
--- НОВІ ТАБЛИЦІ ДЛЯ МАНГИ
--- ==========================================
-
+-- Manga
 CREATE TABLE IF NOT EXISTS mangas (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT, -- Внутрішній ID манги
-    data_id       INTEGER NOT NULL UNIQUE,           -- ID з data-id, зовнішнє
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    data_id       INTEGER NOT NULL UNIQUE,
     translit_name TEXT    NOT NULL,
     name          TEXT    NOT NULL,
     rating        TEXT    NOT NULL DEFAULT '',
@@ -48,11 +46,11 @@ CREATE TABLE IF NOT EXISTS mangas (
 );
 
 CREATE TABLE IF NOT EXISTS chapters (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT, -- Внутрішній ID глави
-    data_id      INTEGER NOT NULL UNIQUE,           -- Оригінальний ID глави (з сайту)
-    manga_id     INTEGER NOT NULL REFERENCES mangas(id) ON DELETE CASCADE, -- Внутрішній ID манги
-    chapter_num  REAL    NOT NULL, -- Номер глави (дробовий, напр. 10.5)
-    volume       INTEGER NOT NULL, -- Номер тому 
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    data_id      INTEGER NOT NULL UNIQUE,
+    manga_id     INTEGER NOT NULL REFERENCES mangas(id) ON DELETE CASCADE,
+    chapter_num  REAL    NOT NULL,
+    volume       INTEGER NOT NULL,
     date         TEXT,
     created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -65,46 +63,62 @@ CREATE TABLE IF NOT EXISTS account_reads (
     PRIMARY KEY (account_id, chapter_id)
 );
 
--- ==========================================
--- ІНДЕКСИ ДЛЯ ОПТИМІЗАЦІЇ
--- ==========================================
-
+-- Індекси
 CREATE INDEX IF NOT EXISTS idx_events_pending ON events(account_id, kind, status);
-
--- Індекс для швидкого пошуку глави за ID манги та сортування за номером
-CREATE INDEX IF NOT EXISTS idx_chapters_manga_lookup 
-    ON chapters(manga_id, chapter_num);
-
--- Індекс для швидкого пошуку непрочитаних
+CREATE INDEX IF NOT EXISTS idx_chapters_manga_lookup ON chapters(manga_id, chapter_num);
 CREATE INDEX IF NOT EXISTS idx_account_reads_lookup ON account_reads(account_id);
-
--- Індекс для пошуку манги за її транслітерацією
 CREATE INDEX IF NOT EXISTS idx_mangas_translit_name ON mangas(translit_name);
 
--- ==========================================
--- ТРИГЕРИ ДЛЯ ОНОВЛЕННЯ ЧАСУ (updated_at)
--- ==========================================
-
+-- Тригери updated_at
 CREATE TRIGGER IF NOT EXISTS trg_accounts_updated AFTER UPDATE ON accounts BEGIN
     UPDATE accounts SET updated_at = datetime('now') WHERE id = NEW.id;
 END;
-
 CREATE TRIGGER IF NOT EXISTS trg_inventory_updated AFTER UPDATE ON inventory BEGIN
-    UPDATE inventory SET updated_at = datetime('now') WHERE account_id = NEW.account_id AND kind = NEW.kind;
+    UPDATE inventory SET updated_at = datetime('now')
+    WHERE account_id = NEW.account_id AND kind = NEW.kind;
 END;
-
 CREATE TRIGGER IF NOT EXISTS trg_events_updated AFTER UPDATE ON events BEGIN
     UPDATE events SET updated_at = datetime('now') WHERE id = NEW.id;
 END;
-
 CREATE TRIGGER IF NOT EXISTS trg_mangas_updated AFTER UPDATE ON mangas BEGIN
     UPDATE mangas SET updated_at = datetime('now') WHERE id = NEW.id;
 END;
-
 CREATE TRIGGER IF NOT EXISTS trg_chapters_updated AFTER UPDATE ON chapters BEGIN
     UPDATE chapters SET updated_at = datetime('now') WHERE id = NEW.id;
 END;
 """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Migration: profession TEXT  →  professions TEXT (JSON array)
+# ─────────────────────────────────────────────────────────────────────────────
+_MIGRATION_ADD_PROFESSIONS = """
+-- Перевіряємо чи є стара колонка 'profession' і переносимо дані.
+-- SQLite не підтримує DROP COLUMN до 3.35, тому залишаємо сумісність.
+"""
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """
+    Ідемпотентні міграції схеми.
+    Виконуються після CREATE TABLE IF NOT EXISTS, тому безпечні для нових БД.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
+
+    # Стара схема мала 'profession TEXT' (одиничну)
+    if "profession" in cols and "professions" not in cols:
+        conn.execute("ALTER TABLE accounts ADD COLUMN professions TEXT NOT NULL DEFAULT '[]'")
+        # Переносимо наявні дані: profession → ["profession"]
+        conn.execute("""
+            UPDATE accounts
+            SET professions = json_array(profession)
+            WHERE profession IS NOT NULL AND profession != ''
+        """)
+        conn.commit()
+
+    # Якщо новій схемі bракує колонки (чиста БД вже має professions через DDL)
+    elif "professions" not in cols:
+        conn.execute("ALTER TABLE accounts ADD COLUMN professions TEXT NOT NULL DEFAULT '[]'")
+        conn.commit()
+
 
 def get_db(path: str | Path = "bot_state.db") -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), check_same_thread=False)
@@ -113,4 +127,5 @@ def get_db(path: str | Path = "bot_state.db") -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(DDL)
     conn.commit()
+    _apply_migrations(conn)
     return conn

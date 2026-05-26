@@ -32,6 +32,14 @@ class EventBus:
                 listeners.remove(callback)
             except ValueError:
                 pass
+            
+    def unsubscribe_owner(self, owner: object) -> None:
+        """Видаляє всі callbacks що належать owner (за __self__)."""
+        for listeners in self._subs.values():
+            listeners[:] = [
+                cb for cb in listeners
+                if getattr(cb, "__self__", None) is not owner
+            ]
 
     async def emit(
         self,

@@ -39,7 +39,7 @@ class AddAccountFSM(StatesGroup):
 def _success_kb(acc_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎓 Призначити профессію",
-                              callback_data=f"acc:profession:{acc_id}")],
+                              callback_data=f"acc:professions:{acc_id}")],
         [InlineKeyboardButton(text="📋 До списку", callback_data="acc:list")],
     ])
 
@@ -169,12 +169,21 @@ async def _finish_from_call(
 ) -> None:
     data = await state.get_data()
     await state.clear()
-    ok, err = svc.add_account(data["acc_id"], data["email"], data["password"], proxy)
+    acc_id   = data.get("acc_id")
+    email    = data.get("email")
+    password = data.get("password")
+    if not acc_id or not email or not password:
+        await call.message.edit_text(  # або message.answer для _finish_from_msg
+            "❌ Сесія додавання загублена. Почніть заново.",
+            reply_markup=_error_kb(),
+        )
+        return
+    ok, err = svc.add_account(acc_id, email, password, proxy)
     if ok:
         await call.message.edit_text(  # type: ignore[union-attr]
-            f"✅ Акаунт <code>{data['acc_id']}</code> додано!\n\n"
+            f"✅ Акаунт <code>{acc_id}</code> додано!\n\n"
             "Тепер <b>призначте профессію</b> щоб активувати тригери.",
-            reply_markup=_success_kb(data["acc_id"]),
+            reply_markup=_success_kb(acc_id),
         )
     else:
         await call.message.edit_text(  # type: ignore[union-attr]
@@ -196,13 +205,23 @@ async def _finish_from_msg(
     chat   = message.chat.id
     await state.clear()
 
-    ok, err = svc.add_account(data["acc_id"], data["email"], data["password"], proxy)
+    acc_id   = data.get("acc_id")
+    email    = data.get("email")
+    password = data.get("password")
+    if not acc_id or not email or not password:
+        await message.answer(
+            "❌ Сесія додавання загублена. Почніть заново.",
+            reply_markup=_error_kb(),
+        )
+        return
+    
+    ok, err = svc.add_account(acc_id, email, password, proxy)
     if ok:
         text = (
-            f"✅ Акаунт <code>{data['acc_id']}</code> додано!\n\n"
+            f"✅ Акаунт <code>{acc_id}</code> додано!\n\n"
             "Тепер <b>призначте профессію</b> щоб активувати тригери."
         )
-        kb = _success_kb(data["acc_id"])
+        kb = _success_kb(acc_id)
     else:
         text = f"❌ Помилка при додаванні:\n<code>{err}</code>"
         kb   = _error_kb()

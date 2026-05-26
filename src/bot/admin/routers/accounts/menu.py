@@ -18,56 +18,50 @@ from ._common import account_text, account_menu_kb, confirm_remove_kb
 router = Router(name="accounts:menu")
 
 
-def _render(call: CallbackQuery, svc: SchedulerService, acc_id: str, toast: str = ""):
-    """Спільний хелпер: отримує info і повертає (text, kb) або None якщо не знайдено."""
+async def _redraw(call: CallbackQuery, svc: SchedulerService, acc_id: str) -> None:
     info = svc.account_info(acc_id)
-    return info
+    if info:
+        await call.message.edit_text(  # type: ignore[union-attr]
+            account_text(info),
+            reply_markup=account_menu_kb(acc_id, info.status, bool(info.professions)),
+        )
 
 
 # ── Меню ──────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("acc:menu:"))
 async def cb_menu(call: CallbackQuery, svc: SchedulerService) -> None:
-    acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]
+    acc_id = call.data.split(":", 2)[2]
     info   = svc.account_info(acc_id)
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return
     await call.message.edit_text(  # type: ignore[union-attr]
         account_text(info),
-        reply_markup=account_menu_kb(acc_id, info.status, bool(info.profession)),
+        reply_markup=account_menu_kb(acc_id, info.status, bool(info.professions)),
     )
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("acc:refresh:"))
 async def cb_refresh(call: CallbackQuery, svc: SchedulerService) -> None:
-    acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]
+    acc_id = call.data.split(":", 2)[2]
     info   = svc.account_info(acc_id)
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return
     await call.message.edit_text(  # type: ignore[union-attr]
         account_text(info),
-        reply_markup=account_menu_kb(acc_id, info.status, bool(info.profession)),
+        reply_markup=account_menu_kb(acc_id, info.status, bool(info.professions)),
     )
     await call.answer("🔄 Оновлено")
 
 
 # ── Пауза / відновлення ───────────────────────────────────────────────────────
 
-async def _redraw(call: CallbackQuery, svc: SchedulerService, acc_id: str) -> None:
-    info = svc.account_info(acc_id)
-    if info:
-        await call.message.edit_text(  # type: ignore[union-attr]
-            account_text(info),
-            reply_markup=account_menu_kb(acc_id, info.status, bool(info.profession)),
-        )
-
-
 @router.callback_query(F.data.startswith("acc:pause:"))
 async def cb_pause(call: CallbackQuery, svc: SchedulerService) -> None:
-    acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]
+    acc_id = call.data.split(":", 2)[2]
     ok     = svc.pause(acc_id)
     await call.answer("⏸ Призупинено" if ok else "❌ Не вдалось", show_alert=not ok)
     if ok:
@@ -76,7 +70,7 @@ async def cb_pause(call: CallbackQuery, svc: SchedulerService) -> None:
 
 @router.callback_query(F.data.startswith("acc:resume:"))
 async def cb_resume(call: CallbackQuery, svc: SchedulerService) -> None:
-    acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]
+    acc_id = call.data.split(":", 2)[2]
     ok     = svc.resume(acc_id)
     await call.answer("▶️ Відновлено" if ok else "❌ Не вдалось", show_alert=not ok)
     if ok:
@@ -87,7 +81,7 @@ async def cb_resume(call: CallbackQuery, svc: SchedulerService) -> None:
 
 @router.callback_query(F.data.startswith("acc:remove:"))
 async def cb_remove(call: CallbackQuery) -> None:
-    acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]
+    acc_id = call.data.split(":", 2)[2]
     await call.message.edit_text(  # type: ignore[union-attr]
         f"🗑 Видалити акаунт <code>{acc_id}</code>?\nЦю дію не можна скасувати.",
         reply_markup=confirm_remove_kb(acc_id),
@@ -97,7 +91,7 @@ async def cb_remove(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("acc:remove_confirm:"))
 async def cb_remove_confirm(call: CallbackQuery, svc: SchedulerService) -> None:
-    acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]
+    acc_id = call.data.split(":", 2)[2]
     if not svc.remove(acc_id):
         await call.answer("❌ Не вдалось видалити", show_alert=True)
         return

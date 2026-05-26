@@ -123,7 +123,7 @@ class BaseProfession(ABC):
     async def teardown(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
         """
         Викликається при видаленні акаунта.
-        Override щоб відписатись від подій або скинути resources.
+        Override щоб скинути resources.
         """
         pass
 
@@ -147,6 +147,20 @@ class BaseProfession(ABC):
         """
         Tasks що виконуються одразу при старті акаунта.
         Override якщо треба init IO (завантажити дані, синхронізувати).
+
+        Базова реалізація автоматично тегує всі задачі через tag_profession.
+        Підкласам НЕ потрібно викликати tag_profession вручну.
+        """
+        tasks = self._startup_tasks(bot)
+        if tasks:
+            from src.core.tasks.base import tag_profession
+            tag_profession(tasks, self.profession_id)
+        return tasks
+
+    def _startup_tasks(self, bot: "Account") -> list["AnyTask"]:
+        """
+        Hook для підкласів. Повертає стартові задачі БЕЗ тегування.
+        Замінює пряме override startup_tasks() у підкласах.
         """
         return []
 

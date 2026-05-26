@@ -9,11 +9,9 @@ reader/build.py — ReaderProfession.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
-from src.core.runtime.schedule import BaseTrigger
 from src.core.runtime.scheduler import EventDrivenScheduler
 from src.core.tasks.base import AnyTask, Priority
 from src.core.tasks.pipeline import Step, pipeline
@@ -21,7 +19,7 @@ from src.mangabuff.reader.inventory import ReaderInventory
 from src.mangabuff.reader.models import Chapter, ItemReceivedEvent, ReaderWork
 from src.mangabuff.reader.parsers import parse_catalog, parse_chapters
 from src.mangabuff.reader.stats import ReaderRewardStats
-from src.utils.time import today
+from src.mangabuff.reader.trigger import ReaderTrigger
 
 if TYPE_CHECKING:
     from src.core.account import Account
@@ -41,41 +39,6 @@ _SLOT_NOT_READY: dict[str, Any] = {}
 def register_inventory() -> None:
     from src.core.inventory.factory import inventory_factory
     inventory_factory.register("reader", "reader", ReaderInventory)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ReaderTrigger — з урахуванням Daily
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class ReaderTrigger(BaseTrigger):
-    """
-    Тригер з динамічним next_delay — SlotScheduler знає, коли наступний слот.
-    Має вбудовану перевірку статусу збору Daily (streak).
-    """
-    _producer: Callable[["Account"], Iterable[AnyTask]]
-
-    def next_delay(self, bot: "Account") -> float:
-        scheduler = EventDrivenScheduler.get_instance()
-        to_day     = today()
-
-        # Якщо акаунту призначено професію Daily...
-        if scheduler.has_profession(bot.account_id, "daily_claimer"):
-            daily_inv = getattr(bot.inventory, "daily", None)
-            
-            # ...і бонус сьогодні ще НЕ зібрано
-            if daily_inv and daily_inv.last_daily_claimed != to_day:
-                log.info(
-                    f"[{bot.account_id}] ReaderTrigger: Щоденний бонус ще не зібрано. "
-                    f"Засинаємо до події daily.claimed..."
-                )
-                return float("inf")  # Нескінченне очікування події
-
-        # Якщо працюємо окремо або бонус уже зібрано — працюємо за розкладом слотів
-        return bot.inventory.reader.slot_scheduler.delay_until_next()  # type: ignore[attr-defined]
-
-    def producer(self, bot: "Account") -> Iterable[AnyTask]:
-        return self._producer(bot)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,9 +197,7 @@ class ReaderProfession(BaseProfession):
         self._account_id = account_id
         self._scheduler  = scheduler
         
-        # Підписуємося на подію успішного збору щоденного бонусу
         scheduler.subscribe("daily.claimed", self._on_daily_claimed)
-        scheduler.subscribe("daily.all_claimed", self._on_daily_claimed)
 
     async def restore_state(self, bot: "Account") -> None:
         """Відновлення стану (синхронізація конфігу з інвентарем БД)."""
@@ -252,8 +213,6 @@ class ReaderProfession(BaseProfession):
         )
 
     async def teardown(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
-        scheduler._event_bus.unsubscribe("daily.claimed", self._on_daily_claimed)
-        scheduler._event_bus.unsubscribe("daily.all_claimed", self._on_daily_claimed)
         self._stats.dump()
 
     # ── Triggers ──────────────────────────────────────────────────────────────
@@ -287,6 +246,10 @@ class ReaderProfession(BaseProfession):
             return await self._handle_reset_slots(ctx)
         if intent == "set_targets":
             return await self._handle_set_targets(data, ctx)
+        if intent == "force_parse":
+            return await self._handle_force_parse(data, ctx)
+        if intent == "mark_read":
+            return await self._handle_mark_read(data, ctx)
         return RequestResult.deny(f"unknown intent: {intent!r}")
 
     async def _handle_get_state(self, ctx: "RequestContext") -> RequestResult:
@@ -326,23 +289,147 @@ class ReaderProfession(BaseProfession):
         inv.target_slots = targets
         log.info(f"[{ctx.account_id}] ReaderProfession: змінено список цільових слотів → {targets}")
         return RequestResult.approve(data={"targets": targets})
+    
+    async def _handle_force_parse(
+        self,
+        data: dict[str, Any],
+        ctx:  "RequestContext",
+    ) -> RequestResult:
+        """
+        Примусово парсить вказану кількість манг із каталогу або за translit_name.
+
+        data:
+          limit   — кількість манг із каталогу (default=5, якщо targets не передано)
+          targets — список translit_name для точкового парсингу (stale-режим)
+        """
+        bot     = ctx.bot
+        limit   = int(data.get("limit", 5))
+        targets: list[str] = data.get("targets", [])
+
+        try:
+            if targets:
+                mangas_to_parse: list[Any] = []
+                for translit_name in targets:
+                    row = bot.repo.mangas.get_by_translit_name(translit_name)
+                    if row is None:
+                        log.warning(
+                            f"[{ctx.account_id}] force_parse: "
+                            f"manga {translit_name!r} не знайдено в БД — пропускаємо"
+                        )
+                        continue
+                    mangas_to_parse.append(row)
+
+                work = ReaderWork(mode="stale", targets=mangas_to_parse)
+                bot.inventory.reader.work = work  # type: ignore[attr-defined]
+                _fetch_stale(bot, work)
+
+            else:
+                work = ReaderWork(mode="catalog")
+                bot.inventory.reader.work = work  # type: ignore[attr-defined]
+
+                html = bot.session.fetch_manga_catalog(page=1)
+                if not html:
+                    return RequestResult.deny("Каталог тимчасово недоступний")
+
+                mangas = dict(list(parse_catalog(html).items())[:limit])
+                log.info(
+                    f"[{ctx.account_id}] force_parse: отримано {len(mangas)} манг із каталогу"
+                )
+
+                for manga in mangas.values():
+                    work.mangas_to_save.append(manga)
+                    html2 = bot.session.fetch_manga_chapters(manga.translit_name, manga.data_id)
+                    if not html2:
+                        continue
+                    for ch in parse_chapters(html2):
+                        work.chapters_to_save.append(Chapter(
+                            data_id     = ch.data_id,
+                            manga_id    = manga.data_id,
+                            chapter_num = ch.chapter_num,
+                            volume      = ch.volume,
+                            date        = ch.date,
+                        ))
+
+            _save_discovered_mangas(bot)
+            _save_discovered_chapters(bot)
+
+            saved_mangas   = len(work.mangas_to_save)
+            saved_chapters = len(work.chapters_to_save)
+            log.info(
+                f"[{ctx.account_id}] force_parse завершено: "
+                f"{saved_mangas} манг, {saved_chapters} глав збережено"
+            )
+            return RequestResult.approve(data={
+                "mangas":   saved_mangas,
+                "chapters": saved_chapters,
+            })
+
+        except Exception as exc:
+            log.exception(f"[{ctx.account_id}] force_parse: помилка")
+            return RequestResult.deny(str(exc))
+
+    async def _handle_mark_read(
+        self,
+        data: dict[str, Any],
+        ctx:  "RequestContext",
+    ) -> RequestResult:
+        """
+        Позначає всі збережені глави зазначених манг як прочитані для цього акаунта.
+
+        data:
+          targets — список translit_name манг (обов'язково)
+        """
+        bot     = ctx.bot
+        targets: list[str] = data.get("targets", [])
+
+        if not targets:
+            return RequestResult.deny("targets (список translit_name) обов'язковий")
+
+        total = 0
+        try:
+            for translit_name in targets:
+                row = bot.repo.mangas.get_by_translit_name(translit_name)
+                if row is None:
+                    log.warning(
+                        f"[{ctx.account_id}] mark_read: "
+                        f"manga {translit_name!r} не знайдено в БД — пропускаємо"
+                    )
+                    continue
+
+                sequence, _ = bot.repo.chapters.get_chapter_sequence(
+                    account_id=ctx.account_id,
+                    limit=10_000,
+                )
+                target_chapters = [
+                    ch for ch in sequence
+                    if ch["manga_id"] == row.data_id
+                ]
+                for ch in target_chapters:
+                    bot.repo.chapters.mark_chapter_read(ctx.account_id, int(ch["chapter_id"]))
+                    total += 1
+
+                log.info(
+                    f"[{ctx.account_id}] mark_read: "
+                    f"{translit_name!r} — позначено {len(target_chapters)} глав як прочитані"
+                )
+
+            return RequestResult.approve(data={"marked": total, "mangas": targets})
+
+        except Exception as exc:
+            log.exception(f"[{ctx.account_id}] mark_read: помилка")
+            return RequestResult.deny(str(exc))
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
+    # СТАЛО (просто і чисто):
     async def _on_daily_claimed(self, payload: dict[str, Any]) -> None:
-        """Реакція на подію успішного щоденного збору."""
         if payload.get("account_id") != self._account_id:
             return
-
-        log.info(
-            f"[{self._account_id}] ReaderProfession: отримано сигнал daily.claimed! "
-            f"Прокидаємось та запускаємо читання по слотах..."
-        )
+        log.info(f"[{self._account_id}] ReaderProfession: отримано сигнал daily.claimed, запускаємо читання.")
         if self._trigger is not None:
-            # Переносимо запуск тригера на «зараз» і штовхаємо планувальник
             self._trigger.reschedule("+0s")
-            if self._scheduler is not None:
-                self._scheduler.wakeup()
+        if self._scheduler is not None:
+            self._scheduler.wakeup()
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
 

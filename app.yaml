@@ -31,3 +31,12 @@ streak:
   item_selector: ".daily-rewards .daily-rewards-item"
   claim_text: "Забрать"
   day_attr: "data-day"
+
+quiz:
+  mode: daily          # "daily" — N відповідей на день (скидається при daily.claimed)
+                       # "fixed" — N відповідей один раз, не прив'язано до дня
+ 
+  answer_limit: 10      # кількість правильних відповідей до зупинки
+ 
+  answer_delay: 6     # секунди між відповідями (імітація читання питання)
+ 

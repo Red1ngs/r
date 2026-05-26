@@ -1,15 +1,12 @@
 """
 worker.py — BotWorker.
 
-Зміни відносно оригіналу:
-  1. set_http_logger() тепер викликається ТАКОЖ в start() перед connect(),
-     щоб HTTP-логи під час авторизації йшли у правильний файл акаунта,
-     а не у дефолтний 'http' logger.
-
-  2. auth_flow() в BotAuth тепер будує новий httpx.Request замість мутації
-     старого — це вирішує проблему з 419 (див. session.py).
-
-  Все інше — без змін.
+Зміни:
+  1. set_http_logger() викликається в start() перед connect().
+  2. Додано clear_profession(profession_id) — видаляє з черги тільки задачі
+     конкретної profession, не чіпаючи задачі інших.
+  3. assign() автоматично зберігає source_profession на spawned-задачах
+     якщо батьківська задача мала мітку.
 """
 from __future__ import annotations
 
@@ -75,12 +72,47 @@ class BotWorker:
                     heapq.heappush(self._ready, (task.priority, seq, task))
                 else:
                     heapq.heappush(self._waiting, (run_at_mono, seq, task))
-                self._task_log.debug(f"+ enqueue '{task.name}' p={task.priority}{label}")
+                self._task_log.debug(
+                    f"+ enqueue '{task.name}' p={task.priority}"
+                    f" prof={task.source_profession or '—'}{label}"
+                )
 
     def clear(self) -> None:
+        """Очищає всю чергу (усі profession)."""
         with self._lock:
             self._waiting.clear()
             self._ready.clear()
+
+    def clear_profession(self, profession_id: str) -> int:
+        """
+        Видаляє з черги задачі що належать вказаній profession.
+        Задачі інших profession та системні (source_profession=None) не чіпає.
+        Повертає кількість видалених задач.
+        """
+        removed = 0
+        with self._lock:
+            before_ready   = len(self._ready)
+            before_waiting = len(self._waiting)
+
+            self._ready = [
+                (p, s, t) for p, s, t in self._ready
+                if getattr(t, "source_profession", None) != profession_id
+            ]
+            heapq.heapify(self._ready)
+
+            self._waiting = [
+                (rt, s, t) for rt, s, t in self._waiting
+                if getattr(t, "source_profession", None) != profession_id
+            ]
+            heapq.heapify(self._waiting)
+
+            removed = (before_ready - len(self._ready)) + (before_waiting - len(self._waiting))
+
+        if removed:
+            self._task_log.info(
+                f"clear_profession({profession_id!r}): removed {removed} tasks"
+            )
+        return removed
 
     @property
     def queue_size(self) -> int:
@@ -90,11 +122,7 @@ class BotWorker:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        # ВИПРАВЛЕННЯ: встановлюємо HTTP-логер ДО connect(),
-        # щоб логи авторизації (GET /login, POST /login, check_auth)
-        # потрапляли у tasks/{account_id}_tasks.log, а не у 'http' logger.
         set_http_logger(self._task_log)
-
         if not self._bot.connect():
             self._bot.mark_dead("connect() failed on start")
             return
@@ -155,7 +183,12 @@ class BotWorker:
 
     def _execute(self, task: AnyTask) -> TaskResult:
         self._bot.mark_working()
-        self._task_log.info(f"▶ START  '{task.name}'  retry={task.retries}/{task.max_retries}")
+        self._task_log.info(
+            f"▶ START  '{task.name}'"
+            f"  prof={task.source_profession or '—'}"
+            f"  p={task.priority}"
+            f"  retry={task.retries}/{task.max_retries}"
+        )
         try:
             value  = task.run(self._bot)
             result = TaskResult(task=task, success=True, value=value)
@@ -163,6 +196,12 @@ class BotWorker:
 
             spawned = extract_spawned(value)
             if spawned:
+                # Успадковуємо мітку profession від батьківської задачі
+                parent_prof = getattr(task, "source_profession", None)
+                if parent_prof:
+                    for child in spawned:
+                        if getattr(child, "source_profession", None) is None:
+                            child.source_profession = parent_prof  # type: ignore[attr-defined]
                 self.assign(*spawned)
 
             self._emit_task_completed(task)
@@ -187,8 +226,9 @@ class BotWorker:
             from src.core.runtime.scheduler import EventDrivenScheduler
             scheduler = EventDrivenScheduler.get_instance()
             scheduler.emit_event("task.completed", {
-                "account_id": self._bot.account_id,
-                "task_name":  task.name,
+                "account_id":       self._bot.account_id,
+                "task_name":        task.name,
+                "source_profession": getattr(task, "source_profession", None),
             }, source=self._bot.account_id)
         except RuntimeError:
             pass

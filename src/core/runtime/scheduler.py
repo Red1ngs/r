@@ -1,38 +1,18 @@
 """
 scheduler.py — EventDrivenScheduler. Єдиний Scheduler в системі.
 
-Старий Scheduler.py видалено повністю.
-Старий клас Profession (dataclass) — більше не підтримується.
-
-Що є:
-  - AccountContainer             — тільки worker + triggers.
-  - EventDrivenScheduler         — singleton, runtime kernel.
-      monitor loop (sync thread) — dispatch triggers, check guards, reap dead
-      async loop (daemon thread) — EventBus, RequestRouter
-      BaseProfession registry    — setup/restore/teardown lifecycle
-
-Lifecycle акаунта:
-  add_account(id, bot, professions)
-    → worker.start()                        (sync thread)
-    → async: _setup_professions()
-        → profession.setup()                (підписки на events)
-        → profession.restore_state(bot)     (відновлення з Inventories)
-        → triggers з profession реєструються в container
-        → startup tasks → worker.assign()
-    → _wakeup.set()                         (monitor прокидається)
-
-  remove_account(id)
-    → async: profession.teardown()
-    → worker.stop()                         (зберігає inventory)
-    → router.unregister_account()
-
-Guard check (кожен tick):
-  Для кожного BaseProfession → profession.check_guard(bot)
-  False → знімаємо triggers цієї profession, worker.clear()
-
-Recovery після restart:
-  Inventories завантажені в Account.__init__ з БД.
-  profession.restore_state(bot) читає звідти — без нової БД.
+Зміни відносно попередньої версії:
+  1. add_profession_to_account():
+       — резервує слот під lock (container.add_profession з [] triggers)
+         щоб усунути race condition між двома паралельними викликами.
+       — передає profession_priority в _setup_single_profession.
+  2. remove_profession_from_account():
+       — замість container.worker.clear() викликає worker.clear_profession()
+         щоб не знищувати задачі інших profession.
+  3. _setup_professions / _setup_single_profession:
+       — обчислює ProfessionPriority за індексом profession у списку.
+       — передає його в trigger.producer і tag_profession для задач.
+  4. FLIGHT_TIMEOUT знижено до 300 s (з 3600).
 """
 from __future__ import annotations
 
@@ -53,7 +33,7 @@ from src.core.runtime.conditions import Condition
 from src.core.runtime.profession import BaseProfession
 from src.core.runtime.schedule import RunAt, TriggerProtocol
 from src.core.status import AccountStatus
-from src.core.tasks.base import AnyTask
+from src.core.tasks.base import AnyTask, ProfessionPriority, tag_profession
 from src.core.worker import BotWorker
 
 log = get_scheduler_logger()
@@ -67,14 +47,19 @@ class AccountContainer:
     """
     Контейнер стану одного акаунта в Scheduler.
 
-    worker      — виконує tasks
-    guard       — account-level умова; False → kill account
-    professions — profession → її власні triggers (ownership закодований у ключі)
+    professions: dict[BaseProfession, list[TriggerProtocol]]
+        Ключ — profession об'єкт, значення — її тригери.
+        Порядок dict (insertion order) = пріоритет:
+          перший вставлений → PRIMARY, другий → SECONDARY, решта → BACKGROUND.
     """
-    worker:     BotWorker
-    guard:      Optional[Condition] = None
+    worker:      BotWorker
+    guard:       Optional[Condition] = None
     professions: dict["BaseProfession", list[TriggerProtocol]] = field(
-        default_factory=lambda: {}, init=False, repr=False
+        default_factory=dict, init=False, repr=False
+    )
+    # Trigger-об'єкти збережені при pause(); None = акаунт не паузований.
+    _suspended_triggers: Optional[dict["BaseProfession", list[TriggerProtocol]]] = field(
+        default=None, init=False, repr=False
     )
 
     def check_account_guard(self, inv: Inventories) -> bool:
@@ -84,13 +69,12 @@ class AccountContainer:
 
     @property
     def triggers(self) -> list[TriggerProtocol]:
-        """Всі тригери акаунта (з усіх profession)."""
         return [t for ts in self.professions.values() for t in ts]
 
     def add_profession(
         self,
         profession: "BaseProfession",
-        triggers: list[TriggerProtocol],
+        triggers:   list[TriggerProtocol],
     ) -> None:
         self.professions[profession] = list(triggers)
 
@@ -117,6 +101,29 @@ class AccountContainer:
     def remove_all_triggers(self) -> None:
         for ts in self.professions.values():
             ts.clear()
+            
+    def suspend_triggers(self) -> "dict[BaseProfession, list[TriggerProtocol]]":
+        """
+        Зберігає trigger-об'єкти і очищає списки (для pause).
+        trigger._next_fire залишається в об'єкті — resume відновить таймер точно.
+        """
+        snapshot: dict["BaseProfession", list[TriggerProtocol]] = {}
+        for profession, triggers in self.professions.items():
+            snapshot[profession] = list(triggers)
+            triggers.clear()
+        return snapshot
+
+    def restore_triggers(
+        self,
+        snapshot: "dict[BaseProfession, list[TriggerProtocol]]",
+    ) -> None:
+        """
+        Відновлює trigger-об'єкти збережені suspend_triggers().
+        Працює лише для profession що ще присутні в dict (за identity).
+        """
+        for profession, triggers in snapshot.items():
+            if profession in self.professions:
+                self.professions[profession] = list(triggers)
 
     def get_profession(self, profession_id: str) -> Optional["BaseProfession"]:
         return next(
@@ -128,6 +135,13 @@ class AccountContainer:
 
     def profession_list(self) -> list["BaseProfession"]:
         return list(self.professions.keys())
+
+    def profession_priority(self, profession: "BaseProfession") -> ProfessionPriority:
+        """Повертає ProfessionPriority за позицією у dict (insertion order)."""
+        for idx, p in enumerate(self.professions):
+            if p is profession:
+                return ProfessionPriority.from_index(idx)
+        return ProfessionPriority.BACKGROUND
 
     # ── Timing ────────────────────────────────────────────────────────────────
 
@@ -147,9 +161,7 @@ class AccountContainer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EventDrivenScheduler:
-    """
-    Singleton runtime kernel.
-    """
+    """Singleton runtime kernel."""
 
     _instance:  Optional["EventDrivenScheduler"] = None
     _init_lock: threading.Lock = threading.Lock()
@@ -247,11 +259,11 @@ class EventDrivenScheduler:
         self,
         account_id:  str,
         bot:         Account,
-        professions: list[BaseProfession],
+        professions: list["BaseProfession"],
         guard:       Optional[Condition] = None,
     ) -> None:
-        worker = BotWorker(bot, on_error=lambda b: self._wakeup.set())
-        container  = AccountContainer(worker=worker, guard=guard)
+        worker    = BotWorker(bot, on_error=lambda b: self._wakeup.set())
+        container = AccountContainer(worker=worker, guard=guard)
 
         with self._lock:
             if account_id in self._containers:
@@ -287,13 +299,16 @@ class EventDrivenScheduler:
 
     def pause_account(self, account_id: str) -> bool:
         with self._lock:
-            entry = self._containers.get(account_id)
-        if entry is None or entry.worker.bot.status == AccountStatus.SUSPENDED:
+            container = self._containers.get(account_id)
+        if container is None or container.worker.bot.status == AccountStatus.SUSPENDED:
             return False
-        entry.worker.clear()
-        entry.remove_all_triggers()
-        entry.worker.bot.status = AccountStatus.SUSPENDED
-        entry.worker.stop()
+        container.worker.clear()
+        # Зберігаємо trigger-об'єкти з їх _next_fire — щоб resume міг відновити
+        # таймери точно без скидання (не створювати нові об'єкти).
+        # EventBus підписки НЕ знімаємо — вони живуть весь час pause.
+        container._suspended_triggers = container.suspend_triggers()
+        container.worker.bot.status = AccountStatus.SUSPENDED
+        container.worker.stop()
         log.info(f"[{account_id}] призупинено")
         return True
 
@@ -303,8 +318,6 @@ class EventDrivenScheduler:
         if container is None or container.worker.bot.status != AccountStatus.SUSPENDED:
             return False
 
-        professions = container.profession_list()
-
         container.worker.bot.status = AccountStatus.IDLE
         container.worker.start()
 
@@ -312,98 +325,143 @@ class EventDrivenScheduler:
             log.error(f"[{account_id}] resume: connect() провалився")
             return False
 
-        self._run_async(
-            self._restore_professions(account_id, container.worker.bot, professions, container)
-        )
+        # Відновлюємо trigger-об'єкти що були збережені при pause.
+        # Ті самі об'єкти → _next_fire зберігається → таймери не скидаються.
+        # EventBus підписки не чіпаємо — вони живі весь час.
+        suspended = getattr(container, "_suspended_triggers", None)
+        if suspended is not None:
+            container.restore_triggers(suspended)
+            container._suspended_triggers = None
+            self._run_async(
+                self._resume_restore_state(account_id, container.worker.bot, container)
+            )
+        else:
+            # Холодний resume (немає snapshot — наприклад після рестарту процесу):
+            # повна реініціалізація через setup() + build_triggers().
+            professions = container.profession_list()
+            self._run_async(
+                self._restore_professions(
+                    account_id, container.worker.bot, professions, container
+                )
+            )
+
         self._wakeup.set()
         log.info(f"[{account_id}] відновлено")
         return True
 
     # ── Dynamic Profession Management ─────────────────────────────────────────
 
-    def add_profession_to_account(self, account_id: str, profession: BaseProfession) -> None:
+    def add_profession_to_account(
+        self,
+        account_id: str,
+        profession: "BaseProfession",
+    ) -> None:
+        """
+        Динамічно додає profession до активного акаунта.
+
+        Race condition protection:
+          Резервуємо слот під lock (add_profession з порожнім списком triggers)
+          перед тим як запустити async setup. Повторний виклик з тим самим
+          profession_id буде відхилено has_profession() ще під lock.
+        """
         with self._lock:
             container = self._containers.get(account_id)
             if container is None:
                 raise ValueError(f"Акаунт {account_id!r} не знайдено")
             if container.has_profession(profession.profession_id):
-                log.warning(f"[{account_id}] profession {profession.profession_id!r} already registered")
+                log.warning(
+                    f"[{account_id}] profession {profession.profession_id!r} вже зареєстрована"
+                )
                 return
+            # Резервуємо слот — async setup заповнить triggers пізніше
+            container.add_profession(profession, [])
 
-        self._run_async(self._setup_single_profession(account_id, container.worker.bot, profession, container))
+        # Визначаємо пріоритет на основі поточної позиції у dict
+        prof_priority = container.profession_priority(profession)
+
+        self._run_async(
+            self._setup_single_profession(
+                account_id, container.worker.bot, profession, container, prof_priority
+            )
+        )
 
     async def _setup_single_profession(
         self,
-        account_id: str,
-        bot:        Account,
-        profession: BaseProfession,
-        container:      AccountContainer,
+        account_id:    str,
+        bot:           Account,
+        profession:    "BaseProfession",
+        container:     AccountContainer,
+        prof_priority: ProfessionPriority,
     ) -> None:
         try:
             await profession.setup(self, account_id)
             self._router.register(account_id, profession)
 
-            triggers = profession.build_triggers(account_id)
+            raw_triggers = profession.build_triggers(account_id)
             await profession.restore_state(bot)
 
-            container.add_profession(profession, triggers)
+            # Оновлюємо triggers у вже зарезервованому слоті
+            container.professions[profession] = list(raw_triggers)
 
             tasks = profession.startup_tasks(bot)
             if tasks:
+                # Теґуємо задачі profession і коригуємо priority
+                _apply_profession_priority(tasks, profession.profession_id, prof_priority)
                 container.worker.assign(*tasks)
 
             self._wakeup.set()
-            log.info(f"[{account_id}] dynamic setup of {profession.profession_id!r} complete")
+            log.info(
+                f"[{account_id}] dynamic setup {profession.profession_id!r} complete"
+                f" (priority={prof_priority.name})"
+            )
         except Exception as e:
+            # Відкочуємо зарезервований слот при помилці setup
+            with self._lock:
+                container.professions.pop(profession, None)
             log.error(
-                f"[{account_id}] dynamic setup of {profession.profession_id!r} failed: {e}",
+                f"[{account_id}] dynamic setup {profession.profession_id!r} failed: {e}",
                 exc_info=True,
             )
 
     def remove_profession_from_account(self, account_id: str, profession_id: str) -> None:
-        profession_obj = None
+        """
+        Видаляє profession з акаунта.
+        Видаляє ТІЛЬКИ задачі цієї profession з черги (не торкається інших).
+        """
+        profession_obj: Optional["BaseProfession"] = None
         with self._lock:
             container = self._containers.get(account_id)
             if container is not None:
                 profession_obj = container.get_profession(profession_id)
                 container.remove_profession_by_id(profession_id)
-                container.worker.clear()
 
         if profession_obj is not None:
+            # Вибіркове очищення черги — тільки задачі цієї profession
+            if container is not None:
+                container.worker.clear_profession(profession_id)
             self._run_async(self._teardown_professions(account_id, [profession_obj]))
 
         self._router.unregister(account_id, profession_id)
         log.info(f"[{account_id}] profession {profession_id!r} dynamically removed")
-        
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def wakeup(self) -> None:
-        """Публічний метод для примусового пробудження monitor loop.
-        Використовується profession-ами замість прямого доступу до _wakeup.
-        """
         self._wakeup.set()
 
     def reschedule_trigger(self, account_id: str, trigger_name: str, run_at: RunAt) -> bool:
-        """
-        Знаходить тригер акаунта за назвою та змінює його запланований час.
-        Після цього миттєво сигналізує монітору планувальника перерахувати час сну.
-        """
         with self._lock:
             container = self._containers.get(account_id)
         if not container:
             return False
-            
         for trigger in list(container.triggers):
             if trigger.name == trigger_name:
                 trigger.reschedule(run_at)
-                log.info(f"[{account_id}] Тригер {trigger_name!r} успішно перенесено на {run_at}")
-                
-                # Важливо: прокидаємо монітор планувальника, щоб він не спав зайвий час
-                self._wakeup.set()  
+                log.info(f"[{account_id}] Тригер {trigger_name!r} перенесено на {run_at}")
+                self._wakeup.set()
                 return True
-                
-        log.warning(f"[{account_id}] Не вдалося знайти тригер {trigger_name!r} для перенесення")
+        log.warning(f"[{account_id}] Тригер {trigger_name!r} не знайдено")
         return False
-
-    # ── Public API ────────────────────────────────────────────────────────────
 
     def push_task(self, account_id: str, task: AnyTask) -> bool:
         with self._lock:
@@ -416,7 +474,7 @@ class EventDrivenScheduler:
     def has_account(self, account_id: str) -> bool:
         with self._lock:
             return account_id in self._containers
-        
+
     def has_profession(self, account_id: str, profession_id: str) -> bool:
         with self._lock:
             container = self._containers.get(account_id)
@@ -459,6 +517,14 @@ class EventDrivenScheduler:
         with self._lock:
             entry = self._containers.get(account_id)
         return entry.next_trigger_in() if entry else None
+
+    def profession_names(self, account_id: str) -> list[str]:
+        """Список profession акаунта у порядку пріоритету."""
+        with self._lock:
+            entry = self._containers.get(account_id)
+        if entry is None:
+            return []
+        return [p.profession_id for p in entry.profession_list()]
 
     # ── EventBus API ──────────────────────────────────────────────────────────
 
@@ -530,14 +596,15 @@ class EventDrivenScheduler:
         self,
         account_id:  str,
         bot:         Account,
-        professions: list[BaseProfession],
+        professions: list["BaseProfession"],
     ) -> None:
         with self._lock:
             container = self._containers.get(account_id)
         if container is None:
             return
 
-        for profession in professions:
+        for idx, profession in enumerate(professions):
+            prof_priority = ProfessionPriority.from_index(idx)
             try:
                 await profession.setup(self, account_id)
                 self._router.register(account_id, profession)
@@ -549,9 +616,13 @@ class EventDrivenScheduler:
 
                 tasks = profession.startup_tasks(bot)
                 if tasks:
+                    _apply_profession_priority(tasks, profession.profession_id, prof_priority)
                     container.worker.assign(*tasks)
 
-                log.info(f"[{account_id}] {profession.profession_id!r} ready")
+                log.info(
+                    f"[{account_id}] {profession.profession_id!r} ready"
+                    f" (priority={prof_priority.name})"
+                )
             except Exception as e:
                 log.error(
                     f"[{account_id}] setup {profession.profession_id!r} failed: {e}",
@@ -559,15 +630,42 @@ class EventDrivenScheduler:
                 )
 
         self._wakeup.set()
+        
+    async def _resume_restore_state(
+        self,
+        account_id: str,
+        bot:        Account,
+        container:  AccountContainer,
+    ) -> None:
+        """
+        Гарячий resume після pause: відновлює лише in-memory state та стартові задачі.
+        НЕ викликає setup() (підписки EventBus живі) і НЕ будує нові triggers
+        (використовуються збережені об'єкти з коректним _next_fire).
+        """
+        for idx, profession in enumerate(container.profession_list()):
+            prof_priority = ProfessionPriority.from_index(idx)
+            try:
+                await profession.restore_state(bot)
+                tasks = profession.startup_tasks(bot)
+                if tasks:
+                    _apply_profession_priority(tasks, profession.profession_id, prof_priority)
+                    container.worker.assign(*tasks)
+                log.info(f"[{account_id}] {profession.profession_id!r} hot-resumed")
+            except Exception as e:
+                log.error(
+                    f"[{account_id}] hot-resume {profession.profession_id!r}: {e}",
+                    exc_info=True,
+                )
 
     async def _restore_professions(
         self,
         account_id:  str,
         bot:         Account,
-        professions: list[BaseProfession],
-        container:       AccountContainer,
+        professions: list["BaseProfession"],
+        container:   AccountContainer,
     ) -> None:
-        for profession in professions:
+        for idx, profession in enumerate(professions):
+            prof_priority = ProfessionPriority.from_index(idx)
             try:
                 self._router.register(account_id, profession)
 
@@ -578,6 +676,7 @@ class EventDrivenScheduler:
 
                 tasks = profession.startup_tasks(bot)
                 if tasks:
+                    _apply_profession_priority(tasks, profession.profession_id, prof_priority)
                     container.worker.assign(*tasks)
 
                 log.info(f"[{account_id}] {profession.profession_id!r} resumed")
@@ -590,13 +689,15 @@ class EventDrivenScheduler:
     async def _teardown_professions(
         self,
         account_id:  str,
-        professions: list[BaseProfession],
+        professions: list["BaseProfession"],
     ) -> None:
         for profession in professions:
             try:
+                self._event_bus.unsubscribe_owner(profession)
                 await profession.teardown(self, account_id)
             except Exception as e:
                 log.error(f"[{account_id}] teardown {profession.profession_id!r}: {e}")
+
 
     # ── Monitor loop (sync) ───────────────────────────────────────────────────
 
@@ -628,7 +729,8 @@ class EventDrivenScheduler:
             for profession in entry.profession_list():
                 if not profession.check_guard(bot):
                     removed = entry.remove_profession(profession)
-                    entry.worker.clear()
+                    # Тільки задачі цієї profession
+                    entry.worker.clear_profession(profession.profession_id)
                     log.info(
                         f"[{account_id}] {profession.profession_id!r} guard failed "
                         f"→ {removed} triggers removed"
@@ -658,6 +760,15 @@ class EventDrivenScheduler:
                     continue
 
                 trigger.dispatch()
+
+                # Визначаємо profession і її пріоритет для цього тригера
+                owning_profession = self._find_trigger_owner(entry, trigger)
+                prof_priority = (
+                    entry.profession_priority(owning_profession)
+                    if owning_profession else ProfessionPriority.PRIMARY
+                )
+                prof_id = owning_profession.profession_id if owning_profession else None
+
                 try:
                     tasks = list(trigger.producer(bot))
                 except Exception as e:
@@ -665,6 +776,8 @@ class EventDrivenScheduler:
                     tasks = []
 
                 if tasks:
+                    if prof_id:
+                        _apply_profession_priority(tasks, prof_id, prof_priority)
                     entry.worker.assign(*tasks)
                 else:
                     trigger.advance(bot)
@@ -681,6 +794,17 @@ class EventDrivenScheduler:
                         entry.remove_trigger(t)
 
         return next_wakeup
+
+    @staticmethod
+    def _find_trigger_owner(
+        container: AccountContainer,
+        trigger:   TriggerProtocol,
+    ) -> Optional["BaseProfession"]:
+        """Знаходить profession-власника тригера."""
+        for profession, triggers in container.professions.items():
+            if trigger in triggers:
+                return profession
+        return None
 
     def _reap_dead_workers(self) -> None:
         with self._lock:
@@ -732,3 +856,24 @@ class EventDrivenScheduler:
         if callable(val):
             return bool(val())
         return bool(val) if val is not None else False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_profession_priority(
+    tasks:         list[AnyTask],
+    profession_id: str,
+    prof_priority: ProfessionPriority,
+) -> None:
+    """
+    In-place:
+      1. Проставляє source_profession якщо ще не встановлено.
+      2. Коригує priority задачі відповідно до ProfessionPriority profession.
+    """
+    tag_profession(tasks, profession_id)
+    if prof_priority == ProfessionPriority.PRIMARY:
+        return  # Не зміщуємо — задачі Primary profession ідуть без штрафу
+    for task in tasks:
+        task.priority = prof_priority.adjust(task.priority)  # type: ignore[attr-defined]

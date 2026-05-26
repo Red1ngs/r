@@ -36,12 +36,19 @@ def _account_stats_text(info: AccountInfo) -> str:
     triggers = "\n".join(f"  • {t}" for t in info.triggers) or "  —"
     proxy    = f"\nПроксі: <code>{info.proxy}</code>" if info.proxy else ""
 
+    prof_line = (
+        "Професії: <b>" + ", ".join(info.professions) + "</b>"
+        if info.professions else
+        "Професії: <i>не призначено</i>"
+    )
+
     return (
         f"📊 <b>Статистика: {info.account_id}</b>\n\n"
         f"Email:  <code>{info.email}</code>{proxy}\n"
         f"Статус: <b>{info.status}</b>\n"
         f"Черга:  <b>{info.queue_size}</b> задач\n"
-        f"Наступний тригер: <b>{_fmt_seconds(info.next_trigger_s)}</b>\n\n"
+        f"Наступний тригер: <b>{_fmt_seconds(info.next_trigger_s)}</b>\n"
+        f"{prof_line}\n\n"
         f"<b>Тригери:</b>\n{triggers}"
     )
 

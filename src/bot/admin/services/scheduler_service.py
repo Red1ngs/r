@@ -2,13 +2,19 @@
 bot/admin/services/scheduler_service.py
 
 Тонкий фасад між адмін-ботом і Scheduler-сінглтоном.
+
+Зміни:
+  - AccountInfo.profession → professions: list[str]
+  - assign_profession → add_profession (додає, не замінює)
+  - change_profession видалено; натомість remove_profession + add_profession
+  - add_account відновлює ВСІ professions з БД при старті
 """
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from src.core.config.app import AppConfig
 from src.core.config.bot import AuthConfig, BaseHeaders, BotConfig, ClientConfig, NetworkConfig
@@ -75,7 +81,7 @@ def _erase_credentials(account_id: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DTO  (frozen)
+# DTO
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -83,11 +89,17 @@ class AccountInfo:
     account_id:     str
     email:          str
     proxy:          str
-    status:         str          # AccountStatus.name
+    status:         str
     queue_size:     int
     triggers:       list[str]
     next_trigger_s: Optional[float]
-    profession:     Optional[str]
+    # Список profession у порядку пріоритету (індекс 0 = найвищий)
+    professions:    list[str] = field(default_factory=list)
+
+    @property
+    def profession(self) -> Optional[str]:
+        """Зворотна сумісність: перша profession або None."""
+        return self.professions[0] if self.professions else None
 
 
 @dataclass(frozen=True)
@@ -121,7 +133,7 @@ class SchedulerService:
     def _scheduler(self) -> EventDrivenScheduler:
         return EventDrivenScheduler.get_instance()
 
-    # ── Читання стану (DTO) ───────────────────────────────────────────────────
+    # ── Читання стану ─────────────────────────────────────────────────────────
 
     def snapshot(self) -> SchedulerSnapshot:
         scheduler = self._scheduler
@@ -141,7 +153,9 @@ class SchedulerService:
         if bot is None or status is None:
             return None
 
-        db_acc = self._repo.accounts.get(acc_id)
+        # Беремо список professions з runtime (джерело правди для активного стану)
+        runtime_profs = scheduler.profession_names(acc_id)
+
         return AccountInfo(
             account_id     = acc_id,
             email          = bot.bot_config.client.auth.email if bot.bot_config.client.auth else "—",
@@ -150,7 +164,7 @@ class SchedulerService:
             queue_size     = scheduler.queue_size(acc_id) or 0,
             triggers       = scheduler.trigger_names(acc_id),
             next_trigger_s = scheduler.seconds_until_next(acc_id),
-            profession     = db_acc.profession if db_acc else None,
+            professions    = runtime_profs,
         )
 
     def account_ids(self) -> list[str]:
@@ -171,10 +185,9 @@ class SchedulerService:
 
         if password:
             _save_credentials(account_id, password, proxy)
-            self._repo.accounts.upsert(
-                account_id, email, profession=None
-            )
-        
+            # professions=None → не чіпаємо наявний список якщо акаунт вже є в БД
+            self._repo.accounts.upsert(account_id, email, professions=None)
+
         stored_pw, stored_proxy = _load_credentials(account_id)
         if not stored_pw:
             return False, f"Пароль для {account_id!r} не знайдено в .env"
@@ -190,20 +203,50 @@ class SchedulerService:
 
         bot = Account(account_id, bot_config, self._app_config, self._repo)
 
+        # Відновлюємо всі professions з БД
+        db_acc   = self._repo.accounts.get(account_id)
+        prof_names = db_acc.professions if db_acc else []
+        professions = []
+        for name in prof_names:
+            try:
+                professions.append(profession_factory.build(name))
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[{account_id}] Cannot restore profession {name!r}: {e}"
+                )
+
         try:
-            # Створюємо акаунт з пустим списком професій
-            scheduler.add_account(account_id, bot, professions=[])
+            scheduler.add_account(account_id, bot, professions=professions)
         except ValueError as e:
             return False, str(e)
 
         return True, ""
 
-    def assign_profession(self, account_id: str, profession_name: str) -> tuple[bool, str]:
-        """Призначає profession акаунту."""
+    # ── Управління professions ────────────────────────────────────────────────
+
+    def add_profession(
+        self,
+        account_id:    str,
+        profession_name: str,
+        *,
+        priority: int = -1,
+    ) -> tuple[bool, str]:
+        """
+        Додає profession до акаунта.
+
+        priority=-1  → найнижчий пріоритет (в кінець списку)
+        priority=0   → найвищий (першою)
+        priority=N   → вставити на позицію N
+
+        Якщо profession вже призначена — повертає (True, "") без змін (idempotent).
+        """
         scheduler = self._scheduler
-        bot = scheduler.get_bot(account_id)
-        if bot is None:
-            return False, f"Акаунт {account_id!r} не знайдено в ядрі"
+        if not scheduler.has_account(account_id):
+            return False, f"Акаунт {account_id!r} не знайдено"
+
+        if scheduler.has_profession(account_id, profession_name):
+            return True, ""  # вже є — без помилки
 
         try:
             profession = profession_factory.build(profession_name)
@@ -213,22 +256,60 @@ class SchedulerService:
         try:
             scheduler.add_profession_to_account(account_id, profession)
         except Exception as e:
-            return False, f"Не вдалося додати професію в ядро: {e}"
+            return False, f"Не вдалося додати профессію в ядро: {e}"
 
-        self._repo.accounts.set_profession(account_id, profession_name)
+        # Зберігаємо в БД з урахуванням пріоритету
+        self._repo.accounts.add_profession(account_id, profession_name, priority=priority)
         return True, ""
 
-    def change_profession(self, account_id: str, new_prof_name: str) -> tuple[bool, str]:
-        """Скидає попередню професію і призначає нову."""
+    def remove_profession(
+        self,
+        account_id:      str,
+        profession_name: str,
+    ) -> tuple[bool, str]:
+        """Видаляє profession з акаунта (idempotent)."""
         scheduler = self._scheduler
-        
-        db_acc = self._repo.accounts.get(account_id)
-        if db_acc and db_acc.profession:
-            scheduler.remove_profession_from_account(account_id, db_acc.profession)
-            
-        return self.assign_profession(account_id, new_prof_name)
+        if not scheduler.has_account(account_id):
+            return False, f"Акаунт {account_id!r} не знайдено"
 
-    # ── Видалення ─────────────────────────────────────────────────────────────
+        scheduler.remove_profession_from_account(account_id, profession_name)
+        self._repo.accounts.remove_profession(account_id, profession_name)
+        return True, ""
+
+    def set_professions(
+        self,
+        account_id:  str,
+        profession_names: list[str],
+    ) -> tuple[bool, str]:
+        """
+        Атомарно замінює весь список professions акаунта.
+        Видаляє тих що зникли, додає нових, зберігає порядок (= пріоритет).
+        """
+        scheduler = self._scheduler
+        if not scheduler.has_account(account_id):
+            return False, f"Акаунт {account_id!r} не знайдено"
+
+        current = set(scheduler.profession_names(account_id))
+        target  = list(dict.fromkeys(profession_names))  # dedup зі збереженням порядку
+
+        # Видаляємо яких немає у target
+        for name in current - set(target):
+            scheduler.remove_profession_from_account(account_id, name)
+
+        # Додаємо нові у порядку target
+        for idx, name in enumerate(target):
+            if not scheduler.has_profession(account_id, name):
+                try:
+                    profession = profession_factory.build(name)
+                    scheduler.add_profession_to_account(account_id, profession)
+                except Exception as e:
+                    return False, f"Помилка profession {name!r}: {e}"
+
+        # Синхронізуємо БД
+        self._repo.accounts.set_professions(account_id, target)
+        return True, ""
+
+    # ── Видалення акаунта ─────────────────────────────────────────────────────
 
     def remove(self, account_id: str) -> bool:
         ok = self._scheduler.remove_account(account_id)
@@ -236,15 +317,47 @@ class SchedulerService:
             _erase_credentials(account_id)
         return ok
 
-    # ── Оновлення налаштувань (RequestRouter) ─────────────────────────────────
+    # ── Оновлення налаштувань ─────────────────────────────────────────────────
+    def force_parse_mangas(
+            self,
+            account_id: str,
+            *,
+            limit:   int = 5,
+            targets: Optional[list[str]] = None,
+        ) -> tuple[bool, str, dict[str, Any]]:
+            """Примусовий парсинг манг. Повертає (ok, reason, data)."""
+            res = self._scheduler.ask_sync(
+                account_id,
+                profession_id="reader",
+                intent="force_parse",
+                data={"limit": limit, "targets": targets or []},
+            )
+            if res.approved:
+                return True, "", res.data or {}
+            return False, res.reason or "невідома помилка", {}
 
+    def mark_mangas_read(
+        self,
+        account_id: str,
+        targets: list[str],
+    ) -> tuple[bool, str, dict[str, list[str]]]:
+        """Позначає глави вказаних манг як прочитані. Повертає (ok, reason, data)."""
+        res = self._scheduler.ask_sync(
+            account_id,
+            profession_id="reader",
+            intent="mark_read",
+            data={"targets": targets},
+        )
+        if res.approved:
+            return True, "", res.data or {}
+        return False, res.reason or "невідома помилка", {}
+    
     def update_reader_slots(self, account_id: str, target_slots: list[str]) -> bool:
-        """Оновлює target_slots для reader profession за допомогою ask_sync."""
         res = self._scheduler.ask_sync(
             account_id,
             profession_id="reader",
             intent="set_targets",
-            data={"targets": target_slots}
+            data={"targets": target_slots},
         )
         if res.approved:
             bot = self._scheduler.get_bot(account_id)
@@ -252,14 +365,8 @@ class SchedulerService:
                 self._repo.inventory.save(account_id, bot.inventory)
             return True
         return False
-    
+
     def reschedule_trigger(self, account_id: str, trigger_name: str, run_at: str) -> bool:
-        """
-        Дозволяє адмін-боту зручно перенести будь-який тригер акаунта.
-        Приклад використання:
-            svc.reschedule_trigger("acc_01", "scheduled_04:30", "+15m")
-            svc.reschedule_trigger("acc_01", "reader_slot", "18:00")
-        """
         return self._scheduler.reschedule_trigger(account_id, trigger_name, run_at)
 
     def pause(self, account_id: str)  -> bool: return self._scheduler.pause_account(account_id)

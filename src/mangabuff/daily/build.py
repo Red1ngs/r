@@ -144,7 +144,7 @@ class DailyProfession(BaseProfession):
 
     @property
     def profession_id(self) -> str:
-        return "daily_claimer"
+        return "daily"
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -189,9 +189,6 @@ class DailyProfession(BaseProfession):
                 f"[{self._account_id}] 🎁 Пропущений запуск виявлено — запуск негайно"
             )
         # else: час ще не настав — не чіпаємо, тригер спрацює вчасно
-
-    async def teardown(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
-        scheduler._event_bus.unsubscribe("account.unbanned", self._on_account_unbanned)
 
     # ── Triggers ──────────────────────────────────────────────────────────────
 
@@ -278,7 +275,7 @@ class DailyProfession(BaseProfession):
                 )
 
         return pipeline(
-            name   = "daily_claimer",
+            name   = "daily",
             fetch  = _fetch_bonus_status,
             parse  = [
                 Step(_parse_calendar_day, priority=Priority.NORMAL, max_retries=1),
