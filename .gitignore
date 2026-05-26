@@ -2,6 +2,7 @@
 *.db*
 *.log
 logs/ 
+*.zip
 
 # Python-generated files
 __pycache__/
