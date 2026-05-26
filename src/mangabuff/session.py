@@ -324,10 +324,23 @@ class BotSession(BotTransport):
     # ── Utils / Proxy ────────────────────────────────────────────────
 
     def check_proxy(self) -> bool:
+        if not self.bot_config.network.proxy:
+            return True
         try:
+            # Запит через проксі
             r = self.get("https://api.ipify.org", external=True, timeout=10)
             r.raise_for_status()
-            log.info(f"  → Proxy IP: {r.text.strip()}")
+            proxy_ip = r.text.strip()
+
+            # Запит без проксі для порівняння
+            import httpx as _httpx
+            real_ip = _httpx.get("https://api.ipify.org", timeout=10).text.strip()
+
+            if proxy_ip == real_ip:
+                log.error(f"  → Proxy IP збігається з реальним ({real_ip}) — проксі не працює")
+                return False
+
+            log.info(f"  → Proxy IP: {proxy_ip} (реальний: {real_ip}) ✅")
             return True
         except Exception as e:
             log.error(f"  → Proxy check failed: {e}")
