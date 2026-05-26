@@ -54,6 +54,12 @@ class Account:
         try:
             from src.mangabuff.session import BotSession
             session = BotSession(self.bot_config, self.app_config)
+
+            if self.bot_config.network.proxy:
+                if not session.check_proxy():
+                    session.close()
+                    return self._fail("Проксі недоступне або не працює")
+
             session.authenticate()
             self._session = session
             self.status   = AccountStatus.IDLE
