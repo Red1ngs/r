@@ -127,7 +127,7 @@ def parse_chapters(html: str) -> list[Chapter]:
 def parse_manga_data_id(html: str) -> Optional[int]:
     """Парсить data_id манги зі сторінки манги (не з каталогу)."""
     soup = BeautifulSoup(html, "html.parser")
-    manga_element = soup.find('div', class_='manga-card')
+    manga_element = soup.find('div', class_='manga')
     if manga_element:
         data_id = manga_element.get('data-id')
         if data_id:
