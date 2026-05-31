@@ -16,14 +16,14 @@ reader/stats.py — in-memory статистика нагород.
 """
 from __future__ import annotations
 
-import logging
 import statistics
 from dataclasses import dataclass
 from typing import Optional
 
 from src.utils.time import format_ts, now_ts
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_logger
+log = get_logger("farmer.stats")
 
 
 @dataclass

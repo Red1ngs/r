@@ -5,34 +5,65 @@ pipeline.py — фабрика для ланцюгових задач.
 ─────────
 Pipeline описує ЩО робить один цикл виконання:
 
-    fetch(bot) → дані?
-        ├── є  → action(дані, bot)          завершено
-        └── ні → parse[0] → parse[1] → ... → fetch знову
-                  └── вичерпано parse_retries → завершено
+    fetch(bot) → FetchResult
+        ├── Ready(data) → action(data, bot)             завершено
+        ├── NotReady    → parse[0] → ... → fetch знову
+        │                  └── retries вичерпано        → завершено
+        └── Skip        → завершено без action і parse
+
+Контракт fetch
+──────────────
+fetch повертає ОДИН із трьох типів:
+
+    Ready(data)   — дані є, запускаємо action(data, bot).
+                    data — будь-який об'єкт (dict, dataclass, None, False…).
+                    Pipeline не перевіряє вміст — лише тип обгортки.
+
+    NotReady      — даних ще немає, причина тимчасова (треба парсити /
+                    завантажувати). Pipeline запускає parse-chain → fetch знову.
+                    Якщо parse_retries вичерпані — завершено без action.
+
+    Skip          — цикл пропускається повністю: ні action, ні parse-chain.
+                    Profession сама обробила ситуацію у fetch і сигналізує:
+                    «нічого не роби цього разу».
+                    Типово: «слот не готовий за часом», «ціль вже досягнута»,
+                            «глав немає → відправили подію, тригер у сплячці».
+
+ВАЖЛИВО: fetch НЕ повертає None і не кидає виняток для сигналізації стану.
+         Будь-яке значення, що не є FetchResult, вважається помилкою контракту.
 
 Pipeline НЕ знає КОЛИ його запускати і скільки разів.
 Це виключна відповідальність Scheduler + Trigger.
 
-Типове використання:
-    # Оголошення — що робить один цикл
+Типове використання
+───────────────────
+    from src.core.tasks.pipeline import pipeline, Step, Ready, NotReady, Skip
+
+    # Читач без parse-chain — слот або готовий, або ні
     read_one = pipeline(
         name   = "manga_reader",
-        fetch  = fetch_next_chapter,
+        fetch  = fetch_next_chapter,   # повертає Ready / Skip
+        parse  = [],
+        action = read_chapter,
+    )
+
+    # Завантажувач із parse-chain
+    load_one = pipeline(
+        name   = "manga_loader",
+        fetch  = fetch_new_manga,      # повертає Ready / NotReady
         parse  = [
             Step(find_stale_or_new_mangas, max_retries=1),
             Step(fetch_manga_updates,      max_retries=2),
             Step(save_discovered_mangas,   max_retries=2),
             Step(save_discovered_chapters, max_retries=1),
         ],
-        action = read_chapter,
+        action = start_loading,
     )
 
-    # У Profession.startup — запускається один раз одразу
-    # У Trigger.producer   — запускається за розкладом Scheduler-а
-
-Сигнатури:
-    fetch  : (bot: Account) -> Any | None
-    parse  : (bot: Account) -> None        (один крок або список)
+Сигнатури
+─────────
+    fetch  : (bot: Account) -> FetchResult
+    parse  : (bot: Account) -> None          (один крок або список)
     action : (data: Any, bot: Account) -> Any
 
 parse може бути:
@@ -43,16 +74,69 @@ parse може бути:
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Union, TYPE_CHECKING
+from typing import Any, Callable, Generic, TypeVar, Union, TYPE_CHECKING
 
 from src.core.tasks.base import AnyTask, Priority, Task, extract_spawned
 
 if TYPE_CHECKING:
     from src.core.account import Account
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_logger
+log = get_logger("tasks.pipeline")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FetchResult — єдиний контракт повернення з fetch
+# ─────────────────────────────────────────────────────────────────────────────
+
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class Ready(Generic[_T]):
+    """
+    Дані є — передаємо в action.
+
+    data може бути будь-яким значенням (dict, dataclass, навіть None).
+    Pipeline не інтерпретує вміст — лише тип обгортки.
+
+    Приклад:
+        return Ready({"sequence": [...], "slot_name": "scroll"})
+        return Ready(None)   # якщо action очікує сигнал «є, але порожньо»
+    """
+    data: _T
+
+
+@dataclass(frozen=True)
+class NotReady:
+    """
+    Даних немає — причина тимчасова, треба парсити / завантажувати.
+
+    Pipeline запускає parse-chain → fetch знову.
+    Якщо parse_retries вичерпані — цикл завершується без action.
+
+    Типово: «каталог застарів», «нових глав ще немає в БД».
+    """
+
+
+@dataclass(frozen=True)
+class Skip:
+    """
+    Цикл пропускається повністю — ні action, ні parse-chain.
+
+    Profession сама обробила ситуацію у fetch і сигналізує pipeline:
+    «нічого не роби цього разу».
+
+    Типово: «слот не готовий за часом», «ціль вже досягнута»,
+            «глав немає → відправили подію, тригер у сплячці».
+
+    reason (необов'язково) — рядок для debug-логування.
+    """
+    reason: str = ""
+
+
+FetchResult = Ready[Any] | NotReady | Skip
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,7 +223,7 @@ def _make_step_chain(
 
 def _make_fetch_task(
     name:            str,
-    fetch:           Callable[["Account"], Any],
+    fetch:           Callable[["Account"], FetchResult],
     steps:           list[Step],
     action:          Callable[[Any, "Account"], Any],
     parse_retries:   list[int],   # [залишилось] — мутабельний контейнер
@@ -149,19 +233,29 @@ def _make_fetch_task(
 ) -> Task:
     """
     Один FetchTask.
-    None  → parse-chain → fetch знову (якщо є retries).
-    Дані  → ActionTask → завершено.
+
+    Ready(data) → ActionTask(data)           → завершено
+    NotReady    → parse-chain → fetch знову  (якщо є retries)
+                → завершено без action       (retries вичерпані)
+    Skip        → завершено без action
     """
 
     def _run(bot: "Account") -> list[AnyTask]:
-        data = fetch(bot)
+        result = fetch(bot)
 
-        if data is None:
+        # ── Skip ──────────────────────────────────────────────────────────────
+        if isinstance(result, Skip):
+            if result.reason:
+                log.debug(f"[Pipeline:{name}] skip: {result.reason}")
+            return []
+
+        # ── NotReady ──────────────────────────────────────────────────────────
+        if isinstance(result, NotReady):
             if parse_retries[0] <= 0:
                 log.warning(f"[Pipeline:{name}] parse retries вичерпано → стоп")
                 return []
             parse_retries[0] -= 1
-            log.info(f"[Pipeline:{name}] даних немає → підготовка")
+            log.info(f"[Pipeline:{name}] NotReady → підготовка (retries left: {parse_retries[0]})")
             fetch_again = _make_fetch_task(
                 name, fetch, steps, action,
                 parse_retries, fetch_priority, action_priority,
@@ -169,19 +263,27 @@ def _make_fetch_task(
             )
             return _make_step_chain(name, steps, after=fetch_again)
 
-        captured = data
+        # ── Ready ─────────────────────────────────────────────────────────────
+        if isinstance(result, Ready):
+            captured = result.data
 
-        def _action_run(bot: "Account") -> list[AnyTask]:
-            result = action(captured, bot)
-            log.info(f"[Pipeline:{name}] виконано")
-            return extract_spawned(result)
+            def _action_run(bot: "Account") -> list[AnyTask]:
+                action_result = action(captured, bot)
+                log.info(f"[Pipeline:{name}] виконано")
+                return extract_spawned(action_result)
 
-        return [Task(
-            name        = f"{name}:action",
-            fn          = _action_run,
-            priority    = action_priority,
-            max_retries = 0,
-        )]
+            return [Task(
+                name        = f"{name}:action",
+                fn          = _action_run,
+                priority    = action_priority,
+                max_retries = 0,
+            )]
+
+        # ── Невідомий тип — порушення контракту fetch ─────────────────────────
+        raise TypeError(
+            f"[Pipeline:{name}] fetch повернув {type(result)!r}, "
+            f"очікується Ready / NotReady / Skip"
+        )
 
     return Task(
         name        = f"{name}:fetch",
@@ -198,7 +300,7 @@ def _make_fetch_task(
 
 def pipeline(
     name:               str,
-    fetch:              Callable[["Account"], Any],
+    fetch:              Callable[["Account"], FetchResult],
     parse:              ParseArg,
     action:             Callable[[Any, "Account"], Any],
     max_parse_retries:  int = 3,
@@ -209,7 +311,7 @@ def pipeline(
     Повертає producer-функцію: (bot) -> [AnyTask].
 
     Один виклик = один цикл:
-        fetch → parse-chain (якщо немає даних) → action → завершено
+        fetch → Ready / NotReady / Skip → …
 
     КОЛИ і скільки разів запускати — вирішує Trigger у Scheduler.
     Сумісний з Profession.startup і Trigger.producer.

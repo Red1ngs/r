@@ -51,27 +51,45 @@ class MangaRepository:
         name: str,
         rating: str = "",
         info: str = "",
-        image: str = ""
+        image: str = "",
+        views: int = 0,
     ) -> int:
         """Створює або оновлює мангу. Повертає внутрішній ID БД (id)."""
         with self._lock:
             cursor = self._conn.execute(
                 """
-                INSERT INTO mangas (data_id, translit_name, name, rating, info, image)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO mangas (data_id, translit_name, name, rating, info, image, views)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(data_id) DO UPDATE SET
                     translit_name   = excluded.translit_name,
                     name            = excluded.name,
                     rating          = excluded.rating,
                     info            = excluded.info,
-                    image           = excluded.image
+                    image           = excluded.image,
+                    views           = CASE WHEN excluded.views > 0
+                                          THEN excluded.views
+                                          ELSE mangas.views END
                 RETURNING id
                 """,
-                (data_id, translit_name, name, rating, info, image),
+                (data_id, translit_name, name, rating, info, image, views),
             )
             res = cursor.fetchone()
             self._conn.commit()
             return res["id"]
+
+    def update_views(self, data_id: int, views: int) -> None:
+        """Оновлює кількість переглядів манги за її зовнішнім data_id."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE mangas SET views = ? WHERE data_id = ?",
+                (views, data_id),
+            )
+            self._conn.commit()
+
+    def count(self) -> int:
+        """Повертає загальну кількість манг у БД."""
+        row = self._conn.execute("SELECT COUNT(*) FROM mangas").fetchone()
+        return int(row[0]) if row else 0
 
     @staticmethod
     def _to_model(row: sqlite3.Row) -> MangaRow:
@@ -120,7 +138,7 @@ class ChapterRepository:
                 params.extend([f"%{tag}%", f"%{tag}%"])
 
         query += """
-            ORDER BY c.manga_id ASC, c.chapter_num ASC, c.id ASC
+            ORDER BY m.views DESC, c.chapter_num ASC, c.id ASC
             LIMIT ?
         """
         params.append(limit)

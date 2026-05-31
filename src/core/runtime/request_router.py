@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -11,7 +10,8 @@ if TYPE_CHECKING:
     from src.core.account import Account
     from src.core.runtime.profession import BaseProfession, RequestResult
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_logger
+log = get_logger("runtime.request_router")
 
 
 @dataclass

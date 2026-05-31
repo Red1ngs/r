@@ -39,7 +39,6 @@ handle_request intents:
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
@@ -55,7 +54,7 @@ if TYPE_CHECKING:
     from src.core.runtime.schedule import TriggerProtocol
     from src.core.runtime.scheduler import EventDrivenScheduler
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_account_logger
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,7 +107,7 @@ class QuizTrigger(BaseTrigger):
     def producer(self, bot: "Account") -> Iterable[AnyTask]:
         inv: QuizInventory = bot.inventory.quiz  # type: ignore[attr-defined]
         if not inv.session_active:
-            log.info(f"[{bot.account_id}] 📝 Quiz: сесія не активна → відкриваємо")
+            get_account_logger(bot.account_id).info(f"📝 Quiz: сесія не активна → відкриваємо")
             return self._open_producer(bot)
         return self._answer_producer(bot)
 
@@ -149,10 +148,10 @@ class QuizProfession(BaseProfession):
             inv.reset_daily_counter(to_day)
             inv.session_active   = False
             inv.current_question = None
-            log.info(f"[{self._account_id}] Quiz(daily): новий день → лічильник скинуто")
+            get_account_logger(self._account_id).info(f"Quiz(daily): новий день → лічильник скинуто")
 
-        log.info(
-            f"[{self._account_id}] QuizProfession відновлено: "
+        get_account_logger(self._account_id).info(
+            f"QuizProfession відновлено: "
             f"mode={inv.mode!r} "
             f"counter={inv.current_counter()}/{inv.answer_limit} "
             f"delay={inv.answer_delay}s "
@@ -190,10 +189,10 @@ class QuizProfession(BaseProfession):
             return
 
         if inv.last_quiz_date == today():
-            log.info(f"[{self._account_id}] Quiz(daily): ліміт вже вичерпано сьогодні → пропускаємо")
+            get_account_logger(self._account_id).info(f"Quiz(daily): ліміт вже вичерпано сьогодні → пропускаємо")
             return
 
-        log.info(f"[{self._account_id}] Quiz(daily): daily.claimed → скидаємо лічильник, стартуємо")
+        get_account_logger(self._account_id).info(f"Quiz(daily): daily.claimed → скидаємо лічильник, стартуємо")
 
         inv.reset_daily_counter(today())
         inv.session_active   = False
@@ -269,7 +268,7 @@ class QuizProfession(BaseProfession):
         if not changed:
             return RequestResult.deny("нічого не змінено — передайте mode, answer_limit або answer_delay")
 
-        log.info(f"[{ctx.account_id}] Quiz: конфіг оновлено → {changed}")
+        get_account_logger(ctx.account_id).info(f"Quiz: конфіг оновлено → {changed}")
         return RequestResult.approve(data={"changed": changed})
 
     async def _handle_force_restart(self, ctx: "RequestContext") -> RequestResult:
@@ -286,7 +285,7 @@ class QuizProfession(BaseProfession):
             self._trigger.reschedule("+0s")
         if self._scheduler is not None:
             self._scheduler.wakeup()
-        log.info(f"[{ctx.account_id}] QuizProfession: force_restart")
+        get_account_logger(ctx.account_id).info(f"QuizProfession: force_restart")
         return RequestResult.approve(data={"status": "restarting"})
 
     # ── Producers ─────────────────────────────────────────────────────────────
@@ -296,21 +295,23 @@ class QuizProfession(BaseProfession):
         def on_done(bot: "Account") -> None:
             if self._trigger is not None:
                 self._trigger.advance(bot)
+            if self._scheduler is not None:
+                self._scheduler.wakeup()
 
         def open_quiz(bot: "Account") -> None:
-            log.info(f"[{bot.account_id}] 📝 Відкриваємо quiz-сесію…")
+            get_account_logger(bot.account_id).info(f"📝 Відкриваємо quiz-сесію…")
             question = bot.session.quiz_start()
 
             if question is None:
-                log.warning(f"[{bot.account_id}] ⚠️ /quiz/start не відповів")
+                get_account_logger(bot.account_id).warning(f"⚠️ /quiz/start не відповів")
                 on_done(bot)
                 return
 
             inv: QuizInventory = bot.inventory.quiz  # type: ignore[attr-defined]
             inv.open_session(question)
 
-            log.info(
-                f"[{bot.account_id}] ✅ Сесія відкрита | "
+            get_account_logger(bot.account_id).info(
+                f"✅ Сесія відкрита | "
                 f"q_id={question.get('id')} | "
                 f"{question.get('question', '')[:60]}"
             )
@@ -341,21 +342,21 @@ class QuizProfession(BaseProfession):
 
             question = inv.current_question
             if question is None:
-                log.warning(f"[{bot.account_id}] ⚠️ answer_quiz: питання в inventory відсутнє")
+                get_account_logger(bot.account_id).warning(f"⚠️ answer_quiz: питання в inventory відсутнє")
                 on_done(bot)
                 return
 
             answer_text: str = question.get("correct_text", question["answers"][0])
 
-            log.info(
-                f"[{bot.account_id}] ❓ [Q#{question.get('id')}] "
+            get_account_logger(bot.account_id).info(
+                f"❓ [Q#{question.get('id')}] "
                 f"{question.get('question', '')[:60]} → «{answer_text}»"
             )
 
             result = bot.session.quiz_answer(answer_text)
 
             if result is None:
-                log.warning(f"[{bot.account_id}] ⚠️ /quiz/answer не відповів")
+                get_account_logger(bot.account_id).warning(f"⚠️ /quiz/answer не відповів")
                 on_done(bot)
                 return
 
@@ -364,16 +365,16 @@ class QuizProfession(BaseProfession):
             # ── Правильна відповідь (або milestone — той самий success + досягнення) ──
             if status in ("success", "milestone"):
                 if status == "milestone":
-                    log.info(
-                        f"[{bot.account_id}] 🏅 Milestone! "
+                    get_account_logger(bot.account_id).info(
+                        f"🏅 Milestone! "
                         f"milestone={result.get('milestone')} "
                         f"message={result.get('message', '')!r}"
                     )
                 inv.correct_count = result.get("correct_count", inv.correct_count + 1)
                 counter = inv.increment_counter()
 
-                log.info(
-                    f"[{bot.account_id}] ✅ Вірно! "
+                get_account_logger(bot.account_id).info(
+                    f"✅ Вірно! "
                     f"correct={inv.correct_count} | "
                     f"counter={counter}/{inv.answer_limit} "
                     f"(mode={inv.mode})"
@@ -405,8 +406,8 @@ class QuizProfession(BaseProfession):
 
                 # ── Ліміт досягнуто ───────────────────────────────────────────
                 if counter >= inv.answer_limit:
-                    log.info(
-                        f"[{bot.account_id}] 🎯 Ліміт досягнуто "
+                    get_account_logger(bot.account_id).info(
+                        f"🎯 Ліміт досягнуто "
                         f"({counter}/{inv.answer_limit}, mode={inv.mode}) → закриваємо"
                     )
                     inv.close_session(today())
@@ -429,9 +430,9 @@ class QuizProfession(BaseProfession):
                 next_question = result.get("question")
                 if next_question:
                     inv.current_question = next_question
-                    log.info(f"[{bot.account_id}] ➡️  Наступне питання id={next_question.get('id')}")
+                    get_account_logger(bot.account_id).info(f"➡️  Наступне питання id={next_question.get('id')}")
                 else:
-                    log.info(f"[{bot.account_id}] 🏆 Сервер вичерпав питання")
+                    get_account_logger(bot.account_id).info(f"🏆 Сервер вичерпав питання")
                     inv.close_session(today())
 
                 on_done(bot)
@@ -439,8 +440,8 @@ class QuizProfession(BaseProfession):
 
             # ── Невірна відповідь / restart ───────────────────────────────────
             if status == "restart":
-                log.info(
-                    f"[{bot.account_id}] ❌ Невірна відповідь. "
+                get_account_logger(bot.account_id).info(
+                    f"❌ Невірна відповідь. "
                     f"Результат: {inv.correct_count}. "
                     f"mode={inv.mode}. {result.get('message', '')}"
                 )
@@ -460,7 +461,7 @@ class QuizProfession(BaseProfession):
                 on_done(bot)
                 return
 
-            log.warning(f"[{bot.account_id}] ⚠️ Невідомий status: {status!r}")
+            get_account_logger(bot.account_id).warning(f"⚠️ Невідомий status: {status!r}")
             on_done(bot)
 
         return lambda bot: [Task(

@@ -11,6 +11,7 @@ class MangaRow:
     rating:        str
     info:          str
     image:         str
+    views:         int
     created_at:    Optional[str]
     updated_at:    Optional[str]
 

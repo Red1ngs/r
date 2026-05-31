@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-import logging
 from typing import Optional
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup, Tag
 
-from src.mangabuff.reader.models import Chapter, Manga
+from src.mangabuff.farmer.models import Chapter, Manga
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_logger
+log = get_logger("farmer.parsers")
+
+# Кількість манг на одній сторінці каталогу (для розрахунку номера сторінки)
+CATALOG_PAGE_SIZE: int = 30
+
 
 def _extract_image_url(img_tag: Tag) -> str:
     # BeautifulSoup.get може повернути list[str], тому перетворюємо на str
@@ -119,3 +123,29 @@ def parse_chapters(html: str) -> list[Chapter]:
         if ch:
             chapters.append(ch)
     return chapters
+
+def parse_manga_data_id(html: str) -> Optional[int]:
+    """Парсить data_id манги зі сторінки манги (не з каталогу)."""
+    soup = BeautifulSoup(html, "html.parser")
+    manga_element = soup.find('div', class_='manga-card')
+    if manga_element:
+        data_id = manga_element.get('data-id')
+        if data_id:
+            return int(str(data_id))
+    log.warning("Не вдалося знайти data_id на сторінці манги")
+    return None
+
+def parse_manga_views(html: str) -> int:
+    """Парсить кількість переглядів манги з <div class="manga__views">."""
+    soup = BeautifulSoup(html, "html.parser")
+    views_tag = soup.find("div", class_="manga__views")
+    if not views_tag:
+        log.debug("manga__views не знайдено на сторінці манги")
+        return 0
+    try:
+        # "40 108 015" → 40108015  (пробіли/nbsp як роздільник тисяч)
+        raw = views_tag.get_text(strip=True).replace("\xa0", "").replace(" ", "")
+        return int(raw)
+    except (ValueError, AttributeError):
+        log.debug("Не вдалося розпарсити manga__views: %s", views_tag.get_text(strip=True))
+        return 0

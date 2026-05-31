@@ -1,13 +1,13 @@
 from __future__ import annotations
 import json
-import logging
 import sqlite3
 from typing import Any
 
 from src.core.inventory.factory import inventory_factory
 from src.core.inventory.model import DynamicInventories
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_logger
+log = get_logger("db.inventory")
 
 class InventoryRepository: # Перейменували для відповідності стилю
     def __init__(self, conn: sqlite3.Connection):

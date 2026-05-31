@@ -23,7 +23,7 @@ async def _redraw(call: CallbackQuery, svc: SchedulerService, acc_id: str) -> No
     if info:
         await call.message.edit_text(  # type: ignore[union-attr]
             account_text(info),
-            reply_markup=account_menu_kb(acc_id, info.status, bool(info.professions)),
+            reply_markup=account_menu_kb(acc_id, info.status, list(info.professions)),
         )
 
 
@@ -38,7 +38,7 @@ async def cb_menu(call: CallbackQuery, svc: SchedulerService) -> None:
         return
     await call.message.edit_text(  # type: ignore[union-attr]
         account_text(info),
-        reply_markup=account_menu_kb(acc_id, info.status, bool(info.professions)),
+        reply_markup=account_menu_kb(acc_id, info.status, list(info.professions)),
     )
     await call.answer()
 
@@ -52,7 +52,7 @@ async def cb_refresh(call: CallbackQuery, svc: SchedulerService) -> None:
         return
     await call.message.edit_text(  # type: ignore[union-attr]
         account_text(info),
-        reply_markup=account_menu_kb(acc_id, info.status, bool(info.professions)),
+        reply_markup=account_menu_kb(acc_id, info.status, list(info.professions)),
     )
     await call.answer("🔄 Оновлено")
 

@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS mangas (
     rating        TEXT    NOT NULL DEFAULT '',
     info          TEXT    NOT NULL DEFAULT '',
     image         TEXT    NOT NULL DEFAULT '',
+    views         INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
@@ -102,6 +103,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     Виконуються після CREATE TABLE IF NOT EXISTS, тому безпечні для нових БД.
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
+
+    # Міграція: додаємо колонку views до mangas якщо відсутня
+    manga_cols = {row[1] for row in conn.execute("PRAGMA table_info(mangas)")}
+    if "views" not in manga_cols:
+        conn.execute("ALTER TABLE mangas ADD COLUMN views INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
 
     # Стара схема мала 'profession TEXT' (одиничну)
     if "profession" in cols and "professions" not in cols:

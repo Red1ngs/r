@@ -28,7 +28,6 @@ Lifecycle:
 """
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Optional, List, Type
 
@@ -39,7 +38,8 @@ if TYPE_CHECKING:
     from src.core.runtime.schedule import TriggerProtocol
     from src.core.tasks.base import AnyTask
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_logger
+log = get_logger("runtime.profession")
 
 
 class BaseProfession(ABC):

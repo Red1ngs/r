@@ -1,0 +1,203 @@
+"""
+farmer/catalog_loader.py — CatalogLoaderProfession.
+
+Архітектура:
+    CatalogLoaderProfession
+        • Слухає «reader.chapters_exhausted» — перший хто встиг захоплює лок.
+        • Парсить сторінку каталогу (per-account catalog_page).
+        • Через scheduler.dispatch_work() рівномірно розподіляє транслітерації
+          між усіма активними MangaLoaderProfession в системі.
+
+Універсальний розподіл задач:
+    scheduler.dispatch_work(
+        profession_id = "manga_loader",
+        intent        = "load_batch",
+        items         = translits,
+        item_key      = "translits",
+    )
+    — знаходить N акаунтів з manga_loader, ділить items на N частин,
+      надсилає кожному через ask().
+
+Баги що виправлені:
+    #5  манги не дублюються між ітераціями       — CatalogLoaderProfession дедуплікує по data_id
+    #6  catalog_page — per-account через inventory — CatalogLoaderInventory.catalog_page
+"""
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any, Optional
+
+from src.core.runtime.profession import BaseProfession, RequestResult
+from src.core.runtime.scheduler import EventDrivenScheduler
+from src.mangabuff.farmer.parsers import parse_catalog, CATALOG_PAGE_SIZE
+
+if TYPE_CHECKING:
+    from src.core.account import Account
+    from src.core.runtime.request_router import RequestContext
+    from src.core.runtime.schedule import TriggerProtocol
+
+log = logging.getLogger(__name__)
+
+
+def _parse_catalog_page(bot: "Account") -> list[str]:
+    """
+    Парсить поточну сторінку каталогу для цього акаунта.
+
+    Повертає список транслітерацій манг з новими главами.
+    Фікс #5: дедуплікація по data_id всередині однієї сторінки.
+    Фікс #6: per-account catalog_page через CatalogLoaderInventory.
+    """
+    inv = bot.inventory.catalog_loader  # type: ignore[attr-defined]
+    page = inv.catalog_page
+
+    html = bot.session.fetch_manga_catalog(page=page)
+    if not html:
+        log.warning(f"[{bot.account_id}] CatalogLoader: каталог недоступний (сторінка {page})")
+        return []
+
+    mangas = parse_catalog(html)
+    if not mangas:
+        log.info(f"[{bot.account_id}] CatalogLoader: сторінка {page} порожня → скидаємо на 1")
+        inv.catalog_page = 1
+        return []
+
+    # Фікс #5: data_id унікальні в межах однієї сторінки через dict[int, Manga]
+    # (parse_catalog вже повертає dict, де ключ — data_id)
+    seen: set[int] = set()
+    translits: list[str] = []
+
+    for data_id, manga in mangas.items():
+        if data_id in seen:
+            continue
+        seen.add(data_id)
+        # Зберігаємо мангу в БД одразу (без глав — глави парсить MangaLoader)
+        bot.repo.mangas.upsert(
+             data_id, manga.translit_name, manga.name,
+             manga.rating or "", manga.info or "", manga.image or "",
+         )
+        translits.append(manga.translit_name)
+
+    # Наступна сторінка = загальна кількість манг в БД / CATALOG_PAGE_SIZE
+    total_mangas = bot.repo.mangas.count()
+    next_page = max(1, total_mangas // CATALOG_PAGE_SIZE)
+
+    inv.catalog_page = next_page
+    log.info(
+        f"[{bot.account_id}] CatalogLoader: сторінка {page} → "
+        f"{len(translits)} манг, total_in_db={total_mangas}, наступна сторінка={next_page}"
+    )
+    return translits
+
+
+class CatalogLoaderProfession(BaseProfession):
+    """
+    Profession «Каталог-лоадер».
+
+    Відповідальність:
+        • Слухає «reader.chapters_exhausted».
+        • Перший хто встиг захоплює глобальний лок — решта пропускають.
+        • Парсить одну сторінку каталогу (per-account catalog_page).
+        • Через scheduler.dispatch_work() рівномірно розподіляє транслітерації
+          між усіма MangaLoaderProfession в системі.
+
+    Коректно працює як з одним акаунтом, так і з кількома:
+        • Один акаунт  → парсить каталог і диспетчить на свій же MangaLoader.
+        • Кілька       → перший хто встиг парсить, решта чекають chapters_ready.
+    """
+
+    def __init__(self) -> None:
+        self._account_id: str                               = ""
+        self._scheduler:  Optional["EventDrivenScheduler"] = None
+
+    @property
+    def profession_id(self) -> str:
+        return "catalog_loader"
+
+    async def setup(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
+        self._account_id = account_id
+        self._scheduler  = scheduler
+        scheduler.subscribe("reader.chapters_exhausted", self._on_chapters_exhausted)
+
+    async def restore_state(self, bot: "Account") -> None:
+        inv = bot.inventory.catalog_loader
+        log.info(
+            f"[{self._account_id}] CatalogLoaderProfession відновлено: "
+            f"catalog_page={inv.catalog_page}"
+        )
+
+    async def teardown(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
+        pass
+
+    def build_triggers(self, account_id: str) -> list["TriggerProtocol"]:
+        return []
+
+    def check_guard(self, bot: "Account") -> bool:
+        return not bool(bot.inventory.personal.data.get("is_banned"))
+
+    async def handle_request(
+        self,
+        intent: str,
+        data:   dict[str, Any],
+        ctx:    "RequestContext",
+    ) -> RequestResult:
+        if intent == "get_state":
+            inv = ctx.bot.inventory.catalog_loader  # type: ignore[attr-defined]
+            return RequestResult.approve(data={"catalog_page": inv.catalog_page})
+        if intent == "reset_catalog_page":
+            inv = ctx.bot.inventory.catalog_loader  # type: ignore[attr-defined]
+            inv.catalog_page = 1
+            log.info(f"[{ctx.account_id}] CatalogLoaderProfession: catalog_page скинуто на 1")
+            return RequestResult.approve(data={"catalog_page": 1})
+        return RequestResult.deny(f"unknown intent: {intent!r}")
+
+    async def _on_chapters_exhausted(self, payload: dict[str, Any]) -> None:
+        if self._scheduler is None:
+            return
+
+        # Перший хто встиг — парсить. Решта пропускають і чекають chapters_ready.
+        acquired = await self._scheduler.try_acquire_loader_lock()
+        if not acquired:
+            log.info(
+                f"[{self._account_id}] CatalogLoaderProfession: "
+                f"інший catalog_loader вже парсить — пропускаємо"
+            )
+            return
+
+        log.info(f"[{self._account_id}] CatalogLoaderProfession: chapters_exhausted → парсимо каталог")
+
+        bot = self._scheduler.get_bot(self._account_id)
+        if bot is None:
+            log.warning(f"[{self._account_id}] CatalogLoaderProfession: акаунт не знайдено")
+            await self._scheduler.release_loader_lock()
+            return
+
+        try:
+            translits = _parse_catalog_page(bot)
+
+            if not translits:
+                log.info(f"[{self._account_id}] CatalogLoaderProfession: каталог порожній або недоступний")
+                return
+
+            dispatched = await self._scheduler.dispatch_work(
+                profession_id = "manga_loader",
+                intent        = "load_batch",
+                items         = translits,
+                item_key      = "translits",
+                caller        = self._account_id,
+            )
+            log.info(
+                f"[{self._account_id}] CatalogLoaderProfession: "
+                f"{len(translits)} манг розподілено між {dispatched} manga_loader(ів)"
+            )
+        except Exception:
+            log.exception(f"[{self._account_id}] CatalogLoaderProfession: помилка")
+            # При помилці — знімаємо лок і будимо читачів щоб не зависли
+            await self._scheduler.release_loader_lock()
+            self._scheduler.emit_event("loader.chapters_ready", {"error": True},
+                                       source=self._account_id)
+        # Лок знімає MangaLoaderProfession після завершення останнього батчу,
+        # або тут якщо dispatch_work повернув 0 (немає manga_loader'ів).
+        else:
+            if dispatched == 0:
+                await self._scheduler.release_loader_lock()
+

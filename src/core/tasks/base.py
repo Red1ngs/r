@@ -29,7 +29,6 @@ source_profession:
 from __future__ import annotations
 
 import itertools
-import logging
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -38,7 +37,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     from src.core.account import Account
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_logger
+log = get_logger("tasks.base")
 
 _seq = itertools.count()
 

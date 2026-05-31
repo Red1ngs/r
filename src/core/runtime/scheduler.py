@@ -42,6 +42,19 @@ _MAX_SLEEP = 30.0
 _MIN_SLEEP = 0.5
 
 
+def _split_evenly(items: list[Any], n: int) -> list[list[Any]]:
+    """
+    Ділить items на n рівних частин (остання може бути меншою).
+
+        _split_evenly([1,2,3,4,5], 3)  →  [[1,2], [3,4], [5]]
+        _split_evenly([1,2], 5)        →  [[1], [2], [], [], []]
+    """
+    if n <= 0:
+        return []
+    size = max(1, -(-len(items) // n))   # ceil division
+    return [items[i: i + size] for i in range(0, len(items), size)]
+
+
 @dataclass
 class AccountContainer:
     """
@@ -212,10 +225,13 @@ class EventDrivenScheduler:
             name="scheduler-monitor",
         )
 
-        self._event_bus   = EventBus()
-        self._router      = RequestRouter()
-        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._event_bus    = EventBus()
+        self._router       = RequestRouter()
+        self._async_loop:  Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
+        # Глобальний лок: тільки один LoaderProfession парсить одночасно.
+        # Ініціалізується ліниво в async-петлі (asyncio.Lock прив'язаний до loop).
+        self._loading_lock: Optional[asyncio.Lock] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -251,6 +267,7 @@ class EventDrivenScheduler:
 
     def _run_async_loop(self) -> None:
         asyncio.set_event_loop(self._async_loop)
+        self._loading_lock = asyncio.Lock()   # створюємо в петлі, якій належить
         self._async_loop.run_forever()
 
     # ── Account management ────────────────────────────────────────────────────
@@ -493,6 +510,69 @@ class EventDrivenScheduler:
         with self._lock:
             return list(self._containers.keys())
 
+    def get_accounts_with_profession(self, profession_id: str) -> list[str]:
+        """Повертає account_id усіх акаунтів що мають активну вказану професію."""
+        with self._lock:
+            return [
+                account_id
+                for account_id, container in self._containers.items()
+                if container.has_profession(profession_id)
+            ]
+
+    async def dispatch_work(
+        self,
+        profession_id: str,
+        intent:        str,
+        items:         list[Any],
+        item_key:      str,
+        *,
+        caller:        str   = "system",
+        timeout:       float = 30.0,
+    ) -> int:
+        """
+        Рівномірно розподіляє items між усіма акаунтами з вказаною професією.
+
+        Знаходить N воркерів → ділить items на N рівних частин →
+        надсилає кожному ask(profession_id, intent, {item_key: chunk}).
+
+        Повертає кількість воркерів яким надіслано завдання.
+        Якщо воркерів немає — логує warning і повертає 0.
+
+        Приклад:
+            dispatched = await scheduler.dispatch_work(
+                profession_id = "manga_loader",
+                intent        = "load_batch",
+                items         = translits,
+                item_key      = "translits",
+                caller        = self._account_id,
+            )
+        """
+        workers = self.get_accounts_with_profession(profession_id)
+        if not workers:
+            log.warning(
+                f"dispatch_work: немає акаунтів з професією {profession_id!r} "
+                f"— {len(items)} завдань не розподілено"
+            )
+            return 0
+
+        chunks = _split_evenly(items, len(workers))
+
+        dispatched = 0
+        for account_id, chunk in zip(workers, chunks):
+            if not chunk:
+                continue
+            await self.ask(
+                account_id    = account_id,
+                profession_id = profession_id,
+                intent        = intent,
+                data          = {item_key: chunk},
+                caller        = caller,
+                timeout       = timeout,
+            )
+            dispatched += 1
+
+        return dispatched
+
     def status(self, account_id: str) -> Optional[AccountStatus]:
         with self._lock:
             entry = self._containers.get(account_id)
@@ -530,6 +610,25 @@ class EventDrivenScheduler:
 
     def subscribe(self, event_name: str, callback: EventCallback) -> None:
         self._event_bus.subscribe(event_name, callback)
+
+    async def try_acquire_loader_lock(self) -> bool:
+        """
+        Намагається захопити глобальний лок завантажувача (non-blocking).
+
+        Повертає True якщо лок захоплено — цей лоадер може парсити.
+        Повертає False якщо інший лоадер вже тримає лок — треба пропустити.
+        """
+        if self._loading_lock is None:
+            return True   # async-петля ще не готова — дозволяємо як fallback
+        if self._loading_lock.locked():
+            return False
+        await self._loading_lock.acquire()
+        return True
+
+    async def release_loader_lock(self) -> None:
+        """Звільняє глобальний лок завантажувача."""
+        if self._loading_lock is not None and self._loading_lock.locked():
+            self._loading_lock.release()
 
     def emit_event(
         self,

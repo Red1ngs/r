@@ -36,18 +36,18 @@ slot_scheduler.py — планувальник читань по слотах.
 """
 from __future__ import annotations
 
-import logging
 import random
-from dataclasses import dataclass
+
 from typing import TYPE_CHECKING, Optional
 
 # Використовуємо єдину точку отримання часу в проекті
 from src.utils.time import now_ts, seconds_until_midnight, today
 
 if TYPE_CHECKING:
-    from src.mangabuff.reader.inventory import ReaderInventory, SlotProgress
+    from src.mangabuff.farmer.inventory import ReaderInventory, SlotProgress
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_logger
+log = get_logger("farmer.slot_scheduler")
 
 JITTER_MIN: float = 1.0
 JITTER_MAX: float = 30.0
@@ -55,12 +55,6 @@ JITTER_MAX: float = 30.0
 _SCHEDULE_KEY   = "slot_schedule"
 _RESET_DATE_KEY = "slot_reset_date"
 
-
-@dataclass
-class SlotFire:
-    """Результат current() — який слот виконувати зараз."""
-    slot:  "SlotProgress"
-    delay: float   # секунди до виконання (0.0 = прямо зараз)
 
 
 class SlotScheduler:

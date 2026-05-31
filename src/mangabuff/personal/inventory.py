@@ -22,7 +22,7 @@ from typing import (
 from src.core.inventory.model import BaseInventory
 
 if TYPE_CHECKING:
-    from src.mangabuff.reader.models import ItemReceivedEvent
+    from src.mangabuff.farmer.models import ItemReceivedEvent
 
 
 @dataclass

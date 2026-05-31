@@ -22,8 +22,8 @@ from typing import (
 from src.core.inventory.model import BaseInventory
 
 if TYPE_CHECKING:
-    from src.mangabuff.reader.slot_scheduler import SlotScheduler
-    from src.mangabuff.reader.models import ReaderWork
+    from src.mangabuff.farmer.slot_scheduler import SlotScheduler
+    from src.mangabuff.farmer.models import ReaderWork
 
 
 @dataclass
@@ -88,7 +88,7 @@ class ReaderInventory(BaseInventory):
     @property
     def slot_scheduler(self) -> "SlotScheduler":
         if self._scheduler is None:
-            from src.mangabuff.reader.slot_scheduler import SlotScheduler as _SS
+            from src.mangabuff.farmer.slot_scheduler import SlotScheduler as _SS
             self._scheduler = _SS(self)
         return self._scheduler
 
@@ -170,3 +170,48 @@ class ReaderInventory(BaseInventory):
             f"pending={len(self.pending_slots())}>"
         )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LoaderInventory
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class LoaderInventory(BaseInventory):
+    """
+    Зберігає стан LoaderProfession між запусками.
+
+    catalog_page — фікс #6: кожен акаунт пам'ятає свою сторінку каталогу
+                   незалежно від кількості манг у спільній БД.
+    """
+
+    @property
+    def catalog_page(self) -> int:
+        """Остання успішно оброблена сторінка каталогу (1-based)."""
+        return int(self.data.get("catalog_page", 1))
+
+    @catalog_page.setter
+    def catalog_page(self, value: int) -> None:
+        self.data["catalog_page"] = max(1, value)
+
+    def __repr__(self) -> str:
+        return f"<LoaderInventory catalog_page={self.catalog_page}>"
+    
+    
+@dataclass
+class CatalogLoaderInventory(BaseInventory):
+    """
+    Per-account стан CatalogLoaderProfession.
+
+    catalog_page — фікс #6: кожен акаунт пам'ятає свою сторінку каталогу
+                   незалежно від кількості манг у спільній БД.
+    """
+
+    @property
+    def catalog_page(self) -> int:
+        return int(self.data.get("catalog_page", 1))
+
+    @catalog_page.setter
+    def catalog_page(self, value: int) -> None:
+        self.data["catalog_page"] = max(1, value)
+
+    def __repr__(self) -> str:
+        return f"<CatalogLoaderInventory catalog_page={self.catalog_page}>"

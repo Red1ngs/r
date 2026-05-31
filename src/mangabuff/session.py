@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import threading
 from typing import Any, Dict, Generator, Optional
 from urllib.parse import unquote
@@ -16,7 +15,7 @@ from src.mangabuff.daily.parser import get_claimable_day
 from src.utils.log_section import section
 from src.utils.logging import log_request, log_response
 
-log = logging.getLogger(__name__)
+from src.utils.logging import _log as log
 
 
 # ===========================================================================
@@ -92,19 +91,19 @@ class BotAuth(httpx.Auth):
         # ре-логіниться (не наш кейс, але safe), просто пропускаємо.
         acquired = self._relogin_lock.acquire(blocking=True, timeout=30)
         if not acquired:
-            log.error("  → 419: не вдалось отримати relogin lock за 30с")
+            log().error("  → 419: не вдалось отримати relogin lock за 30с")
             return
 
         try:
-            log.warning("  → 419 CSRF expired — re-logging in")
+            log().warning("  → 419 CSRF expired — re-logging in")
             success = False
             try:
                 success = self.transport.login(force=True)
             except Exception as e:
-                log.error(f"  → re-login failed: {e}")
+                log().error(f"  → re-login failed: {e}")
 
             if not success:
-                log.error("  → re-login failed, request aborted")
+                log().error("  → re-login failed, request aborted")
                 raise PermissionError("Session expired and re-login failed")
 
             # Будуємо новий request з актуальними заголовками та cookies.
@@ -154,7 +153,7 @@ class BotTransport:
         self.headers       = RequestHeaders(bot_config)
         self.client:       Optional[httpx.Client] = None
         self.saved_cookies = httpx.Cookies()
-        self._rate_limiter = RateLimiter(min_interval=1.0)
+        self._rate_limiter = RateLimiter(min_interval=2.0)
 
         self._create_client()
 
@@ -191,7 +190,7 @@ class BotTransport:
 
         auth = self.bot_config.client.auth
         if not auth:
-            log.error("No auth credentials in config")
+            log().error("No auth credentials in config")
             return False
 
         section(f"auth  {auth.email}")
@@ -213,7 +212,7 @@ class BotTransport:
                 self.headers.xsrf_token = unquote(xsrf)
             return True
         except Exception as e:
-            log.error(f"  → _fetch_csrf error: {e}")
+            log().error(f"  → _fetch_csrf error: {e}")
             return False
 
     def _submit_login(self) -> bool:
@@ -227,15 +226,15 @@ class BotTransport:
         try:
             r = self.post("/login", data=payload, headers=self.headers.get_ajax(is_post=True))
             if r.status_code not in (200, 204, 302):
-                log.warning(f"  → login POST returned {r.status_code}")
+                log().warning(f"  → login POST returned {r.status_code}")
                 return False
             self._update_cookies(self.client.cookies)
             ok = self.check_auth()
             if not ok:
-                log.warning("  → login POST ok але check_auth провалився")
+                log().warning("  → login POST ok але check_auth провалився")
             return ok
         except Exception as e:
-            log.error(f"  → _submit_login error: {e}")
+            log().error(f"  → _submit_login error: {e}")
             return False
 
     def check_auth(self) -> bool:
@@ -250,11 +249,11 @@ class BotTransport:
                 xsrf = self.client.cookies.get("XSRF-TOKEN")
                 if xsrf:
                     self.headers.xsrf_token = unquote(xsrf)
-                log.info(f"  → ✅ {user_name}")
+                log().info(f"  → ✅ {user_name}")
                 return True
             return False
         except Exception as e:
-            log.error(f"  → check_auth error: {e}")
+            log().error(f"  → check_auth error: {e}")
             return False
 
     def _update_cookies(self, new_cookies: dict[str, str] | httpx.Cookies) -> None:
@@ -337,13 +336,13 @@ class BotSession(BotTransport):
             real_ip = _httpx.get("https://api.ipify.org", timeout=10).text.strip()
 
             if proxy_ip == real_ip:
-                log.error(f"  → Proxy IP збігається з реальним ({real_ip}) — проксі не працює")
+                log().error(f"  → Proxy IP збігається з реальним ({real_ip}) — проксі не працює")
                 return False
 
-            log.info(f"  → Proxy IP: {proxy_ip} (реальний: {real_ip}) ✅")
+            log().info(f"  → Proxy IP: {proxy_ip} (реальний: {real_ip}) ✅")
             return True
         except Exception as e:
-            log.error(f"  → Proxy check failed: {e}")
+            log().error(f"  → Proxy check failed: {e}")
             return False
 
     # ── Daily Bonus ──────────────────────────────────────────────────
@@ -361,13 +360,13 @@ class BotSession(BotTransport):
                 day_attr=self.daily.day_attr,
             )
             if day is not None:
-                log.info(f"  → день {day} доступний")
+                log().info(f"  → день {day} доступний")
                 return int(day)
 
-            log.info("  → бонус недоступний сьогодні")
+            log().info("  → бонус недоступний сьогодні")
             return None
         except Exception as e:
-            log.error(f"  → /balance error: {e}")
+            log().error(f"  → /balance error: {e}")
             return None
 
     def claim_calendar(self, day: int | str) -> tuple[bool, dict[str, Any]]:
@@ -375,12 +374,12 @@ class BotSession(BotTransport):
             url = self.daily.url_calendar_claim.format(day)
             r = self.post(url, timeout=15)
             if r.status_code == 200:
-                log.info("  → отримано")
+                log().info("  → отримано")
                 return True, r.json()
-            log.warning(f"  → {r.status_code} {r.json().get('message', '')}")
+            log().warning(f"  → {r.status_code} {r.json().get('message', '')}")
             return False, r.json()
         except Exception as e:
-            log.error(f"  → claim_calendar error: {e}")
+            log().error(f"  → claim_calendar error: {e}")
             return False, {}
 
     def claim_daily(self) -> tuple[bool, dict[str, Any]]:
@@ -388,12 +387,12 @@ class BotSession(BotTransport):
             url = self.daily.url_ping
             r = self.post(url, timeout=15)
             if r.status_code == 200:
-                log.info("  → отримано")
+                log().info("  → отримано")
                 return True, r.json()
-            log.warning(f"  → {r.status_code} {r.json().get('message', '')}")
+            log().warning(f"  → {r.status_code} {r.json().get('message', '')}")
             return False, r.json()
         except Exception as e:
-            log.error(f"  → claim_daily error: {e}")
+            log().error(f"  → claim_daily error: {e}")
             return False, {}
 
     # ── Reader ───────────────────────────────────────────────────────
@@ -419,17 +418,17 @@ class BotSession(BotTransport):
             r.raise_for_status()
             return r.text
         except Exception as e:
-            log.error(f"  → fetch_manga_catalog error: {e}")
+            log().error(f"  → fetch_manga_catalog error: {e}")
             return None
 
     def fetch_manga_chapters(self, translit_name: str, manga_data_id: int) -> Optional[str]:
-        page_html = self._fetch_manga_page(translit_name)
+        page_html = self.fetch_manga_page(translit_name)
         if not page_html:
             return None
         more_html = self._fetch_more_chapters(manga_data_id)
         return page_html + more_html
 
-    def _fetch_manga_page(self, translit_name: str) -> Optional[str]:
+    def fetch_manga_page(self, translit_name: str) -> Optional[str]:
         try:
             url = self.reader.parsing.url_chapters.format(translit_name=translit_name)
             r = self.get(url, timeout=15)
@@ -437,7 +436,7 @@ class BotSession(BotTransport):
             self.headers.referer = str(r.url)
             return r.text
         except Exception as e:
-            log.error(f"  → fetch_manga_page error: {e}")
+            log().error(f"  → fetch_manga_page error: {e}")
             return None
 
     def _fetch_more_chapters(self, manga_data_id: int) -> str:
@@ -447,7 +446,7 @@ class BotSession(BotTransport):
             r.raise_for_status()
             return r.json().get("content", "")
         except Exception as e:
-            log.warning(f"  → fetch_more_chapters error: {e}")
+            log().warning(f"  → fetch_more_chapters error: {e}")
             return ""
         
     # ── Quiz ───────────────────────────────────────────────────────
@@ -461,10 +460,10 @@ class BotSession(BotTransport):
             r = self.post("/quiz/start", timeout=15)
             if r.status_code == 200:
                 return r.json().get("question")
-            log.warning(f"  → quiz_start: {r.status_code}")
+            log().warning(f"  → quiz_start: {r.status_code}")
             return None
         except Exception as e:
-            log.error(f"  → quiz_start error: {e}")
+            log().error(f"  → quiz_start error: {e}")
             return None
         
     def quiz_answer(self, answer: str) -> Optional[dict[str, Any]]:
@@ -480,9 +479,8 @@ class BotSession(BotTransport):
             )
             if r.status_code == 200:
                 return r.json()
-            log.warning(f"  → quiz_answer: {r.status_code}")
+            log().warning(f"  → quiz_answer: {r.status_code}")
             return None
         except Exception as e:
-            log.error(f"  → quiz_answer error: {e}")
+            log().error(f"  → quiz_answer error: {e}")
             return None
- 

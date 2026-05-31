@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
-log = logging.getLogger(__name__)
+from src.core.logging.loggers import get_logger
+log = get_logger("runtime.event_bus")
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 

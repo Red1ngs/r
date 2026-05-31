@@ -20,7 +20,7 @@ from src.core.config.app import AppConfig
 from src.core.config.bot import AuthConfig, BaseHeaders, BotConfig, ClientConfig, NetworkConfig
 from src.core.runtime.scheduler import EventDrivenScheduler
 from src.core.account import Account
-from src.core.runtime.profession import profession_factory
+from src.core.runtime.profession import BaseProfession, profession_factory
 from src.database.repository.factory import Repositories
 
 _ENV_FILE = Path(".env")
@@ -206,13 +206,13 @@ class SchedulerService:
         # Відновлюємо всі professions з БД
         db_acc   = self._repo.accounts.get(account_id)
         prof_names = db_acc.professions if db_acc else []
-        professions = []
+        professions: list[BaseProfession] = []
         for name in prof_names:
             try:
                 professions.append(profession_factory.build(name))
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
+                from src.core.logging.loggers import get_logger
+                get_logger("admin.scheduler_service").warning(
                     f"[{account_id}] Cannot restore profession {name!r}: {e}"
                 )
 
@@ -319,22 +319,30 @@ class SchedulerService:
 
     # ── Оновлення налаштувань ─────────────────────────────────────────────────
     def force_parse_mangas(
-            self,
-            account_id: str,
-            *,
-            limit:   int = 5,
-            targets: Optional[list[str]] = None,
-        ) -> tuple[bool, str, dict[str, Any]]:
-            """Примусовий парсинг манг. Повертає (ok, reason, data)."""
-            res = self._scheduler.ask_sync(
-                account_id,
-                profession_id="reader",
-                intent="force_parse",
-                data={"limit": limit, "targets": targets or []},
-            )
-            if res.approved:
-                return True, "", res.data or {}
-            return False, res.reason or "невідома помилка", {}
+        self,
+        account_id: str,
+        targets: list[str],
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """
+        Примусовий парсинг манг за translit_name. Повертає (ok, reason, data).
+
+        Надсилає запит до manga_loader (не reader).
+        Ключ payload: translits (не targets).
+        """
+        res = self._scheduler.ask_sync(
+            account_id,
+            profession_id="manga_loader",
+            intent="force_parse",
+            data={"translits": targets},
+        )
+        if res.approved:
+            data = res.data or {}
+            # нормалізуємо ключі для зворотної сумісності з UI
+            return True, "", {
+                "chapters": data.get("chapters_saved", 0),
+                "mangas":   data.get("mangas", 0),
+            }
+        return False, res.reason or "невідома помилка", {}
 
     def mark_mangas_read(
         self,
@@ -368,6 +376,18 @@ class SchedulerService:
 
     def reschedule_trigger(self, account_id: str, trigger_name: str, run_at: str) -> bool:
         return self._scheduler.reschedule_trigger(account_id, trigger_name, run_at)
+
+    def reset_catalog_page(self, account_id: str) -> tuple[bool, str]:
+        """Скидає сторінку каталогу на 1 для catalog_loader."""
+        res = self._scheduler.ask_sync(
+            account_id,
+            profession_id="catalog_loader",
+            intent="reset_catalog_page",
+            data={},
+        )
+        if res.approved:
+            return True, ""
+        return False, res.reason or "невідома помилка"
 
     def pause(self, account_id: str)  -> bool: return self._scheduler.pause_account(account_id)
     def resume(self, account_id: str) -> bool: return self._scheduler.resume_account(account_id)

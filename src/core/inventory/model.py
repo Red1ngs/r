@@ -7,11 +7,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from src.mangabuff.reader.inventory import ReaderInventory
+    from src.mangabuff.farmer.inventory import ReaderInventory
     from src.mangabuff.personal.inventory import PersonalInventory
+    from src.mangabuff.farmer.inventory import LoaderInventory
     from src.mangabuff.alliance.inventory import AllianceInventory
     from src.mangabuff.daily.inventory import DailyInventory
     from src.mangabuff.quiz.inventory import QuizInventory
+    from src.mangabuff.farmer.inventory import CatalogLoaderInventory
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,8 +55,10 @@ class DynamicInventories:
         personal: "PersonalInventory"
         alliance: "AllianceInventory"
         reader:   "ReaderInventory"
+        loader:   "LoaderInventory"
         daily:    "DailyInventory"
         quiz:     "QuizInventory"
+        catalog_loader: "CatalogLoaderInventory"
 
     def __repr__(self) -> str:
         parts = " ".join(

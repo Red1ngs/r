@@ -1,42 +1,42 @@
-# ==========================================
-# 1. ГЛОБАЛЬНІ НАЛАШТУВАННЯ (reader)
-# ==========================================
 reader:
-  # Як часто перевіряти оновлення (в днях)
+  url_add_history: "/addHistory"
   update_interval_days: 1
-  url_add_history: "/addHistory?r=702"  # URL для додавання історії читання
-  
-  reward_slots:
-    - name: "scroll"
-      daily_limit: 3
-      interval_seconds: 3600.0  # 1 година
-      reward_keys: ["scroll", "rank", "is_blessed"]
-
-    - name: "card"
-      daily_limit: 10
-      interval_seconds: 5400.0
-      reward_keys: ["id", "name", "image"]
 
   parsing:
-    url_catalog: "/manga"
-    url_chapters: "/manga/{translit_name}"
-    url_chapters_load: "/chapters/load"
-    reward_selector: ".reward-item"
-    reward_type_attr: "data-reward-type"  # Атрибут, що вказує тип винагороди
-    reward_id_attr: "data-reward-id"  # Атрибут, що вказує ID винагороди
+    url_catalog:        "/manga"
+    url_chapters:       "/manga/{translit_name}"
+    url_chapters_load:  "/chapters/load"
+    reward_selector:    ".reward-item"
+    reward_type_attr:   "data-reward-type"
+    reward_id_attr:     "data-reward-id"
 
-streak:
-  url_balance: "/balance"
-  url_claim: "/balance/claim/{}"  # {} буде замінено на номер дня
-  item_selector: ".daily-rewards .daily-rewards-item"
-  claim_text: "Забрать"
-  day_attr: "data-day"
+  reward_slots:
+    - name:             "card"
+      daily_limit:      10
+      interval_seconds: 5400      # затримка після отримання картки
+      reward_keys:      ["id", "name", "image"]
+
+    - name:             "scroll"
+      daily_limit:      3
+      interval_seconds: 1800      # затримка після отримання свитку
+      reward_keys:      ["scroll", "rank", "is_blessed"]
+
+  reading_mode:
+    mode:              "standard"
+    read_interval_s:   5400       # fallback: слот готовий одразу або всі закриті
+    event_interval_s:  120
+    card_slot:         "card"
+    scroll_slot:       "scroll"
+
+daily:
+  url_balance:        "/balance"
+  url_ping:           "/visit/ping"
+  url_calendar_claim: "/balance/claim/{}"
+  item_selector:      ".daily-rewards .daily-rewards-item"
+  claim_text:         "Забрать"
+  day_attr:           "data-day"
 
 quiz:
-  mode: daily          # "daily" — N відповідей на день (скидається при daily.claimed)
-                       # "fixed" — N відповідей один раз, не прив'язано до дня
- 
-  answer_limit: 10      # кількість правильних відповідей до зупинки
- 
-  answer_delay: 6     # секунди між відповідями (імітація читання питання)
- 
+  mode:         "daily"
+  answer_limit: 10
+  answer_delay: 8.0

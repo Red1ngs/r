@@ -11,6 +11,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from src.bot.admin.services.scheduler_service import AccountInfo
 from src.core.runtime.profession import profession_factory
+from src.bot.admin.routers.accounts.profession_menu import profession_menu_registry
 
 # ── Статуси → emoji ───────────────────────────────────────────────────────────
 
@@ -91,10 +92,17 @@ def accounts_list_kb(accounts: list[AccountInfo]) -> InlineKeyboardMarkup:
 
 
 def account_menu_kb(
-    acc_id:       str,
-    status:       str,
-    has_professions: bool,
+    acc_id:           str,
+    status:           str,
+    active_professions: list[str],
 ) -> InlineKeyboardMarkup:
+    """
+    Головне меню акаунта.
+
+    Кнопки profession-специфічних операцій генеруються автоматично
+    з ProfessionMenuRegistry — кожний модуль profession реєструє
+    свої пункти при імпорті, жодного хардкоду тут.
+    """
     is_suspended = status == "SUSPENDED"
     is_dead      = status == "DEAD"
     rows: list[list[InlineKeyboardButton]] = []
@@ -110,24 +118,14 @@ def account_menu_kb(
             callback_data=f"acc:professions:{acc_id}",
         )])
 
-    if not is_dead and has_professions:
-        rows.append([InlineKeyboardButton(
-            text="🎰 Слоти читача",
-            callback_data=f"acc:slots:{acc_id}",
-        )])
-
-    # ← додати:
-    if not is_dead and has_professions:
-        rows.append([
-            InlineKeyboardButton(
-                text="🔍 Парсинг манг",
-                callback_data=f"acc:force_parse:{acc_id}",
-            ),
-            InlineKeyboardButton(
-                text="✅ Прочитані",
-                callback_data=f"acc:mark_read:{acc_id}",
-            ),
-        ])
+    # ── Profession-специфічні пункти меню (автогенерація з реєстру) ──────────
+    if not is_dead and active_professions:
+        prof_items = profession_menu_registry.items_for(active_professions)
+        for item in prof_items:
+            rows.append([InlineKeyboardButton(
+                text=item.label,
+                callback_data=item.build_callback(acc_id),
+            )])
 
     rows.append([
         InlineKeyboardButton(text="🔄 Оновити", callback_data=f"acc:refresh:{acc_id}"),

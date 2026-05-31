@@ -3,20 +3,24 @@ daily/build.py — DailyProfession.
 
 Відповідальність:
     Збирає щоденний бонус і календарний streak-бонус.
-    Запускається раз на день у псевдовипадковий час відносно 04:30 
+    Запускається раз на день у псевдовипадковий час відносно 04:30
     (розподіляється індивідуально для кожного акаунта за його хешем).
 
 State (bot.inventory.daily → DailyInventory):
     last_daily_claimed    : str | None  — "YYYY-MM-DD" UTC
     last_calendar_claimed : str | None  — "YYYY-MM-DD" UTC
-    can_claim_calendar    : bool
+    can_claim_calendar    : bool        — день стріку відомий, можна збирати
     day                   : int         — поточний день стріку
+
+    Весь стан живе в DailyInventory.data (dict) і персистується автоматично
+    через worker._execute → finally → repo.inventory.save().
+    Явний save() в action не потрібен і не використовується.
 
 Pipeline (один цикл):
     _fetch_bonus_status
-      ├─ _NOTHING_TO_DO → все зібрано → on_cycle_done
-      ├─ None           → день календаря невідомий → parse → fetch знову
-      └─ plan dict      → action → claim_daily / claim_calendar
+      ├─ Skip        → все зібрано → on_cycle_done
+      ├─ NotReady    → день стріку невідомий → parse(_parse_calendar_day) → fetch знову
+      └─ Ready(plan: dict[str, bool]) → action → claim_daily / claim_calendar
 
 Events що емітуємо:
     "daily.claimed"     — зібрано хоча б один бонус
@@ -27,34 +31,29 @@ handle_request intents:
     "force_claim" → скидає last_*_claimed (спрацює при наступному trigger)
 
 Recovery після restart:
-    DailyInventory завантажена з БД в Account.__init__.
+    DailyInventory завантажується з БД в Account.__init__.
     restore_state() лише читає last_*_claimed — IO немає.
 """
 from __future__ import annotations
 
 import hashlib
-import logging
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
 from src.core.runtime.schedule import ScheduleDef, ScheduleTrigger
 from src.core.tasks.base import AnyTask, Priority
-from src.core.tasks.pipeline import Step, pipeline
+from src.core.tasks.pipeline import NotReady, Ready, Skip, Step, pipeline
 from src.mangabuff.daily.inventory import DailyInventory
 from src.mangabuff.daily.stats import DailyRewardStats
-
 from src.utils.time import format_ts, now_ts, today
 
 if TYPE_CHECKING:
     from src.core.account import Account
     from src.core.runtime.request_router import RequestContext
-    from src.core.runtime.scheduler import EventDrivenScheduler
     from src.core.runtime.schedule import TriggerProtocol
+    from src.core.runtime.scheduler import EventDrivenScheduler
 
-log = logging.getLogger(__name__)
-
-# ── Sentinel ───────────────────────────────────────────────────────────────────
-_NOTHING_TO_DO: dict[str, Any] = {}
+from src.core.logging.loggers import get_account_logger
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,62 +63,78 @@ _NOTHING_TO_DO: dict[str, Any] = {}
 def get_stable_random_time(base_time: str, account_id: str, max_jitter_minutes: int = 60) -> str:
     """
     Повертає псевдовипадковий час у форматі HH:MM, зміщений відносно base_time.
-    Зсув є абсолютно стабільним для конкретного account_id (використовує MD5-хеш).
-    
+    Зсув стабільний для конкретного account_id (MD5-хеш).
+
     Приклад:
-        get_stable_random_time("04:30", "acc_01", 60) -> завжди повертатиме, наприклад, "05:14"
-        get_stable_random_time("04:30", "acc_02", 60) -> завжди повертатиме, наприклад, "04:47"
+        get_stable_random_time("04:30", "acc_01", 60) → завжди "05:14"
+        get_stable_random_time("04:30", "acc_02", 60) → завжди "04:47"
     """
     try:
         h, m = map(int, base_time.split(":"))
     except ValueError:
-        return base_time  # Відкат до базового значення, якщо формат пошкоджено
+        return base_time
 
-    # Отримуємо стабільне число від 0 до max_jitter_minutes на основі хешу ID акаунта
-    seed_bytes = account_id.encode("utf-8")
-    hash_val = int(hashlib.md5(seed_bytes).hexdigest(), 16)
-    jitter = hash_val % (max_jitter_minutes + 1)
+    hash_val = int(hashlib.md5(account_id.encode()).hexdigest(), 16)
+    jitter   = hash_val % (max_jitter_minutes + 1)
 
-    # Розраховуємо новий час з урахуванням переходу через добу
     total_minutes = (h * 60 + m + jitter) % 1440
-    new_h, new_m = divmod(total_minutes, 60)
-    
+    new_h, new_m  = divmod(total_minutes, 60)
     return f"{new_h:02d}:{new_m:02d}"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_bonus_status(bot: "Account") -> Any:
-    inv   = bot.inventory.daily  # type: ignore[attr-defined]
+def _fetch_bonus_status(bot: "Account") -> Ready[dict[str, bool]] | NotReady | Skip:
+    """
+    Fetch-крок pipeline щоденного бонусу.
+
+    Повертає:
+        Skip              — обидва бонуси вже зібрано сьогодні.
+        NotReady          — потрібен календарний бонус, але день стріку
+                            невідомий (can_claim_calendar=False); pipeline
+                            запустить _parse_calendar_day → fetch знову.
+        Ready(plan: dict) — є що збирати:
+                            {"do_daily": bool, "do_calendar": bool}
+    """
+    inv    = bot.inventory.daily  # type: ignore[attr-defined]
     to_day = today()
 
     needs_daily    = inv.last_daily_claimed    != to_day
     needs_calendar = inv.last_calendar_claimed != to_day
 
     if not needs_daily and not needs_calendar:
-        log.info(f"[{bot.account_id}] 🎁 Всі бонуси на сьогодні вже зібрано")
-        return _NOTHING_TO_DO
+        get_account_logger(bot.account_id).info("🎁 Всі бонуси на сьогодні вже зібрано")
+        return Skip(reason="all claimed")
 
     if needs_calendar and not inv.can_claim_calendar:
-        log.info(f"[{bot.account_id}] 🎁 День стріку невідомий → парсинг")
-        return None
+        get_account_logger(bot.account_id).info("🎁 День стріку невідомий → парсинг")
+        return NotReady()
 
-    return {"do_daily": needs_daily, "do_calendar": needs_calendar}
+    return Ready({"do_daily": needs_daily, "do_calendar": needs_calendar})
 
 
 def _parse_calendar_day(bot: "Account") -> None:
+    """
+    Parse-крок: отримує поточний день стріку зі сторінки /balance.
+
+    Якщо бонус недоступний — виставляє last_calendar_claimed = today(),
+    щоб наступний fetch побачив needs_calendar=False і не повертав NotReady.
+    can_claim_calendar при цьому лишається False і зберігається в БД
+    (через worker finally → repo.inventory.save).
+    """
     inv = bot.inventory.daily  # type: ignore[attr-defined]
     day = bot.session.fetch_daily_streak()
 
     if day is None:
-        log.info(f"[{bot.account_id}] 🎁 Календарний бонус зараз недоступний")
+        get_account_logger(bot.account_id).info("🎁 Календарний бонус зараз недоступний")
         inv.can_claim_calendar    = False
         inv.last_calendar_claimed = today()
         return
 
-    log.info(f"[{bot.account_id}] 🎁 Календар: день {day}")
-    inv.day               = day
+    get_account_logger(bot.account_id).info(f"🎁 Календар: день {day}")
+    inv.day                = day
     inv.can_claim_calendar = True
 
 
@@ -128,9 +143,7 @@ def _parse_calendar_day(bot: "Account") -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DailyProfession(BaseProfession):
-    """
-    Profession «Щоденні бонуси».
-    """
+    """Profession «Щоденні бонуси»."""
 
     INTERVAL = 86_400   # 24 години
     AT_TIME  = "04:30"  # базовий час запуску UTC
@@ -138,8 +151,8 @@ class DailyProfession(BaseProfession):
     def __init__(self) -> None:
         self._account_id:   str                              = ""
         self._stats:        DailyRewardStats                 = DailyRewardStats()
-        self._trigger:      Optional[ScheduleTrigger]        = None   # ← тип змінено
-        self._scheduled_at: Optional[str]                    = None   # ← нове поле
+        self._trigger:      Optional[ScheduleTrigger]        = None
+        self._scheduled_at: Optional[str]                    = None
         self._scheduler:    Optional["EventDrivenScheduler"] = None
 
     @property
@@ -154,18 +167,18 @@ class DailyProfession(BaseProfession):
         scheduler.subscribe("account.unbanned", self._on_account_unbanned)
 
     async def restore_state(self, bot: "Account") -> None:
-
         inv: DailyInventory = bot.inventory.daily  # type: ignore[attr-defined]
-        to_day = today()
+        to_day    = today()
+        all_done  = (
+            inv.last_daily_claimed    == to_day
+            and inv.last_calendar_claimed == to_day
+        )
 
-        daily_done    = inv.last_daily_claimed    == to_day
-        calendar_done = inv.last_calendar_claimed == to_day
-        all_done      = daily_done and calendar_done
-
-        log.info(
-            f"[{self._account_id}] DailyProfession відновлено: "
+        get_account_logger(self._account_id).info(
+            f"DailyProfession відновлено: "
             f"daily={inv.last_daily_claimed!r} "
             f"calendar={inv.last_calendar_claimed!r} "
+            f"can_claim_calendar={inv.can_claim_calendar} "
             f"all_done={all_done}"
         )
 
@@ -174,40 +187,36 @@ class DailyProfession(BaseProfession):
 
         if all_done:
             # Бонус вже зібрано — переносимо тригер на завтра.
-            # Без цього next_fire в минулому → is_due()=True → негайний повторний запуск.
+            # Без цього next_fire в минулому → is_due()=True → негайний повтор.
             self._trigger.advance_to_next_day_at(self._scheduled_at)
-            next_dt = format_ts(self._trigger.next_fire)
-            log.info(
-                f"[{self._account_id}] 🎁 Бонус вже зібрано — "
-                f"наступний запуск: {next_dt}"
+            get_account_logger(self._account_id).info(
+                f"🎁 Бонус вже зібрано — наступний запуск: "
+                f"{format_ts(self._trigger.next_fire)}"
             )
         elif self._trigger.next_fire < now_ts():
-            # Бонус не зібрано, але запланований час вже пройшов (бот упав до збору).
-            # Запускаємо негайно на наступному тіку scheduler.
+            # Бонус не зібрано, але час вже пройшов (бот упав до збору).
             self._trigger.reschedule("+0s")
-            log.info(
-                f"[{self._account_id}] 🎁 Пропущений запуск виявлено — запуск негайно"
-            )
-        # else: час ще не настав — не чіпаємо, тригер спрацює вчасно
+            get_account_logger(self._account_id).info("🎁 Пропущений запуск — запуск негайно")
+        # else: час ще не настав — тригер спрацює вчасно
 
     # ── Triggers ──────────────────────────────────────────────────────────────
 
     def build_triggers(self, account_id: str) -> list["TriggerProtocol"]:
         scheduled_time     = get_stable_random_time(self.AT_TIME, account_id, max_jitter_minutes=60)
-        self._scheduled_at = scheduled_time  # ← зберігаємо для restore_state
+        self._scheduled_at = scheduled_time
 
-        log.info(
-            f"[{account_id}] Створено розклад щоденного збору: "
-            f"{scheduled_time} UTC (базовий: {self.AT_TIME}, зміщення стабільне)"
+        get_account_logger(account_id).info(
+            f"Створено розклад щоденного збору: "
+            f"{scheduled_time} UTC (базовий: {self.AT_TIME})"
         )
 
-        trigger = ScheduleDef(
-            interval=self.INTERVAL,
-            producer=self._make_producer(),
-            at=scheduled_time,
-        ).to_trigger(account_id)   # тепер повертає ScheduleTrigger
+        trigger        = ScheduleDef(
+            interval = self.INTERVAL,
+            producer = self._make_producer(),
+            at       = scheduled_time,
+        ).to_trigger(account_id)
 
-        self._trigger = trigger    # тип тепер ScheduleTrigger — advance_to_next_day_at доступний
+        self._trigger = trigger
         return [trigger]
 
     def check_guard(self, bot: "Account") -> bool:
@@ -233,7 +242,7 @@ class DailyProfession(BaseProfession):
         return RequestResult.approve(data={
             "last_daily_claimed":    inv.last_daily_claimed,
             "last_calendar_claimed": inv.last_calendar_claimed,
-            "daily_done":            inv.last_daily_claimed == to_day,
+            "daily_done":            inv.last_daily_claimed    == to_day,
             "calendar_done":         inv.last_calendar_claimed == to_day,
             "calendar_day":          inv.day,
             "can_claim_calendar":    inv.can_claim_calendar,
@@ -241,6 +250,12 @@ class DailyProfession(BaseProfession):
         })
 
     async def _handle_force_claim(self, ctx: "RequestContext") -> RequestResult:
+        """
+        Скидає стан бонусів — pipeline запуститься при наступному тіку тригера.
+
+        Зберігаємо явно тут, бо це request-handler (поза worker-loop),
+        і автоматичного збереження через finally не відбудеться.
+        """
         inv: DailyInventory = ctx.bot.inventory.daily  # type: ignore[attr-defined]
         inv.last_daily_claimed    = None  # type: ignore[assignment]
         inv.last_calendar_claimed = None  # type: ignore[assignment]
@@ -248,10 +263,11 @@ class DailyProfession(BaseProfession):
         ctx.bot.repo.inventory.save(ctx.account_id, ctx.bot.inventory)
 
         if self._trigger is not None:
-            # Використовуємо публічне API: reschedule скидає _in_flight та ставить час
             self._trigger.reschedule("+0s")
 
-        log.info(f"[{ctx.account_id}] DailyProfession: force_claim → стан скинуто, тригер активовано")
+        get_account_logger(ctx.account_id).info(
+            "DailyProfession: force_claim → стан скинуто, тригер активовано"
+        )
         return RequestResult.approve(data={"status": "reset, will claim on next tick"})
 
     # ── Event handlers ────────────────────────────────────────────────────────
@@ -259,7 +275,7 @@ class DailyProfession(BaseProfession):
     async def _on_account_unbanned(self, payload: dict[str, Any]) -> None:
         if payload.get("account_id") != self._account_id:
             return
-        log.info(f"[{self._account_id}] DailyProfession: розбан отримано, guard знятий")
+        get_account_logger(self._account_id).info("DailyProfession: розбан отримано, guard знятий")
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
 
@@ -269,9 +285,8 @@ class DailyProfession(BaseProfession):
             if self._trigger is not None:
                 self._trigger.advance(bot)
             else:
-                log.warning(
-                    f"[{bot.account_id}] DailyProfession: on_cycle_done викликано "
-                    f"але self._trigger == None — тригер не зсунуто!"
+                get_account_logger(bot.account_id).warning(
+                    "DailyProfession: on_cycle_done — self._trigger is None, тригер не зсунуто!"
                 )
 
         return pipeline(
@@ -290,35 +305,39 @@ class DailyProfession(BaseProfession):
     ) -> Callable[[Any, "Account"], None]:
 
         def action(plan: Any, bot: "Account") -> None:
-            if plan is _NOTHING_TO_DO:
-                on_cycle_done(bot)
-                return
+            """
+            Виконує збір бонусів згідно плану.
 
+            Зберігати інвентар явно не потрібно: worker._execute зберігає
+            його автоматично у finally після завершення кожної задачі.
+            """
             inv: DailyInventory = bot.inventory.daily  # type: ignore[attr-defined]
-            to_day       = today()
+            to_day      = today()
             claimed_any = False
 
             if plan.get("do_daily"):
-                log.info(f"[{bot.account_id}] 🎁 Збираємо звичайний бонус…")
+                get_account_logger(bot.account_id).info("🎁 Збираємо звичайний бонус…")
                 success, result = bot.session.claim_daily()
                 self._stats.daily_results = result
                 if success:
                     inv.last_daily_claimed = to_day
                     claimed_any = True
-                    log.info(f"[{bot.account_id}] ✅ Звичайний бонус зібрано: {result}")
+                    get_account_logger(bot.account_id).info(f"✅ Звичайний бонус зібрано: {result}")
 
             if plan.get("do_calendar"):
                 day = inv.day
-                log.info(f"[{bot.account_id}] 🎁 Збираємо календарний бонус (день {day})…")
+                get_account_logger(bot.account_id).info(f"🎁 Збираємо календарний бонус (день {day})…")
                 success, result = bot.session.claim_calendar(day)
                 self._stats.calendar_results = result
                 if success:
                     inv.last_calendar_claimed = to_day
                     inv.can_claim_calendar    = False
                     claimed_any = True
-                    log.info(f"[{bot.account_id}] ✅ Календарний бонус зібрано: {result}")
+                    get_account_logger(bot.account_id).info(f"✅ Календарний бонус зібрано: {result}")
                 else:
-                    log.warning(f"[{bot.account_id}] ⚠️ Помилка збору календаря — спробуємо наступного разу")
+                    get_account_logger(bot.account_id).warning(
+                        "⚠️ Помилка збору календаря — спробуємо наступного разу"
+                    )
 
             if self._scheduler is not None and claimed_any:
                 both_done = (
@@ -329,7 +348,7 @@ class DailyProfession(BaseProfession):
                     "daily.all_claimed" if both_done else "daily.claimed",
                     {
                         "account_id":    bot.account_id,
-                        "daily_done":    inv.last_daily_claimed == to_day,
+                        "daily_done":    inv.last_daily_claimed    == to_day,
                         "calendar_done": inv.last_calendar_claimed == to_day,
                         "calendar_day":  inv.day,
                     },

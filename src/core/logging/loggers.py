@@ -22,9 +22,8 @@ _MAX_BYTES    = 10 * 1024 * 1024
 _BACKUP_COUNT = 5
 _DATE_FMT     = "%Y-%m-%d %H:%M:%S"
 
-_FMT_SYSTEM  = "%(asctime)s  %(levelname)-8s  [%(name)s]  %(message)s"
-_FMT_ACCOUNT = "%(asctime)s  %(levelname)-8s  %(message)s"
-_FMT_TASK    = "%(asctime)s  %(levelname)-8s  [%(funcName)s]  %(message)s"
+# Єдиний формат для всіх — ім'я логера завжди видно
+_FMT = "%(asctime)s  %(levelname)-8s  [%(name)s]  %(message)s"
 
 _initialized: set[str] = set()
 
@@ -55,15 +54,14 @@ def _attach(
 
 def get_logger(name: str) -> logging.Logger:
     """
-    Системний логер.
-    Пише у logs/{name}.log + propagate → system.log + errors.log через root.
+    Системний логер. Пише у system.log / errors.log через root (propagate).
+    Окремого файлу не створює — всі системні логи агрегуються в system.log.
     """
-    full_name = f"src.core.{name}"
+    full_name = f"src.{name}"
     logger = logging.getLogger(full_name)
     if full_name not in _initialized:
         _initialized.add(full_name)
         logger.setLevel(logging.DEBUG)
-        _attach(logger, _LOG_DIR / f"{name}.log", _FMT_SYSTEM)
         logger.propagate = True
     return logger
 
@@ -73,16 +71,12 @@ def get_account_logger(account_id: str) -> logging.Logger:
     Логер акаунта → logs/accounts/{account_id}.log.
     ERROR автоматично також у logs/errors.log через root.
     """
-    name = f"account.{account_id}"
+    name = f"src.account.{account_id}"
     logger = logging.getLogger(name)
     if name not in _initialized:
         _initialized.add(name)
         logger.setLevel(logging.DEBUG)
-        _attach(
-            logger,
-            _LOG_DIR / "accounts" / f"{account_id}.log",
-            _FMT_ACCOUNT,
-        )
+        _attach(logger, _LOG_DIR / "accounts" / f"{account_id}.log", _FMT)
         logger.propagate = True
     return logger
 
@@ -92,16 +86,12 @@ def get_task_logger(account_id: str) -> logging.Logger:
     Логер тасків і HTTP → logs/tasks/{account_id}_tasks.log.
     Сюди ж потрапляють всі httpx event-hooks через set_http_logger().
     """
-    name = f"tasks.{account_id}"
+    name = f"src.tasks.{account_id}"
     logger = logging.getLogger(name)
     if name not in _initialized:
         _initialized.add(name)
         logger.setLevel(logging.DEBUG)
-        _attach(
-            logger,
-            _LOG_DIR / "tasks" / f"{account_id}_tasks.log",
-            _FMT_TASK,
-        )
+        _attach(logger, _LOG_DIR / "tasks" / f"{account_id}_tasks.log", _FMT)
         logger.propagate = True
     return logger
 

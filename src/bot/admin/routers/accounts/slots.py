@@ -2,7 +2,7 @@
 accounts/slots.py
 
 Редагування target_slots для reader profession.
-Показується тільки якщо profession == "reader".
+Пункт меню реєструється через ProfessionMenuRegistry.
 """
 from __future__ import annotations
 
@@ -14,9 +14,21 @@ from aiogram.types import CallbackQuery, Message
 from src.bot.admin.services.scheduler_service import SchedulerService
 from src.core.runtime.scheduler import EventDrivenScheduler
 from ._common import cancel_add_kb
+from .profession_menu import profession_menu_registry
 
 router = Router(name="accounts:slots")
 
+
+# ── Реєстрація пункту меню ────────────────────────────────────────────────────
+
+profession_menu_registry.register(
+    profession_id="reader",
+    label="🎰 Слоти читача",
+    callback_template="acc:slots:{acc_id}",
+)
+
+
+# ── FSM ───────────────────────────────────────────────────────────────────────
 
 class EditSlotsFSM(StatesGroup):
     wait_slots = State()
@@ -29,17 +41,16 @@ async def cb_slots(call: CallbackQuery, state: FSMContext, svc: SchedulerService
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return
-    
+
     if "reader" not in info.professions:
         await call.answer("❌ Слоти доступні тільки для акаунтів з reader", show_alert=True)
         return
 
-    # Запитуємо поточний стан слотів через RequestRouter
     res = EventDrivenScheduler.get_instance().ask_sync(
         account_id=acc_id,
         profession_id="reader",
         intent="get_state",
-        data={}
+        data={},
     )
 
     if not res.approved:
