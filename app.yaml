@@ -24,7 +24,7 @@ reader:
 
     - name:             "candy"
       daily_limit:      20
-      interval_seconds: 120
+      interval_seconds: 180
       reward_keys:      ["token", "type"]
 
   reading_modes:
