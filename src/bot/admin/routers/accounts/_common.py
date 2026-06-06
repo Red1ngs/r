@@ -13,11 +13,11 @@ from src.bot.admin.services.scheduler_service import AccountInfo
 from src.core.runtime.profession import profession_factory
 from src.bot.admin.routers.accounts.profession_menu import profession_menu_registry
 
-# ── Статуси → emoji ───────────────────────────────────────────────────────────
+# ── Статуси ───────────────────────────────────────────────────────────────────
 
 STATUS_EMOJI: dict[str, str] = {
     "IDLE":      "💤",
-    "WORKING":   "⚙️",
+    "WORKING":   "🟢",
     "COOLDOWN":  "⏳",
     "ERROR":     "⚠️",
     "DEAD":      "💀",
@@ -33,41 +33,55 @@ STATUS_LABEL: dict[str, str] = {
     "SUSPENDED": "⚫",
 }
 
-# Emoji для відображення пріоритету profession у списку
+STATUS_TEXT: dict[str, str] = {
+    "IDLE":      "очікує",
+    "WORKING":   "працює",
+    "COOLDOWN":  "cooldown",
+    "ERROR":     "помилка",
+    "DEAD":      "мертвий",
+    "SUSPENDED": "призупинено",
+}
+
 _PRIORITY_BADGE = ["①", "②", "③", "④", "⑤"]
+
 
 # ── Форматування ──────────────────────────────────────────────────────────────
 
-def fmt_seconds(s: Optional[float]) -> str:
-    if s is None:
-        return "—"
-    if s < 60:
-        return f"{int(s)}с"
-    m, sec = divmod(int(s), 60)
-    return f"{m}хв {sec}с" if sec else f"{m}хв"
-
 
 def account_text(info: AccountInfo) -> str:
-    emoji    = STATUS_EMOJI.get(info.status, "❓")
-    triggers = ", ".join(info.triggers) if info.triggers else "—"
-    proxy_line = f"\nПроксі: <code>{info.proxy}</code>" if info.proxy else ""
-    next_line  = f"\nНаступний тригер: <b>{fmt_seconds(info.next_trigger_s)}</b>"
+    status_emoji = STATUS_EMOJI.get(info.status, "❓")
+    status_text  = STATUS_TEXT.get(info.status, info.status.lower())
 
+    # ── Рядки профессій
     if info.professions:
-        profs_formatted = " ".join(
-            f"{_PRIORITY_BADGE[i] if i < len(_PRIORITY_BADGE) else '•'} {name}"
-            for i, name in enumerate(info.professions)
-        )
-        prof_line = f"\nПрофесії: <b>{profs_formatted}</b>"
+        prof_parts = []
+        for i, name in enumerate(info.professions):
+            badge = _PRIORITY_BADGE[i] if i < len(_PRIORITY_BADGE) else "•"
+            prof_parts.append(f"{badge} {name}")
+        profs_line = "  " + "  ".join(prof_parts)
     else:
-        prof_line = "\nПрофесії: <i>не призначено</i>"
+        profs_line = "  <i>не призначено</i>"
+
+    # ── Монітори
+    if info.monitors:
+        monitors_line = "  " + ", ".join(m for m in info.monitors)
+    else:
+        monitors_line = "  <i>немає</i>"
+
+    # ── Проксі
+    proxy_line = f"\n🔗 <code>{info.proxy}</code>" if info.proxy else ""
+
+    # ── Сесія
+    session_line = "🟢 сесія активна" if info.is_connected else "🔴 сесія відсутня"
 
     return (
-        f"{emoji} <b>{info.account_id}</b>\n"
-        f"Email: <code>{info.email}</code>{proxy_line}\n"
-        f"Статус: <b>{info.status}</b>  Черга: <b>{info.queue_size}</b>"
-        f"{prof_line}{next_line}\n"
-        f"Тригери: {triggers}"
+        f"{status_emoji} <b>{info.account_id}</b>  ·  {status_text}{proxy_line}\n"
+        f"📧 <code>{info.email}</code>\n"
+        f"{session_line}\n"
+        f"\n"
+        f"<b>Професії</b>\n{profs_line}\n"
+        f"\n"
+        f"<b>Монітори</b>\n{monitors_line}"
     )
 
 
@@ -92,33 +106,49 @@ def accounts_list_kb(accounts: list[AccountInfo]) -> InlineKeyboardMarkup:
 
 
 def account_menu_kb(
-    acc_id:           str,
-    status:           str,
+    acc_id:             str,
+    status:             str,
     active_professions: list[str],
+    is_connected:       bool = False,
 ) -> InlineKeyboardMarkup:
-    """
-    Головне меню акаунта.
-
-    Кнопки profession-специфічних операцій генеруються автоматично
-    з ProfessionMenuRegistry — кожний модуль profession реєструє
-    свої пункти при імпорті, жодного хардкоду тут.
-    """
     is_suspended = status == "SUSPENDED"
     is_dead      = status == "DEAD"
     rows: list[list[InlineKeyboardButton]] = []
 
-    if is_suspended:
-        rows.append([InlineKeyboardButton(text="▶️ Відновити", callback_data=f"acc:resume:{acc_id}")])
-    elif not is_dead:
-        rows.append([InlineKeyboardButton(text="⏸ Пауза", callback_data=f"acc:pause:{acc_id}")])
+    # ── Сесія: підключити / відключити
+    if not is_dead:
+        if is_connected:
+            rows.append([InlineKeyboardButton(
+                text="🔌 Відключити сесію",
+                callback_data=f"acc:disconnect:{acc_id}",
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                text="🔗 Підключити сесію",
+                callback_data=f"acc:connect:{acc_id}",
+            )])
 
+    # ── Пауза / відновлення
+    if not is_dead:
+        if is_suspended:
+            rows.append([InlineKeyboardButton(
+                text="▶️ Відновити",
+                callback_data=f"acc:resume:{acc_id}",
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                text="⏸ Пауза",
+                callback_data=f"acc:pause:{acc_id}",
+            )])
+
+    # ── Управління професіями
     if not is_dead:
         rows.append([InlineKeyboardButton(
-            text="🎓 Управління професіями",
+            text="🎓 Професії",
             callback_data=f"acc:professions:{acc_id}",
         )])
 
-    # ── Profession-специфічні пункти меню (автогенерація з реєстру) ──────────
+    # ── Profession-специфічні пункти (автогенерація з реєстру)
     if not is_dead and active_professions:
         prof_items = profession_menu_registry.items_for(active_professions)
         for item in prof_items:
@@ -127,8 +157,9 @@ def account_menu_kb(
                 callback_data=item.build_callback(acc_id),
             )])
 
+    # ── Службові кнопки
     rows.append([
-        InlineKeyboardButton(text="🔄 Оновити", callback_data=f"acc:refresh:{acc_id}"),
+        InlineKeyboardButton(text="🔄", callback_data=f"acc:refresh:{acc_id}"),
         InlineKeyboardButton(text="🗑 Видалити", callback_data=f"acc:remove:{acc_id}"),
     ])
     rows.append([InlineKeyboardButton(text="↩️ До списку", callback_data="acc:list")])
@@ -136,21 +167,16 @@ def account_menu_kb(
 
 
 def professions_manage_kb(
-    acc_id:      str,
-    active:      list[str],
+    acc_id: str,
+    active: list[str],
 ) -> InlineKeyboardMarkup:
-    """
-    Клавіатура управління списком professions акаунта.
-
-    Активні professions відображаються з номером пріоритету і кнопкою видалення.
-    Неактивні (доступні для додавання) — окремим рядком.
-    """
     all_names = profession_factory.names()
     rows: list[list[InlineKeyboardButton]] = []
 
-    # Поточні professions у порядку пріоритету
     if active:
-        rows.append([InlineKeyboardButton(text="── Активні (порядок = пріоритет) ──", callback_data="noop")])
+        rows.append([InlineKeyboardButton(
+            text="── Активні ──", callback_data="noop",
+        )])
         for i, name in enumerate(active):
             badge = _PRIORITY_BADGE[i] if i < len(_PRIORITY_BADGE) else "•"
             rows.append([
@@ -159,17 +185,20 @@ def professions_manage_kb(
                     callback_data="noop",
                 ),
                 InlineKeyboardButton(
-                    text="✖ Видалити",
+                    text="✖",
                     callback_data=f"acc:prof_remove:{acc_id}:{name}",
                 ),
             ])
     else:
-        rows.append([InlineKeyboardButton(text="Професій ще немає", callback_data="noop")])
+        rows.append([InlineKeyboardButton(
+            text="Професій ще немає", callback_data="noop",
+        )])
 
-    # Доступні для додавання
     available = [n for n in all_names if n not in active]
     if available:
-        rows.append([InlineKeyboardButton(text="── Додати професію ──", callback_data="noop")])
+        rows.append([InlineKeyboardButton(
+            text="── Додати ──", callback_data="noop",
+        )])
         for name in available:
             rows.append([InlineKeyboardButton(
                 text=f"➕ {name}",

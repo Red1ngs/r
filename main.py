@@ -2,19 +2,18 @@
 main.py — точка входу.
 
 При старті завантажує .env (паролі акаунтів, токен бота, admin ids).
-Акаунти додаються через адмін-панель — main.py їх не знає.
+Акаунти відновлюються з БД і підключаються послідовно (StartupManager),
+щоб уникнути паралельного флуду login-запитів і помилки "Сесія не встановлена".
 """
-import time
+import asyncio
 from pathlib import Path
 
 # ── Завантаження .env ─────────────────────────────────────────────────────────
-# python-dotenv: pip install python-dotenv
-# .env містить: ADMIN_BOT_TOKEN, ADMIN_IDS, ACCOUNT_PASSWORD_ACC_XX=...
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(".env"), override=False)  # override=False: os.environ має пріоритет
+    load_dotenv(Path(".env"), override=False)
 except ImportError:
-    pass  # якщо dotenv не встановлено — змінні мають бути встановлені системою
+    pass
 
 from src.core.logging.setup import setup_logging
 setup_logging(log_dir="logs")
@@ -24,29 +23,32 @@ log = get_scheduler_logger()
 log.info("=" * 60)
 log.info("Application starting")
 
-# ── Реєстрація інвентарів ─────────────────────────────────────────────────────
-from src.mangabuff.setup import register_inventories
+# ── Реєстрація ────────────────────────────────────────────────────────────────
+from src.mangabuff.setup import (
+    register_inventories,
+    register_professions,
+    register_monitors,
+    register_recorders,
+)
+
 register_inventories()
-
-# ── Реєстрація професій ─────────────────────────────────────────────────────
-from src.mangabuff.setup import register_professions
 register_professions()
+register_monitors()
+register_recorders()
 
-# ── Реєстрація репозиторіїв ─────────────────────────────────────────────────────
+# ── БД ────────────────────────────────────────────────────────────────────────
 from src.database.setup import init_database
 repositories = init_database()
 
-# ── БД і AppConfig ────────────────────────────────────────────────────────────
+# ── AppConfig ─────────────────────────────────────────────────────────────────
 from src.core.config.app import AppConfig
-
 app_cfg = AppConfig.from_yaml("app.yaml")
 
-# ─── Налаштування часової зони (─────────────────────────────────────────
+# ── Часова зона ───────────────────────────────────────────────────────────────
 from src.utils.time import set_timezone
+set_timezone("Europe/Kiev")
 
-set_timezone("Europe/Kiev")  # або "UTC+3", або "Europe/Kiev" (якщо встановлено zoneinfo/pytz)
-
-# ── Scheduler (Singleton, порожній) ───────────────────────────────────────────
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 from src.core.account import Account
 from src.core.runtime.scheduler import EventDrivenScheduler
 
@@ -57,20 +59,28 @@ scheduler = EventDrivenScheduler.initialize(on_dead=on_dead)
 scheduler.start()
 log.info("Scheduler initialized (empty)")
 
-# ── Відновлення акаунтів з БД ─────────────────────────────────────────────────
+# ── Services ──────────────────────────────────────────────────────────────────
 from src.bot.admin.services.scheduler_service import SchedulerService
 from src.database.repository.account import AccountRepository
+from src.core.runtime.startup_manager import StartupManager, StartupConfig
 
-def restore_accounts_from_db(
-    service:    SchedulerService,
-    repository: AccountRepository,
-) -> int:
+
+async def restore_accounts(
+    service:     SchedulerService,
+    repository:  AccountRepository,
+    startup_cfg: StartupConfig,
+) -> None:
     """
-    Відновлює акаунти після рестарту.
-    add_account() вже читає professions з БД і передає їх у scheduler —
-    тому тут НЕ треба викликати add_profession окремо.
+    Крок 1: реєструє всі акаунти в scheduler через add_account()
+            (профессії встановлюються, але connect() ще НЕ викликано).
+    Крок 2: StartupManager послідовно викликає bot.connect() з паузами —
+            лише після цього монітори отримують живу сесію і починають працювати.
+
+    Саме відсутність цього порядку викликала:
+        RuntimeError: [My_bot] Сесія не встановлена...
     """
-    restored = 0
+    registered: list[str] = []
+
     for row in repository.get_all_accounts():
         ok, err = service.add_account(row.id, row.email)
         if not ok:
@@ -80,35 +90,58 @@ def restore_accounts_from_db(
         if row.professions:
             log.info(f"[restore] '{row.id}' → professions={row.professions}")
         else:
-            log.warning(f"[restore] '{row.id}' без profession — тригерів не буде")
+            log.warning(f"[restore] '{row.id}' без profession — моніторів не буде")
 
-        restored += 1
-    return restored
+        registered.append(row.id)
 
-# ── Admin Telegram Bot ────────────────────────────────────────────────────────
+    if not registered:
+        log.info("[restore] Немає акаунтів для відновлення")
+        return
+
+    sm = StartupManager(scheduler=scheduler, cfg=startup_cfg)
+    for aid in registered:
+        sm.add(aid)
+
+    await sm.run()
+
+    if sm.failed_accounts:
+        log.warning(
+            "[restore] Не підключились: "
+            + ", ".join(f"'{a}' ({e})" for a, e in sm.failed_accounts)
+        )
+
+
+# ── Admin Telegram Bot + main loop ────────────────────────────────────────────
 from src.bot.admin.config import AdminBotConfig
 from src.bot.admin.runner import AdminBotRunner
-from src.bot.admin.services.scheduler_service import SchedulerService
 
-try:
-    admin_cfg = AdminBotConfig.from_env()
-    svc = SchedulerService(repositories, app_cfg)
-    restore_accounts_from_db(svc, repositories.accounts)
-    
-    admin_bot = AdminBotRunner(admin_cfg, svc)
-    admin_bot.start()
-    log.info("AdminBot started — додавай акаунти через /accounts")
-except RuntimeError as e:
-    log.error(f"AdminBot не запущено: {e}")
-    admin_bot = None  # type: ignore[assignment]
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
-try:
-    while True:
-        time.sleep(30)
-except KeyboardInterrupt:
-    log.info("Shutdown requested")
-    scheduler.stop()
-    if admin_bot:
-        admin_bot.stop()
-    log.info("Shutdown complete")
+async def main() -> None:
+    startup_cfg = StartupConfig.from_app_config(app_cfg)
+    admin_bot = None
+
+    try:
+        admin_cfg = AdminBotConfig.from_env()
+        svc = SchedulerService(repositories, app_cfg)
+
+        await restore_accounts(svc, repositories.accounts, startup_cfg)
+
+        admin_bot = AdminBotRunner(admin_cfg, svc)
+        admin_bot.start()
+        log.info("AdminBot started — додавай акаунти через /accounts")
+    except RuntimeError as e:
+        log.error(f"AdminBot не запущено: {e}")
+
+    try:
+        while True:
+            await asyncio.sleep(30)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        log.info("Shutdown requested")
+        scheduler.stop()
+        if admin_bot:
+            admin_bot.stop()
+        log.info("Shutdown complete")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,12 +1,5 @@
 """
 accounts/profession.py
-
-Управління списком profession акаунта (додавання, видалення).
-
-Callbacks:
-  acc:professions:{acc_id}          — меню управління
-  acc:prof_add:{acc_id}:{name}      — додати profession
-  acc:prof_remove:{acc_id}:{name}   — видалити profession
 """
 from __future__ import annotations
 
@@ -27,8 +20,8 @@ def _professions_text(acc_id: str, professions: list[str]) -> str:
     )
     return (
         f"🎓 <b>Акаунт {acc_id}</b>\n\n"
-        f"Активні професії (за пріоритетом):\n{lines}\n\n"
-        f"Перша в списку має найвищий пріоритет — її задачі виконуються першими."
+        f"Активні професії:\n{lines}\n\n"
+        f"Професії акаунта визначають підключені монітори та доступний інструментарій."
     )
 
 
@@ -63,7 +56,6 @@ async def cb_prof_add(call: CallbackQuery, svc: SchedulerService) -> None:
         await call.answer(f"❌ {err}", show_alert=True)
         return
 
-    # Перемальовуємо меню з оновленим списком
     info = svc.account_info(acc_id)
     if info:
         await call.message.edit_text(
@@ -97,7 +89,7 @@ async def cb_prof_remove(call: CallbackQuery, svc: SchedulerService) -> None:
     await call.answer(f"✅ Професію {prof_name!r} видалено")
 
 
-# ── noop (кнопки-роздільники) ─────────────────────────────────────────────────
+# ── noop ──────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "noop")
 async def cb_noop(call: CallbackQuery) -> None:

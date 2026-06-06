@@ -15,6 +15,7 @@ force_parse (виклик з бота):
 """
 from __future__ import annotations
 
+from logging import log
 from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
@@ -24,7 +25,6 @@ from src.mangabuff.farmer.parsers import parse_chapters, parse_manga_data_id, pa
 if TYPE_CHECKING:
     from src.core.account import Account
     from src.core.runtime.request_router import RequestContext
-    from src.core.runtime.schedule import TriggerProtocol
 
 from src.core.logging.loggers import get_account_logger
 
@@ -47,6 +47,10 @@ def _load_manga_batch(bot: "Account", translits: list[str]) -> int:
                 f"manga {translit_name!r} не знайдено в БД — пропускаємо"
             )
             continue
+
+        if not bot.is_connected:
+            get_account_logger(bot.account_id).warning(f"[{bot.account_id}] manga_loader: акаунт відключено, батч скасовано")
+            return 0  # або raise відповідний виняток
 
         html = bot.session.fetch_manga_chapters(translit_name, manga_row.data_id)
         if not html:
@@ -86,13 +90,18 @@ def _force_load_manga(bot: "Account", translit_name: str) -> int:
 
     Повертає кількість збережених глав.
     """
+    logger = get_account_logger(bot.account_id)
+    if not bot.is_connected:
+        logger.warning(f"[{bot.account_id}] manga_loader: акаунт відключено, force_parse скасовано")
+        return 0
+    
     manga_row = bot.repo.mangas.get_by_translit_name(translit_name)
 
     if manga_row is None:
         # Манга невідома — отримуємо сторінку щоб дізнатися data_id
         page_html = bot.session.fetch_manga_page(translit_name)  # noqa: SLF001
         if not page_html:
-            get_account_logger(bot.account_id).warning(
+            logger.warning(
                 f"force_parse: "
                 f"сторінка манги {translit_name!r} недоступна"
             )
@@ -100,7 +109,7 @@ def _force_load_manga(bot: "Account", translit_name: str) -> int:
 
         data_id = parse_manga_data_id(page_html)
         if data_id is None:
-            get_account_logger(bot.account_id).warning(
+            logger.warning(
                 f"force_parse: "
                 f"не вдалося визначити data_id для {translit_name!r} — "
                 f"перевірте _MANGA_PAGE_DATA_ID_SELECTORS у parsers.py"
@@ -111,17 +120,17 @@ def _force_load_manga(bot: "Account", translit_name: str) -> int:
         bot.repo.mangas.upsert(data_id, translit_name, translit_name)
         manga_row = bot.repo.mangas.get_by_translit_name(translit_name)
         if manga_row is None:
-            get_account_logger(bot.account_id).error(f"force_parse: upsert пройшов, але get повернув None")
+            logger.error(f"force_parse: upsert пройшов, але get повернув None")
             return 0
 
-        get_account_logger(bot.account_id).info(
+        logger.info(
             f"force_parse: "
             f"нова манга {translit_name!r} зареєстрована в БД (data_id={data_id})"
         )
 
     html = bot.session.fetch_manga_chapters(translit_name, manga_row.data_id)
     if not html:
-        get_account_logger(bot.account_id).warning(
+        logger.warning(
             f"force_parse: "
             f"глави недоступні для {translit_name!r}"
         )
@@ -137,7 +146,7 @@ def _force_load_manga(bot: "Account", translit_name: str) -> int:
     ]
     if chapters:
         bot.repo.chapters.upsert_many(chapters)
-        get_account_logger(bot.account_id).debug(
+        logger.debug(
             f"force_parse: "
             f"{translit_name!r} → {len(chapters)} глав збережено, views={views}"
         )
@@ -172,9 +181,6 @@ class MangaLoaderProfession(BaseProfession):
 
     async def teardown(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
         pass
-
-    def build_triggers(self, account_id: str) -> list["TriggerProtocol"]:
-        return []
 
     def check_guard(self, bot: "Account") -> bool:
         return not bool(bot.inventory.personal.data.get("is_banned"))

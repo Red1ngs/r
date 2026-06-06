@@ -5,7 +5,9 @@ import threading
 from typing import Any, Optional
 
 from src.database.DTO.manga import ChapterRow, MangaRow
+from src.core.logging.loggers import get_logger
 
+logger = get_logger("MangaRepository")
 
 class MangaRepository:
     """Керування даними манг у БД."""
@@ -85,6 +87,16 @@ class MangaRepository:
                 (views, data_id),
             )
             self._conn.commit()
+            
+    def get_existing_data_ids(self, data_ids: list[int]) -> set[int]:
+        if not data_ids:
+            return set()
+        placeholders = ",".join("?" * len(data_ids))
+        rows = self._conn.execute(
+            f"SELECT data_id FROM mangas WHERE data_id IN ({placeholders})",
+            data_ids,
+        ).fetchall()
+        return {row["data_id"] for row in rows}
 
     def count(self) -> int:
         """Повертає загальну кількість манг у БД."""
@@ -154,7 +166,11 @@ class ChapterRepository:
                 "chapter_id": row["chapter_data_id"],  # зовнішній data_id глави (для сайту)
             })
             mangas_set.add(row["translit_name"])
-
+        logger.info(
+            f"get_chapter_sequence: "
+            f"account_id={account_id}, limit={limit}, "
+            f"include_tags={include_tags}, exclude_tags={exclude_tags} → {len(sequence)} chapters, {len(mangas_set)} mangas"
+        )
         return sequence, list(mangas_set)
 
     def mark_chapter_read(self, account_id: str, chapter_data_id: int) -> None:
@@ -171,6 +187,37 @@ class ChapterRepository:
                 (account_id, chapter_data_id)
             )
             self._conn.commit()
+            
+    def mark_mangas_read(self, account_id: str, translit_names: list[str]) -> int:
+        if not translit_names:
+            return 0
+        placeholders = ",".join("?" * len(translit_names))
+        query = f"""
+            INSERT OR IGNORE INTO account_reads (account_id, chapter_id)
+            SELECT ?, c.id
+            FROM chapters c
+            JOIN mangas m ON c.manga_id = m.id
+            WHERE m.translit_name IN ({placeholders})
+        """
+        params = [account_id] + translit_names
+        with self._lock:
+            cursor = self._conn.execute(query, tuple(params))
+            self._conn.commit()
+            return cursor.rowcount
+        
+    def has_unread_chapters(self, account_id: str) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1
+            FROM chapters c
+            LEFT JOIN account_reads ar
+                ON ar.chapter_id = c.id AND ar.account_id = ?
+            WHERE ar.chapter_id IS NULL
+            LIMIT 1
+            """,
+            (account_id,)
+        ).fetchone()
+        return row is not None
 
     def upsert(
         self,

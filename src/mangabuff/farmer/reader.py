@@ -1,84 +1,64 @@
 """
 farmer/reader.py — ReaderProfession.
 
-Архітектура:
-    ReaderProfession
-        • Читає мангу по слотах (scroll / card / ...) для нагород.
-        • Коли в БД немає непрочитаних глав → емітить «reader.chapters_exhausted».
-        • Слухає «loader.chapters_ready» (broadcast) → скидає тригер у +0s.
+Відповідальність:
+    ТІЛЬКИ виконання: отримати ask, взяти глави з БД, відправити на сайт,
+    записати прочитані, емітити події.
+
+    КОЛИ читати — вирішує ReadingMonitor (не Reader).
+    СТАТИСТИКА    — не зберігається тут; логується через події.
+    СЛОТИ         — видалено; Reader не знає про нагородні слоти.
+
+Зовнішні виклики:
+    scheduler.ask(account_id, "reader", "do_read", {
+        "limit":        int,
+        "include_tags": list[str] | None,
+        "exclude_tags": list[str] | None,
+    })
+
+    scheduler.ask(account_id, "reader", "mark_read",  {"targets": [translit_name, ...]})
+    scheduler.ask(account_id, "reader", "get_state",  {})
+    scheduler.ask(account_id, "reader", "set_reading_params", {
+        "limit":        int,
+        "include_tags": list[str] | None,
+        "exclude_tags": list[str] | None,
+    })
+
+Події що емітуються:
+    reader.chapters_exhausted  — {account_id}
+    reader.chapters_read       — {account_id, count, mangas}
+    reader.reward_received     — {account_id, reward}
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
 from src.core.runtime.scheduler import EventDrivenScheduler
-from src.core.tasks.base import AnyTask
-from src.core.tasks.pipeline import pipeline, Ready, Skip
 from src.mangabuff.farmer.inventory import ReaderInventory
-from src.mangabuff.farmer.models import ItemReceivedEvent
-from src.mangabuff.farmer.stats import ReaderRewardStats
-from src.mangabuff.farmer.trigger import ReaderTrigger
 
 if TYPE_CHECKING:
     from src.core.account import Account
     from src.core.runtime.request_router import RequestContext
-    from src.core.runtime.schedule import TriggerProtocol
 
 from src.core.logging.loggers import get_account_logger
 
 
-def _fetch_next_chapter(bot: "Account") -> Ready[dict[str, Any]] | Skip:
-    """
-    Fetch-крок pipeline читача.
-
-    Повертає:
-        Skip                        — слот не готовий за часом; pipeline
-                                      завершується без action і без parse.
-        Ready({"sequence": [], …})  — глав немає; action побачить порожній
-                                      sequence і викличе on_exhausted.
-        Ready({"sequence": […], …}) — є непрочитані глави; action читає.
-
-    None і виняток з цієї функції не використовуються для сигналізації стану.
-    """
-    inv  = bot.inventory.reader  # type: ignore[attr-defined]
-    slot = inv.slot_scheduler.current()
-
-    if slot is None:
-        get_account_logger(bot.account_id).debug("🎰 Слот не готовий за часом → очікуємо")
-        return Skip(reason="slot not ready")
-
-    sequence, mangas = bot.repo.chapters.get_chapter_sequence(
-        account_id=bot.account_id,
-        limit=2,
-    )
-
-    if sequence:
-        get_account_logger(bot.account_id).info(
-            f"📖 [{slot.slot_name}] "
-            f"Знайдено непрочитані глави ({len(sequence)}): {', '.join(mangas)}"
-        )
-        return Ready({"sequence": sequence, "mangas": mangas, "slot_name": slot.slot_name})
-
-    get_account_logger(bot.account_id).info(f"🎰 [{slot.slot_name}] Непрочитаних глав немає → сигнал завантажувачу")
-    return Ready({"sequence": [], "mangas": [], "slot_name": slot.slot_name})
-
+# ─────────────────────────────────────────────────────────────────────────────
+# ReaderProfession
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ReaderProfession(BaseProfession):
     """
     Profession «Читач манги».
 
-    Відповідальність:
-        • Читає глави зі слотів для отримання нагород.
-        • Якщо в БД немає непрочитаних глав — емітить «reader.chapters_exhausted»
-          і чекає. Самостійно нічого не завантажує.
-        • При отриманні «loader.chapters_ready» → скидає тригер у +0s.
+    Чистий виконавець: отримує ask → читає → емітить події.
+    Не веде статистику, не знає про слоти, не планує наступний запуск.
+    Таймінг цілком делегований ReadingMonitor.
     """
 
     def __init__(self) -> None:
         self._account_id: str                               = ""
-        self._stats:      ReaderRewardStats                 = ReaderRewardStats()
-        self._trigger:    Optional[ReaderTrigger]           = None
         self._scheduler:  Optional["EventDrivenScheduler"] = None
 
     @property
@@ -91,34 +71,11 @@ class ReaderProfession(BaseProfession):
         self._account_id = account_id
         self._scheduler  = scheduler
 
-        scheduler.subscribe("daily.claimed",         self._on_daily_claimed)
-        scheduler.subscribe("loader.chapters_ready", self._on_chapters_ready)
-
     async def restore_state(self, bot: "Account") -> None:
-        inv: ReaderInventory = bot.inventory.reader  # type: ignore[attr-defined]
-        inv.init_slots(bot.app_config.reader.reward_slots)
-        inv.slot_scheduler.initialize()
-
-        get_account_logger(self._account_id).info(
-            f"ReaderProfession відновлено: "
-            f"slots={[s.slot_name for s in inv.all_slots()]} "
-            f"pending={len(inv.pending_slots())} "
-            f"goal_reached={inv.goal_reached()}"
-        )
+        get_account_logger(self._account_id).info("ReaderProfession відновлено")
 
     async def teardown(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
-        self._stats.dump()
-
-    # ── Triggers ──────────────────────────────────────────────────────────────
-
-    def build_triggers(self, account_id: str) -> list["TriggerProtocol"]:
-        trigger = ReaderTrigger(
-            name       = "reader_slot",
-            account_id = account_id,
-            _producer  = self._make_producer(),
-        )
-        self._trigger = trigger
-        return [trigger]
+        self._scheduler = None
 
     def check_guard(self, bot: "Account") -> bool:
         return not bool(bot.inventory.personal.data.get("is_banned"))
@@ -131,227 +88,177 @@ class ReaderProfession(BaseProfession):
         data:   dict[str, Any],
         ctx:    "RequestContext",
     ) -> RequestResult:
-        if intent == "get_stats":
-            return RequestResult.approve(data={"summary": self._stats.summary()})
+        if intent == "do_read":
+            return await self._handle_do_read(data, ctx)
+        if intent == "claim_candy":
+            return await self._handle_claim_candy(data, ctx)
         if intent == "get_state":
             return await self._handle_get_state(ctx)
-        if intent == "reset_slots":
-            return await self._handle_reset_slots(ctx)
-        if intent == "set_targets":
-            return await self._handle_set_targets(data, ctx)
+        if intent == "set_reading_params":
+            return await self._handle_set_reading_params(data, ctx)
         if intent == "mark_read":
             return await self._handle_mark_read(data, ctx)
         return RequestResult.deny(f"unknown intent: {intent!r}")
 
-    async def _handle_get_state(self, ctx: "RequestContext") -> RequestResult:
-        inv: ReaderInventory = ctx.bot.inventory.reader  # type: ignore[attr-defined]
-        return RequestResult.approve(data={
-            "slots": [
-                {
-                    "name":        s.slot_name,
-                    "collected":   s.collected,
-                    "daily_limit": s.daily_limit,
-                    "complete":    s.is_complete(),
-                    "remaining":   s.remaining(),
-                }
-                for s in inv.all_slots()
-            ],
-            "pending":      len(inv.pending_slots()),
-            "goal_reached": inv.goal_reached(),
-            "delay_next":   inv.slot_scheduler.delay_until_next(),
-            "stats":        self._stats.summary(),
-        })
+    # ── do_read ───────────────────────────────────────────────────────────────
 
-    async def _handle_reset_slots(self, ctx: "RequestContext") -> RequestResult:
-        inv: ReaderInventory = ctx.bot.inventory.reader  # type: ignore[attr-defined]
-        inv.slot_scheduler.reset()
-        get_account_logger(ctx.account_id).info("ReaderProfession: примусове скидання розкладу слотів")
-        return RequestResult.approve(data={"status": "slots reset"})
-
-    async def _handle_set_targets(
+    async def _handle_do_read(
         self,
         data: dict[str, Any],
         ctx:  "RequestContext",
     ) -> RequestResult:
-        targets = data.get("targets", [])
-        if not isinstance(targets, list):
-            return RequestResult.deny("targets must be a list of slot names")
-        inv: ReaderInventory = ctx.bot.inventory.reader  # type: ignore[attr-defined]
-        inv.target_slots = targets
-        get_account_logger(ctx.account_id).info(f"ReaderProfession: змінено список цільових слотів → {targets}")
-        return RequestResult.approve(data={"targets": targets})
-
-    async def _handle_mark_read(
-        self,
-        data: dict[str, Any],
-        ctx:  "RequestContext",
-    ) -> RequestResult:
-        bot     = ctx.bot
-        targets: list[str] = data.get("targets", [])
-
-        if not targets:
-            return RequestResult.deny("targets (список translit_name) обов'язковий")
-
-        total = 0
-        try:
-            for translit_name in targets:
-                row = bot.repo.mangas.get_by_translit_name(translit_name)
-                if row is None:
-                    get_account_logger(ctx.account_id).warning(
-                        f"mark_read: manga {translit_name!r} не знайдено в БД — пропускаємо"
-                    )
-                    continue
-
-                sequence, _ = bot.repo.chapters.get_chapter_sequence(
-                    account_id=ctx.account_id,
-                    limit=2,
-                )
-                target_chapters = [
-                    ch for ch in sequence
-                    if ch["manga_id"] == row.data_id
-                ]
-                for ch in target_chapters:
-                    bot.repo.chapters.mark_chapter_read(ctx.account_id, int(ch["chapter_id"]))
-                    total += 1
-
-                get_account_logger(ctx.account_id).info(
-                    f"mark_read: {translit_name!r} — позначено {len(target_chapters)} глав як прочитані"
-                )
-
-            return RequestResult.approve(data={"marked": total, "mangas": targets})
-
-        except Exception as exc:
-            get_account_logger(ctx.account_id).exception("mark_read: помилка")
-            return RequestResult.deny(str(exc))
-
-    # ── Event handlers ────────────────────────────────────────────────────────
-
-    async def _on_daily_claimed(self, payload: dict[str, Any]) -> None:
-        if payload.get("account_id") != self._account_id:
-            return
-        get_account_logger(self._account_id).info("ReaderProfession: daily.claimed → запускаємо читання")
-        if self._trigger is not None:
-            self._trigger.reschedule("+0s")
-        if self._scheduler is not None:
-            self._scheduler.wakeup()
-
-    async def _on_chapters_ready(self, payload: dict[str, Any]) -> None:
         """
-        Broadcast від MangaLoader — глави є, прокидаємось.
+        Запускає один цикл читання з параметрами від ReadingMonitor.
 
-        reschedule("+0s") → _next_fire = now → is_ready() = True одразу.
-        wakeup() виводить scheduler з sleep щоб не чекати наступного тіку.
+        Параметри:
+            limit        : int           — кількість глав за раз
+            include_tags : list[str]     — фільтр за тегами (включити)
+            exclude_tags : list[str]     — фільтр за тегами (виключити)
         """
-        get_account_logger(self._account_id).info("ReaderProfession: loader.chapters_ready → прокидаємось")
-        if self._trigger is not None:
-            self._trigger.reschedule("+0s")
-        if self._scheduler is not None:
-            self._scheduler.wakeup()
+        limit:        int                 = int(data.get("limit", 2))
+        include_tags: Optional[list[str]] = data.get("include_tags") or None
+        exclude_tags: Optional[list[str]] = data.get("exclude_tags") or None
 
-    # ── Pipeline ──────────────────────────────────────────────────────────────
+        bot = ctx.bot
+        log = get_account_logger(bot.account_id)
 
-    def _make_producer(self) -> Callable[["Account"], Iterable[AnyTask]]:
+        sequence, mangas = bot.repo.chapters.get_chapter_sequence(
+            account_id   = bot.account_id,
+            limit        = limit,
+            include_tags = include_tags,
+            exclude_tags = exclude_tags,
+        )
 
-        def on_cycle_done(bot: "Account") -> None:
-            if self._trigger is not None:
-                self._trigger.advance(bot)
-
-        def on_exhausted(bot: "Account") -> None:
-            """
-            Глав немає — емітуємо подію і явно переводимо тригер у сплячку.
-
-            reschedule(inf) миттєво звільняє слот пулу задач:
-                _in_flight = False, _next_fire = inf → is_ready() = False.
-            Тригер оживає тільки через _on_chapters_ready → reschedule("+0s").
-            """
+        if not sequence:
+            log.info("📖 Непрочитаних глав немає → chapters_exhausted")
             if self._scheduler is not None:
                 self._scheduler.emit_event(
                     "reader.chapters_exhausted",
                     {"account_id": bot.account_id},
                     source=bot.account_id,
                 )
-            if self._trigger is not None:
-                self._trigger.reschedule(float("inf"))  # сплячка — пул вільний
+            return RequestResult.approve(data={"read": 0, "mangas": []})
 
-        return pipeline(
-            name   = "manga_reader",
-            fetch  = _fetch_next_chapter,
-            parse  = [],   # Читач не парсить — пустий parse-chain
-            action = self._make_read_action(on_cycle_done, on_exhausted),
+        log.info(f"📖 Знайдено непрочитані глави ({len(sequence)}): {', '.join(mangas)}")
+
+        reward = bot.safe_session.submit_add_history([
+            {"manga_id": ch["manga_id"], "chapter_id": ch["chapter_id"]}
+            for ch in sequence
+        ])
+
+        for ch in sequence:
+            bot.repo.chapters.mark_chapter_read(bot.account_id, int(ch["chapter_id"]))
+
+        log.info(
+            f"📖 Прочитано {len(sequence)} глав: {', '.join(mangas)}"
+            + (f" | нагорода: {reward}" if reward else "")
         )
 
-    def _make_read_action(
-        self,
-        on_cycle_done: Callable[["Account"], None],
-        on_exhausted:  Callable[["Account"], None],
-    ) -> Callable[[Any, "Account"], None]:
-
-        def read_chapter(data: Any, bot: "Account") -> None:
-            inv: ReaderInventory = bot.inventory.reader  # type: ignore[attr-defined]
-            sequence:  list[dict[str, Any]] = data.get("sequence", [])
-            slot_name: str                  = data.get("slot_name", "")
-
-            if not sequence:
-                # fetch повернув Ready з порожнім sequence — глав немає
-                on_exhausted(bot)
-                return
-
-            get_account_logger(bot.account_id).info(f"🎰 [{slot_name}] Запуск читання {len(sequence)} глав")
-
-            reward = bot.session.submit_add_history([
-                {"manga_id": ch["manga_id"], "chapter_id": ch["chapter_id"]}
-                for ch in sequence
-            ])
-
-            for ch in sequence:
-                bot.repo.chapters.mark_chapter_read(bot.account_id, int(ch["chapter_id"]))
-
-            if slot_name:
-                inv.slot_scheduler.mark_done(slot_name)
-
-            self._stats.record(slot_name=slot_name, reward=reward if reward else None)
-
-            if not reward:
-                get_account_logger(bot.account_id).info(f"🎰 [{slot_name}] Прочитано (нагорода відсутня)")
-                on_cycle_done(bot)
-                return
-
-            reward_keys: frozenset[str] = frozenset(reward.keys())
-            closed = inv.record_reward(reward_keys)
-
-            if closed:
-                slot_info   = next((s for s in inv.all_slots() if s.slot_name == closed), None)
-                collected   = slot_info.collected   if slot_info else "?"
-                daily_limit = slot_info.daily_limit if slot_info else "?"
-                get_account_logger(bot.account_id).info(f"🎉 Слот {closed!r} закрито ({collected}/{daily_limit})")
-
-                bot.inventory.personal.push_item_received(ItemReceivedEvent(
-                    account_id = bot.account_id,
-                    slot_name  = closed,
-                    reward     = reward,
-                ))
-
-                if self._scheduler is not None:
-                    self._scheduler.emit_event(
-                        "reader.slot_closed",
-                        {"account_id": bot.account_id, "slot_name": closed, "reward": reward},
-                        source=bot.account_id,
-                    )
-
-            get_account_logger(bot.account_id).info(
-                f"🎰 [{slot_name}] Нагорода: {reward} | "
-                f"активних слотів: {len(inv.pending_slots())}"
+        if self._scheduler is not None:
+            self._scheduler.emit_event(
+                "reader.chapters_read",
+                {
+                    "account_id": bot.account_id,
+                    "count":      len(sequence),
+                    "mangas":     mangas,
+                },
+                source=bot.account_id,
             )
+            if reward:
+                self._scheduler.emit_event(
+                    "reader.reward_received",
+                    {"account_id": bot.account_id, "reward": reward},
+                    source=bot.account_id,
+                )
 
-            if inv.goal_reached():
-                get_account_logger(bot.account_id).info("🎯 Усі цільові слоти закриті")
-                if self._scheduler is not None:
-                    self._scheduler.emit_event(
-                        "reader.goal_reached",
-                        {"account_id": bot.account_id},
-                        source=bot.account_id,
-                    )
+        return RequestResult.approve(data={
+            "read":   len(sequence),
+            "mangas": mangas,
+            "reward": reward,
+        })
 
-            on_cycle_done(bot)
+    async def _handle_claim_candy(
+        self,
+        data: dict[str, Any],
+        ctx:  "RequestContext",
+    ) -> RequestResult:
+        get_account_logger(ctx.account_id).info(f"Claiming candy with data: {data}")
+        token: str = data.get("token", "")
+        if not token:
+            return RequestResult.deny("token обов'язковий")
 
-        return read_chapter
+        bot = ctx.bot
+        success, reward = bot.safe_session.claim_candy(token)
+        if not success:
+            return RequestResult.deny("Не вдалося отримати цукерку")
+
+        return RequestResult.approve(data={"reward": reward})
+
+    # ── get_state ─────────────────────────────────────────────────────────────
+
+    async def _handle_get_state(self, ctx: "RequestContext") -> RequestResult:
+        inv: ReaderInventory = ctx.bot.inventory.reader  # type: ignore[attr-defined]
+        params_raw = inv.data.get("reading_params", {})
+        return RequestResult.approve(data={"reading_params": params_raw})
+
+    # ── set_reading_params ────────────────────────────────────────────────────
+
+    async def _handle_set_reading_params(
+        self,
+        data: dict[str, Any],
+        ctx:  "RequestContext",
+    ) -> RequestResult:
+        """
+        Оновлює ReadingParams що ReadingMonitor передаватиме при наступних ask.
+        """
+        from src.mangabuff.farmer.reading_monitor import ReadingParams
+
+        params = ReadingParams(
+            limit        = int(data.get("limit", 2)),
+            include_tags = data.get("include_tags") or None,
+            exclude_tags = data.get("exclude_tags") or None,
+        )
+        inv: ReaderInventory = ctx.bot.inventory.reader  # type: ignore[attr-defined]
+        inv.data["reading_params"] = params.to_dict()
+
+        get_account_logger(ctx.account_id).info(
+            f"ReaderProfession: reading_params оновлено → {params}"
+        )
+        return RequestResult.approve(data={"reading_params": params.to_dict()})
+
+    # ── mark_read ─────────────────────────────────────────────────────────────
+
+    async def _handle_mark_read(
+        self,
+        data: dict[str, Any],
+        ctx:  "RequestContext",
+    ) -> RequestResult:
+        bot = ctx.bot
+        targets: list[str] = data.get("targets", [])
+
+        if not targets:
+            return RequestResult.deny("targets (список translit_name) обов'язковий")
+
+        valid: list[str] = []
+        log = get_account_logger(ctx.account_id)
+
+        try:
+            for name in targets:
+                if bot.repo.mangas.get_by_translit_name(name) is None:
+                    log.warning(f"mark_read: manga {name!r} не знайдено в БД — пропускаємо")
+                else:
+                    valid.append(name)
+
+            if not valid:
+                return RequestResult.approve(data={"marked": 0, "mangas": []})
+
+            total = bot.repo.chapters.mark_mangas_read(
+                account_id=ctx.account_id,
+                translit_names=valid,
+            )
+            log.info(f"mark_read: {total} глав позначено для {valid}")
+            return RequestResult.approve(data={"marked": total, "mangas": valid})
+
+        except Exception as exc:
+            log.exception("mark_read: помилка")
+            return RequestResult.deny(str(exc))

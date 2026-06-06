@@ -5,12 +5,8 @@ bot/admin/routers/logs.py
 
 /logs                    — меню вибору типу логів
 /logs account <id>       — останні 30 рядків акаунта
-/logs tasks <id>         — останні 30 рядків tasks
 /logs errors             — помилки за останні 24 год
 /logs scheduler          — останні 30 рядків scheduler.log
-
-Telegram обмежує повідомлення до 4096 символів —
-довгі логи розбиваються на частини автоматично.
 """
 from __future__ import annotations
 
@@ -28,19 +24,17 @@ from src.core.logging.reader import LogReader
 router = Router(name="logs")
 _reader = LogReader()
 
-_MAX_MSG = 3800   # Telegram limit з запасом
+_MAX_MSG = 3800
 _TAIL_N  = 40
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _split_text(text: str, chunk: int = _MAX_MSG) -> list[str]:
-    """Розбиває довгий текст на частини по chunk символів."""
     return [text[i : i + chunk] for i in range(0, len(text), chunk)]
 
 
 async def _send_lines(target: Message | CallbackQuery, lines: list[str], title: str) -> None:
-    """Відправляє рядки логів, розбиваючи на частини якщо потрібно."""
     msg = target if isinstance(target, Message) else target.message
 
     if not lines:
@@ -64,9 +58,6 @@ def _logs_menu_kb(account_ids: list[str]) -> InlineKeyboardMarkup:
     if account_ids:
         rows.append([InlineKeyboardButton(
             text="👤 Акаунт →", callback_data="logs:pick_account:account"
-        )])
-        rows.append([InlineKeyboardButton(
-            text="⚙️ Tasks →",  callback_data="logs:pick_account:tasks"
         )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -106,16 +97,15 @@ async def cb_logs_menu(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("logs:pick_account:"))
 async def cb_pick_account(call: CallbackQuery) -> None:
-    log_type    = call.data.split(":", 2)[2]  # type: ignore[union-attr]  → "account" | "tasks"
+    log_type    = call.data.split(":", 2)[2]  # type: ignore[union-attr]  → "account"
     account_ids = _reader.list_accounts()
 
     if not account_ids:
         await call.answer("📭 Лог-файлів акаунтів не знайдено", show_alert=True)
         return
 
-    label = "👤 Акаунт" if log_type == "account" else "⚙️ Tasks"
     await call.message.edit_text(  # type: ignore[union-attr]
-        f"📋 <b>{label} — оберіть акаунт:</b>",
+        "📋 <b>👤 Акаунт — оберіть акаунт:</b>",
         reply_markup=_pick_account_kb(log_type, account_ids),
     )
     await call.answer()
@@ -149,23 +139,12 @@ async def cb_account_log(call: CallbackQuery) -> None:
     await _send_lines(call, lines, f"Акаунт {acc_id} (останні {_TAIL_N} рядків)")
 
 
-# ── Tasks лог ─────────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("logs:tasks:"))
-async def cb_tasks_log(call: CallbackQuery) -> None:
-    acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]
-    await call.answer()
-    lines = _reader.tail_tasks(acc_id, _TAIL_N)
-    await _send_lines(call, lines, f"Tasks {acc_id} (останні {_TAIL_N} рядків)")
-
-
 # ── Команда /logs з аргументами ───────────────────────────────────────────────
 
 @router.message(Command("logs"))
 async def cmd_logs_args(message: Message) -> None:
     """
     /logs account <id>  — лог акаунта
-    /logs tasks <id>    — tasks лог
     /logs errors        — помилки 24год
     /logs scheduler     — scheduler лог
     """
@@ -184,15 +163,10 @@ async def cmd_logs_args(message: Message) -> None:
         lines = _reader.tail_scheduler(_TAIL_N)
         await _send_lines(message, lines, f"Scheduler (останні {_TAIL_N} рядків)")
 
-    elif sub in ("account", "tasks") and len(parts) == 3:
+    elif sub == "account" and len(parts) == 3:
         acc_id = parts[2].strip()
-        if sub == "account":
-            lines = _reader.tail_account(acc_id, _TAIL_N)
-            title = f"Акаунт {acc_id}"
-        else:
-            lines = _reader.tail_tasks(acc_id, _TAIL_N)
-            title = f"Tasks {acc_id}"
-        await _send_lines(message, lines, f"{title} (останні {_TAIL_N} рядків)")
+        lines = _reader.tail_account(acc_id, _TAIL_N)
+        await _send_lines(message, lines, f"Акаунт {acc_id} (останні {_TAIL_N} рядків)")
 
     else:
         await message.answer(
@@ -200,6 +174,5 @@ async def cmd_logs_args(message: Message) -> None:
             "/logs\n"
             "/logs errors\n"
             "/logs scheduler\n"
-            "/logs account &lt;id&gt;\n"
-            "/logs tasks &lt;id&gt;"
+            "/logs account &lt;id&gt;"
         )

@@ -2,12 +2,6 @@
 bot/admin/services/scheduler_service.py
 
 Тонкий фасад між адмін-ботом і Scheduler-сінглтоном.
-
-Зміни:
-  - AccountInfo.profession → professions: list[str]
-  - assign_profession → add_profession (додає, не замінює)
-  - change_profession видалено; натомість remove_profession + add_profession
-  - add_account відновлює ВСІ professions з БД при старті
 """
 from __future__ import annotations
 
@@ -24,7 +18,6 @@ from src.core.runtime.profession import BaseProfession, profession_factory
 from src.database.repository.factory import Repositories
 
 _ENV_FILE = Path(".env")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # .env helpers
@@ -86,19 +79,17 @@ def _erase_credentials(account_id: str) -> None:
 
 @dataclass(frozen=True)
 class AccountInfo:
-    account_id:     str
-    email:          str
-    proxy:          str
-    status:         str
-    queue_size:     int
-    triggers:       list[str]
-    next_trigger_s: Optional[float]
-    # Список profession у порядку пріоритету (індекс 0 = найвищий)
-    professions:    list[str] = field(default_factory=list)
+    account_id:  str
+    email:       str
+    proxy:       str
+    status:      str
+    queue_size:   int = 0
+    professions:  list[str] = field(default_factory=list)
+    monitors:     list[str] = field(default_factory=list)
+    is_connected: bool = False
 
     @property
     def profession(self) -> Optional[str]:
-        """Зворотна сумісність: перша profession або None."""
         return self.professions[0] if self.professions else None
 
 
@@ -153,22 +144,45 @@ class SchedulerService:
         if bot is None or status is None:
             return None
 
-        # Беремо список professions з runtime (джерело правди для активного стану)
         runtime_profs = scheduler.profession_names(acc_id)
 
+        active_monitors = []
+        am = scheduler._monitors.get(acc_id)
+        if am is not None:
+            active_monitors = am.active_ids()
+
         return AccountInfo(
-            account_id     = acc_id,
-            email          = bot.bot_config.client.auth.email if bot.bot_config.client.auth else "—",
-            proxy          = bot.bot_config.network.proxy or "",
-            status         = status.name,
-            queue_size     = scheduler.queue_size(acc_id) or 0,
-            triggers       = scheduler.trigger_names(acc_id),
-            next_trigger_s = scheduler.seconds_until_next(acc_id),
-            professions    = runtime_profs,
+            account_id   = acc_id,
+            email        = bot.bot_config.client.auth.email if bot.bot_config.client.auth else "—",
+            proxy        = bot.bot_config.network.proxy or "",
+            status       = status.name,
+            queue_size   = 0,
+            professions  = runtime_profs,
+            monitors     = active_monitors,
+            is_connected = bot.is_connected,
         )
 
     def account_ids(self) -> list[str]:
         return self._scheduler.account_ids()
+
+    def get_bot(self, account_id: str):
+        """Повертає Account або None. Використовується StartupManager."""
+        return self._scheduler.get_bot(account_id)
+
+    def connect_account(self, account_id: str) -> bool:
+        """
+        Встановлює сесію і підключає монітори.
+        Делегує в scheduler.connect_account() — єдине місце де це відбувається.
+        """
+        return self._scheduler.connect_account(account_id)
+
+    def disconnect_account(self, account_id: str) -> bool:
+        """Закриває сесію акаунта без зупинки профессій."""
+        bot = self._scheduler.get_bot(account_id)
+        if bot is None:
+            return False
+        bot.disconnect()
+        return True
 
     # ── Створення акаунта ─────────────────────────────────────────────────────
 
@@ -185,7 +199,6 @@ class SchedulerService:
 
         if password:
             _save_credentials(account_id, password, proxy)
-            # professions=None → не чіпаємо наявний список якщо акаунт вже є в БД
             self._repo.accounts.upsert(account_id, email, professions=None)
 
         stored_pw, stored_proxy = _load_credentials(account_id)
@@ -203,7 +216,6 @@ class SchedulerService:
 
         bot = Account(account_id, bot_config, self._app_config, self._repo)
 
-        # Відновлюємо всі professions з БД
         db_acc   = self._repo.accounts.get(account_id)
         prof_names = db_acc.professions if db_acc else []
         professions: list[BaseProfession] = []
@@ -232,21 +244,12 @@ class SchedulerService:
         *,
         priority: int = -1,
     ) -> tuple[bool, str]:
-        """
-        Додає profession до акаунта.
-
-        priority=-1  → найнижчий пріоритет (в кінець списку)
-        priority=0   → найвищий (першою)
-        priority=N   → вставити на позицію N
-
-        Якщо profession вже призначена — повертає (True, "") без змін (idempotent).
-        """
         scheduler = self._scheduler
         if not scheduler.has_account(account_id):
             return False, f"Акаунт {account_id!r} не знайдено"
 
         if scheduler.has_profession(account_id, profession_name):
-            return True, ""  # вже є — без помилки
+            return True, ""
 
         try:
             profession = profession_factory.build(profession_name)
@@ -258,7 +261,6 @@ class SchedulerService:
         except Exception as e:
             return False, f"Не вдалося додати профессію в ядро: {e}"
 
-        # Зберігаємо в БД з урахуванням пріоритету
         self._repo.accounts.add_profession(account_id, profession_name, priority=priority)
         return True, ""
 
@@ -267,7 +269,6 @@ class SchedulerService:
         account_id:      str,
         profession_name: str,
     ) -> tuple[bool, str]:
-        """Видаляє profession з акаунта (idempotent)."""
         scheduler = self._scheduler
         if not scheduler.has_account(account_id):
             return False, f"Акаунт {account_id!r} не знайдено"
@@ -281,22 +282,16 @@ class SchedulerService:
         account_id:  str,
         profession_names: list[str],
     ) -> tuple[bool, str]:
-        """
-        Атомарно замінює весь список professions акаунта.
-        Видаляє тих що зникли, додає нових, зберігає порядок (= пріоритет).
-        """
         scheduler = self._scheduler
         if not scheduler.has_account(account_id):
             return False, f"Акаунт {account_id!r} не знайдено"
 
         current = set(scheduler.profession_names(account_id))
-        target  = list(dict.fromkeys(profession_names))  # dedup зі збереженням порядку
+        target  = list(dict.fromkeys(profession_names))
 
-        # Видаляємо яких немає у target
         for name in current - set(target):
             scheduler.remove_profession_from_account(account_id, name)
 
-        # Додаємо нові у порядку target
         for idx, name in enumerate(target):
             if not scheduler.has_profession(account_id, name):
                 try:
@@ -305,7 +300,6 @@ class SchedulerService:
                 except Exception as e:
                     return False, f"Помилка profession {name!r}: {e}"
 
-        # Синхронізуємо БД
         self._repo.accounts.set_professions(account_id, target)
         return True, ""
 
@@ -317,19 +311,14 @@ class SchedulerService:
             _erase_credentials(account_id)
         return ok
 
-    # ── Оновлення налаштувань ─────────────────────────────────────────────────
-    def force_parse_mangas(
+    # ── Async операції ────────────────────────────────────────────────────────
+
+    async def force_parse_mangas(
         self,
         account_id: str,
         targets: list[str],
     ) -> tuple[bool, str, dict[str, Any]]:
-        """
-        Примусовий парсинг манг за translit_name. Повертає (ok, reason, data).
-
-        Надсилає запит до manga_loader (не reader).
-        Ключ payload: translits (не targets).
-        """
-        res = self._scheduler.ask_sync(
+        res = await self._scheduler.ask(
             account_id,
             profession_id="manga_loader",
             intent="force_parse",
@@ -337,20 +326,18 @@ class SchedulerService:
         )
         if res.approved:
             data = res.data or {}
-            # нормалізуємо ключі для зворотної сумісності з UI
             return True, "", {
                 "chapters": data.get("chapters_saved", 0),
                 "mangas":   data.get("mangas", 0),
             }
         return False, res.reason or "невідома помилка", {}
 
-    def mark_mangas_read(
+    async def mark_mangas_read(
         self,
         account_id: str,
         targets: list[str],
-    ) -> tuple[bool, str, dict[str, list[str]]]:
-        """Позначає глави вказаних манг як прочитані. Повертає (ok, reason, data)."""
-        res = self._scheduler.ask_sync(
+    ) -> tuple[bool, str, dict[str, Any]]:
+        res = await self._scheduler.ask(
             account_id,
             profession_id="reader",
             intent="mark_read",
@@ -359,13 +346,23 @@ class SchedulerService:
         if res.approved:
             return True, "", res.data or {}
         return False, res.reason or "невідома помилка", {}
-    
-    def update_reader_slots(self, account_id: str, target_slots: list[str]) -> bool:
-        res = self._scheduler.ask_sync(
+
+    async def update_reading_params(
+        self,
+        account_id:   str,
+        limit:        int                  = 2,
+        include_tags: Optional[list[str]]  = None,
+        exclude_tags: Optional[list[str]]  = None,
+    ) -> bool:
+        res = await self._scheduler.ask(
             account_id,
             profession_id="reader",
-            intent="set_targets",
-            data={"targets": target_slots},
+            intent="set_reading_params",
+            data={
+                "limit":        limit,
+                "include_tags": include_tags,
+                "exclude_tags": exclude_tags,
+            },
         )
         if res.approved:
             bot = self._scheduler.get_bot(account_id)
@@ -374,12 +371,8 @@ class SchedulerService:
             return True
         return False
 
-    def reschedule_trigger(self, account_id: str, trigger_name: str, run_at: str) -> bool:
-        return self._scheduler.reschedule_trigger(account_id, trigger_name, run_at)
-
-    def reset_catalog_page(self, account_id: str) -> tuple[bool, str]:
-        """Скидає сторінку каталогу на 1 для catalog_loader."""
-        res = self._scheduler.ask_sync(
+    async def reset_catalog_page(self, account_id: str) -> tuple[bool, str]:
+        res = await self._scheduler.ask(
             account_id,
             profession_id="catalog_loader",
             intent="reset_catalog_page",
@@ -388,6 +381,17 @@ class SchedulerService:
         if res.approved:
             return True, ""
         return False, res.reason or "невідома помилка"
+
+    async def get_reader_state(self, account_id: str) -> tuple[bool, dict[str, Any]]:
+        res = await self._scheduler.ask(
+            account_id,
+            profession_id="reader",
+            intent="get_state",
+            data={},
+        )
+        if res.approved:
+            return True, res.data or {}
+        return False, {}
 
     def pause(self, account_id: str)  -> bool: return self._scheduler.pause_account(account_id)
     def resume(self, account_id: str) -> bool: return self._scheduler.resume_account(account_id)

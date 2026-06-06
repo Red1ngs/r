@@ -1,17 +1,8 @@
 """
 accounts/reader_tools.py
-
-Інструменти Reader-професії:
-  • Примусовий парсинг манг за translit_name (force_parse).
-    Дані отримуються виключно через MangaLoaderProfession (translit_name),
-    без жодної взаємодії з каталогом.
-
-Доступно тільки для акаунтів із profession «manga_loader».
-
-Пункт меню реєструється автоматично через ProfessionMenuRegistry —
-не треба вручну додавати кнопки в account_menu_kb.
 """
 from __future__ import annotations
+import html
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -26,8 +17,6 @@ router = Router(name="accounts:reader_tools")
 
 
 # ── Реєстрація пунктів меню ───────────────────────────────────────────────────
-# Виконується один раз при імпорті модуля.
-# Кнопки з'являться автоматично в account_menu_kb для акаунтів з profession "manga_loader".
 
 profession_menu_registry.register(
     profession_id="manga_loader",
@@ -35,10 +24,20 @@ profession_menu_registry.register(
     callback_template="acc:force_parse:{acc_id}",
 )
 
+profession_menu_registry.register(
+    profession_id="reader",
+    label="✅ Прочитані глави",
+    callback_template="acc:mark_read:{acc_id}",
+)
+
 
 # ── FSM ───────────────────────────────────────────────────────────────────────
 
 class ForceParseFSM(StatesGroup):
+    wait_input = State()
+
+
+class MarkReadFSM(StatesGroup):
     wait_input = State()
 
 
@@ -91,7 +90,7 @@ async def fsm_force_parse_input(
 
     await message.answer(f"⏳ Запускаю парсинг: {', '.join(targets)}…")
 
-    ok, reason, result = svc.force_parse_mangas(acc_id, targets=targets)
+    ok, reason, result = await svc.force_parse_mangas(acc_id, targets=targets)
 
     if ok:
         await message.answer(
@@ -101,3 +100,68 @@ async def fsm_force_parse_input(
         )
     else:
         await message.answer(f"❌ Помилка парсингу:\n<code>{reason}</code>")
+
+
+# ── Mark read ─────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("acc:mark_read:"))
+async def cb_mark_read_start(
+    call: CallbackQuery,
+    state: FSMContext,
+    svc: SchedulerService,
+) -> None:
+    acc_id = call.data.split(":", 2)[2]
+    info   = svc.account_info(acc_id)
+    if info is None:
+        await call.answer("❌ Акаунт не знайдено", show_alert=True)
+        return
+
+    if "reader" not in info.professions:
+        await call.answer("❌ Доступно тільки для reader", show_alert=True)
+        return
+
+    await state.set_state(MarkReadFSM.wait_input)
+    await state.update_data(acc_id=acc_id)
+
+    await call.message.answer(  # type: ignore[union-attr]
+        f"✅ <b>Позначити глави як прочитані</b> для <code>{acc_id}</code>\n\n"
+        "Введіть <b>список translit_name через кому</b>:\n\n"
+        "<i>Приклад:</i>\n"
+        "• <code>vsevedushchii-chitatel, naruto, one-piece</code>",
+        reply_markup=cancel_add_kb(),
+    )
+    await call.answer()
+
+
+@router.message(MarkReadFSM.wait_input)
+async def fsm_mark_read_input(
+    message: Message,
+    state: FSMContext,
+    svc: SchedulerService,
+) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    acc_id: str = data.get("acc_id", "")
+    await state.clear()
+
+    targets = [t.strip() for t in text.split(",") if t.strip()]
+    if not targets:
+        await message.answer("❌ Введіть хоча б один translit_name. Операцію скасовано.")
+        return
+
+    wait_msg = await message.answer(f"⏳ Позначаю як прочитані: {', '.join(targets)}…")
+
+    ok, reason, result = await svc.mark_mangas_read(acc_id, targets=targets)
+
+    if ok:
+        marked: int = result.get("marked", 0)
+        mangas: list[str] = result.get("mangas", [])
+        
+        await wait_msg.edit_text(
+            f"✅ <b>Готово</b>\n"
+            f"Позначено нових глав: <b>{marked}</b>\n"
+            f"Манги: {', '.join(f'<code>{m}</code>' for m in mangas)}"
+        )
+    else:
+        safe_reason = html.escape(str(reason))
+        await wait_msg.edit_text(f"❌ Помилка:\n<code>{safe_reason}</code>")

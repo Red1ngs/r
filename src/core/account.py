@@ -1,11 +1,13 @@
 """
-account.py — незмінний. Залишається точно як є.
+account.py — модель акаунта + сесія.
 
 Account не знає про Scheduler, Profession чи EventBus.
-Це правильно — Account є чистою моделлю даних + сесії.
 
-Єдина зміна: видалено старі typing imports якщо вони були пов'язані
-з Profession dataclass. Account їх не використовував напряму.
+Зміна відносно попередньої версії:
+  - session property більше не кидає AssertionError при _session is None.
+    Замість цього повертає Optional[BotSession] — відповідальність за
+    перевірку наявності сесії перекладена на caller.
+  - Додано safe_session property як явний контракт для коду,
 """
 from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
@@ -13,7 +15,7 @@ from typing import TYPE_CHECKING, Optional
 from src.core.config.app import AppConfig
 from src.core.config.bot import BotConfig
 from src.core.inventory.model import DynamicInventories as Inventories
-from src.core.tasks.stats import stats_factory, DynamicStats as Stats
+from src.core.stats import stats_factory, DynamicStats as Stats
 from src.database.repository.factory import Repositories
 from src.core.status import AccountStatus
 from src.core.logging.loggers import get_account_logger
@@ -46,9 +48,37 @@ class Account:
         return self.inventories
 
     @property
-    def session(self) -> "BotSession":
-        assert self._session is not None, f"[{self.account_id}] Сесія не встановлена"
+    def session(self) -> Optional["BotSession"]:
+        """
+        Повертає активну сесію або None якщо акаунт відключено.
+
+        Callers що очікують сесію завжди повинні перевіряти:
+            if not bot.is_connected:
+                return  # або логувати попередження
+
+        Для коду де відсутність сесії є справжньою помилкою —
+        використовуй safe_session.
+        """
         return self._session
+
+    @property
+    def safe_session(self) -> "BotSession":
+        """
+        Повертає сесію або кидає RuntimeError якщо відключено.
+
+        Використовується у місцях де сесія має бути гарантована
+        (наприклад, одразу після connect() в startup tasks).
+        """
+        if self._session is None:
+            raise RuntimeError(
+                f"[{self.account_id}] Сесія не встановлена. "
+                "Переконайся що connect() був викликаний перед використанням сесії."
+            )
+        return self._session
+
+    @property
+    def is_connected(self) -> bool:
+        return self._session is not None
 
     def connect(self) -> bool:
         try:
@@ -70,10 +100,6 @@ class Account:
             return self._fail("Авторизація провалилась")
         except Exception as e:
             return self._fail(f"Помилка підключення: {e}")
-
-    @property
-    def is_connected(self) -> bool:
-        return self._session is not None
 
     def disconnect(self) -> None:
         if self._session:

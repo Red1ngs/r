@@ -1,6 +1,6 @@
 from typing import Any
 
-from src.core.tasks.stats import BaseStats
+from src.core.stats import BaseStats
 
 
 class DailyRewardStats(BaseStats):

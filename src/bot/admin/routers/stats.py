@@ -22,34 +22,31 @@ from src.bot.admin.services.scheduler_service import AccountInfo, SchedulerServi
 router = Router(name="stats")
 
 
-def _fmt_seconds(s: float | None) -> str:
-    if s is None:
-        return "—"
-    if s < 60:
-        return f"{int(s)}с"
-    m = int(s // 60)
-    sec = int(s % 60)
-    return f"{m}хв {sec}с" if sec else f"{m}хв"
-
-
 def _account_stats_text(info: AccountInfo) -> str:
-    triggers = "\n".join(f"  • {t}" for t in info.triggers) or "  —"
-    proxy    = f"\nПроксі: <code>{info.proxy}</code>" if info.proxy else ""
+    proxy = f"\nПроксі: <code>{info.proxy}</code>" if info.proxy else ""
 
     prof_line = (
-        "Професії: <b>" + ", ".join(info.professions) + "</b>"
+        "Професії: <b>" + ", ".join(
+            p for p in info.professions
+        ) + "</b>"
         if info.professions else
         "Професії: <i>не призначено</i>"
+    )
+
+    monitor_line = (
+        "Монітори: <b>" + ", ".join(
+            m for m in info.monitors
+        ) + "</b>"
+        if info.monitors else
+        "Монітори: <i>немає</i>"
     )
 
     return (
         f"📊 <b>Статистика: {info.account_id}</b>\n\n"
         f"Email:  <code>{info.email}</code>{proxy}\n"
         f"Статус: <b>{info.status}</b>\n"
-        f"Черга:  <b>{info.queue_size}</b> задач\n"
-        f"Наступний тригер: <b>{_fmt_seconds(info.next_trigger_s)}</b>\n"
-        f"{prof_line}\n\n"
-        f"<b>Тригери:</b>\n{triggers}"
+        f"{prof_line}\n"
+        f"{monitor_line}"
     )
 
 
@@ -73,23 +70,22 @@ async def cmd_stats(message: Message, state: FSMContext, svc: SchedulerService) 
         return
 
     snapshot    = svc.snapshot()
-    total_queue = sum(a.queue_size for a in snapshot.accounts)
     status_count: dict[str, int] = {}
     for acc in snapshot.accounts:
         status_count[acc.status] = status_count.get(acc.status, 0) + 1
 
     lines = [f"📊 <b>Загальна статистика</b>\n"]
-    lines.append(f"Акаунтів: <b>{snapshot.total_accounts}</b>")
-    lines.append(f"Задач у чергах: <b>{total_queue}</b>\n")
+    lines.append(f"Акаунтів: <b>{snapshot.total_accounts}</b>\n")
     lines.append("<b>За статусами:</b>")
     for status, count in sorted(status_count.items()):
         lines.append(f"  {status}: {count}")
     if snapshot.accounts:
         lines.append("\n<b>Деталі:</b>")
         for acc in snapshot.accounts:
+            monitors_str = ", ".join(acc.monitors) if acc.monitors else "—"
             lines.append(
                 f"  <code>{acc.account_id}</code> [{acc.status}] "
-                f"q={acc.queue_size} next={_fmt_seconds(acc.next_trigger_s)}"
+                f"monitors={monitors_str}"
             )
 
     await nav_answer(
@@ -101,7 +97,6 @@ async def cmd_stats(message: Message, state: FSMContext, svc: SchedulerService) 
     )
 
 
-# Callback для статистики конкретного акаунта (з меню)
 @router.callback_query(F.data.startswith("stats:acc:"))
 async def cb_stats_account(call: CallbackQuery, svc: SchedulerService) -> None:
     acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]

@@ -1,5 +1,5 @@
 """
-mangabuff/setup.py — реєстрація інвентарів та професій.
+mangabuff/setup.py — реєстрація інвентарів, професій та моніторів.
 
 Викликати ОДИН РАЗ при старті програми.
 """
@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from src.core.inventory.factory import inventory_factory
 from src.core.runtime.profession import profession_factory
-from src.core.tasks.stats import stats_factory
+from src.core.stats import stats_factory
+from src.core.monitoring.monitor import monitor_registry
 
 # Інвентарі
 from src.mangabuff.daily.inventory import DailyInventory
@@ -16,16 +17,19 @@ from src.mangabuff.farmer.inventory import CatalogLoaderInventory, ReaderInvento
 from src.mangabuff.alliance.inventory import AllianceInventory
 from src.mangabuff.personal.inventory import PersonalInventory
 
-# Професії (Білдери)
+# Професії
 from src.mangabuff.farmer.manga_loader import MangaLoaderProfession
 from src.mangabuff.farmer.catalog_loader import CatalogLoaderProfession
 from src.mangabuff.farmer.reader import ReaderProfession
 from src.mangabuff.daily.build import DailyProfession
 from src.mangabuff.quiz.build import QuizProfession
 
+# Монітори
+from src.mangabuff.farmer.reading_monitor import ReadingMonitor
+from src.mangabuff.quiz.quiz_monitor import QuizMonitor
+
 # Статистика
 from src.mangabuff.daily.stats import DailyRewardStats
-
 
 def register_inventories() -> None:
     inventory_factory.register("personal", "personal", PersonalInventory)
@@ -38,11 +42,22 @@ def register_inventories() -> None:
 
 
 def register_professions() -> None:
-    profession_factory.register("reader", ReaderProfession)
-    profession_factory.register("manga_loader", MangaLoaderProfession)
+    profession_factory.register("reader",         ReaderProfession)
+    profession_factory.register("manga_loader",   MangaLoaderProfession)
     profession_factory.register("catalog_loader", CatalogLoaderProfession)
-    profession_factory.register("daily",  DailyProfession)
-    profession_factory.register("quiz",   QuizProfession)
+    profession_factory.register("daily",          DailyProfession)
+    profession_factory.register("quiz",           QuizProfession)
+
+
+def register_monitors() -> None:
+    """
+    Реєструє монітори в глобальному monitor_registry.
+
+    Монітори підключаються до конкретних акаунтів пізніше через
+    AccountMonitors.attach_all(scheduler, ["reading", ...]).
+    """
+    monitor_registry.register("reading", ReadingMonitor)
+    monitor_registry.register("quiz", QuizMonitor)
 
 
 def register_recorders() -> None:

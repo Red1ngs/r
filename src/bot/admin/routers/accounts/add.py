@@ -2,9 +2,6 @@
 accounts/add.py
 
 FSM додавання нового акаунта: ID → Email → Password → Proxy.
-
-Після успіху пропонується одразу призначити profession.
-Profession і слоти — окремі кроки, тут їх немає.
 """
 from __future__ import annotations
 
@@ -38,7 +35,7 @@ class AddAccountFSM(StatesGroup):
 
 def _success_kb(acc_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎓 Призначити профессію",
+        [InlineKeyboardButton(text="🎓 Призначити професію",
                               callback_data=f"acc:professions:{acc_id}")],
         [InlineKeyboardButton(text="📋 До списку", callback_data="acc:list")],
     ])
@@ -173,7 +170,7 @@ async def _finish_from_call(
     email    = data.get("email")
     password = data.get("password")
     if not acc_id or not email or not password:
-        await call.message.edit_text(  # або message.answer для _finish_from_msg
+        await call.message.edit_text(
             "❌ Сесія додавання загублена. Почніть заново.",
             reply_markup=_error_kb(),
         )
@@ -182,7 +179,7 @@ async def _finish_from_call(
     if ok:
         await call.message.edit_text(  # type: ignore[union-attr]
             f"✅ Акаунт <code>{acc_id}</code> додано!\n\n"
-            "Тепер <b>призначте профессію</b> щоб активувати тригери.",
+            "Тепер <b>призначте професію</b> щоб запустити монітори.",
             reply_markup=_success_kb(acc_id),
         )
     else:
@@ -219,7 +216,7 @@ async def _finish_from_msg(
     if ok:
         text = (
             f"✅ Акаунт <code>{acc_id}</code> додано!\n\n"
-            "Тепер <b>призначте профессію</b> щоб активувати тригери."
+            "Тепер <b>призначте професію</b> щоб запустити монітори."
         )
         kb = _success_kb(acc_id)
     else:

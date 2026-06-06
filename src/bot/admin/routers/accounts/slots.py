@@ -1,38 +1,35 @@
 """
 accounts/slots.py
-
-Редагування target_slots для reader profession.
-Пункт меню реєструється через ProfessionMenuRegistry.
 """
 from __future__ import annotations
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from src.bot.admin.services.scheduler_service import SchedulerService
-from src.core.runtime.scheduler import EventDrivenScheduler
 from ._common import cancel_add_kb
 from .profession_menu import profession_menu_registry
 
 router = Router(name="accounts:slots")
 
-
-# ── Реєстрація пункту меню ────────────────────────────────────────────────────
-
 profession_menu_registry.register(
-    profession_id="reader",
-    label="🎰 Слоти читача",
-    callback_template="acc:slots:{acc_id}",
+    profession_id      = "reader",
+    label              = "⚙️ Параметри читання",
+    callback_template  = "acc:slots:{acc_id}",
 )
 
 
 # ── FSM ───────────────────────────────────────────────────────────────────────
 
 class EditSlotsFSM(StatesGroup):
-    wait_slots = State()
+    wait_limit        = State()
+    wait_include_tags = State()
+    wait_exclude_tags = State()
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("acc:slots:"))
 async def cb_slots(call: CallbackQuery, state: FSMContext, svc: SchedulerService) -> None:
@@ -42,51 +39,81 @@ async def cb_slots(call: CallbackQuery, state: FSMContext, svc: SchedulerService
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return
 
-    if "reader" not in info.professions:
-        await call.answer("❌ Слоти доступні тільки для акаунтів з reader", show_alert=True)
-        return
+    ok, reader_data = await svc.get_reader_state(acc_id)
+    params = reader_data.get("reading_params", {})
 
-    res = EventDrivenScheduler.get_instance().ask_sync(
-        account_id=acc_id,
-        profession_id="reader",
-        intent="get_state",
-        data={},
-    )
-
-    if not res.approved:
-        await call.answer(f"❌ Не вдалося отримати стан: {res.reason}", show_alert=True)
-        return
-
-    slots_data = res.data.get("slots", [])
-    current = [s["name"] for s in slots_data]
-
-    await state.set_state(EditSlotsFSM.wait_slots)
+    await state.set_state(EditSlotsFSM.wait_limit)
     await state.update_data(acc_id=acc_id)
 
-    await call.message.answer(
-        f"🎰 <b>Слоти читача для {acc_id}</b>\n\n"
-        f"Поточні: <code>{', '.join(current) or 'немає'}</code>\n\n"
-        "Введи нові слоти через кому (наприклад: <code>card, scroll</code>):",
+    await call.message.answer(  # type: ignore[union-attr]
+        f"⚙️ <b>Параметри читання</b> для <code>{acc_id}</code>\n\n"
+        f"Поточні налаштування:\n"
+        f"  limit        = <b>{params.get('limit', 2)}</b>\n"
+        f"  include_tags = <b>{params.get('include_tags') or '—'}</b>\n"
+        f"  exclude_tags = <b>{params.get('exclude_tags') or '—'}</b>\n\n"
+        "Введіть нове <b>limit</b> (кількість глав за раз, ціле число):",
         reply_markup=cancel_add_kb(),
     )
     await call.answer()
 
 
-@router.message(EditSlotsFSM.wait_slots)
-async def fsm_slots_input(message: Message, state: FSMContext, svc: SchedulerService) -> None:
-    slots = [s.strip() for s in (message.text or "").split(",") if s.strip()]
-    if not slots:
-        await message.answer("❌ Введи хоча б один слот. Спробуй ще раз:", reply_markup=cancel_add_kb())
+@router.message(EditSlotsFSM.wait_limit)
+async def fsm_limit_input(message: Message, state: FSMContext, svc: SchedulerService) -> None:
+    text = (message.text or "").strip()
+    try:
+        limit = int(text)
+        if limit < 1:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введіть ціле число ≥ 1. Спробуйте ще раз:")
         return
 
+    await state.update_data(limit=limit)
+    await state.set_state(EditSlotsFSM.wait_include_tags)
+    await message.answer(
+        "Введіть <b>include_tags</b> через кому (або <code>-</code> щоб пропустити):\n\n"
+        "<i>Приклад: <code>shounen, fantasy</code></i>",
+        reply_markup=cancel_add_kb(),
+    )
+
+
+@router.message(EditSlotsFSM.wait_include_tags)
+async def fsm_include_tags_input(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    include_tags = None if text == "-" else [t.strip() for t in text.split(",") if t.strip()]
+    await state.update_data(include_tags=include_tags)
+    await state.set_state(EditSlotsFSM.wait_exclude_tags)
+    await message.answer(
+        "Введіть <b>exclude_tags</b> через кому (або <code>-</code> щоб пропустити):\n\n"
+        "<i>Приклад: <code>ecchi, harem</code></i>",
+        reply_markup=cancel_add_kb(),
+    )
+
+
+@router.message(EditSlotsFSM.wait_exclude_tags)
+async def fsm_exclude_tags_input(message: Message, state: FSMContext, svc: SchedulerService) -> None:
+    text = (message.text or "").strip()
+    exclude_tags = None if text == "-" else [t.strip() for t in text.split(",") if t.strip()]
+
     data   = await state.get_data()
-    acc_id = data.get("acc_id", "")
+    acc_id: str                  = data["acc_id"]
+    limit:  int                  = data["limit"]
+    include = data.get("include_tags")
     await state.clear()
 
-    if svc.update_reader_slots(acc_id, slots):
+    ok = await svc.update_reading_params(
+        acc_id,
+        limit        = limit,
+        include_tags = include,
+        exclude_tags = exclude_tags,
+    )
+
+    if ok:
         await message.answer(
-            f"✅ Слоти оновлено: <code>{', '.join(slots)}</code>\n"
-            "Зміни вступлять в силу після наступного циклу читання."
+            f"✅ <b>Параметри читання оновлено</b>\n"
+            f"  limit        = <b>{limit}</b>\n"
+            f"  include_tags = <b>{include or '—'}</b>\n"
+            f"  exclude_tags = <b>{exclude_tags or '—'}</b>"
         )
     else:
-        await message.answer("❌ Не вдалося оновити слоти — акаунт або reader inventory не знайдено")
+        await message.answer("❌ Не вдалося оновити параметри. Перевірте лог.")

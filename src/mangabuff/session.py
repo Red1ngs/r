@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import threading
 from typing import Any, Dict, Generator, Optional
 from urllib.parse import unquote
@@ -153,7 +154,7 @@ class BotTransport:
         self.headers       = RequestHeaders(bot_config)
         self.client:       Optional[httpx.Client] = None
         self.saved_cookies = httpx.Cookies()
-        self._rate_limiter = RateLimiter(min_interval=2.0)
+        self._rate_limiter = RateLimiter(min_interval=random.uniform(1.0, 3.0))  # Виправлення: додано випадковий інтервал між 1 і 3 секундами
 
         self._create_client()
 
@@ -410,6 +411,26 @@ class BotSession(BotTransport):
             return None
         except Exception:
             return None
+        
+    def claim_candy(self, token: str) -> tuple[bool, dict[str, Any]]:
+        try:
+            url = self.reader.parsing.url_candy_claim
+            r = self.post(url, data={"token": token}, timeout=15)
+            if r.status_code == 200:
+                if r.content:
+                    log().info("  → цукерка отримана")
+                    return True, r.json()
+                # Сервер повернув 200 але без контенту (OK)
+                log().info("  → цукерка отримана (порожня відповідь)")
+                return True, {}
+            if r.content:
+                log().warning(f"  → claim_candy: {r.status_code} {r.json().get('message', '')}")
+                return False, r.json()
+            log().warning(f"  → claim_candy: {r.status_code} (без контенту)")
+            return False, {}
+        except Exception as e:
+            log().error(f"  → claim_candy error: {e}")
+            return False, {}
 
     def fetch_manga_catalog(self, page: int = 1) -> Optional[str]:
         try:

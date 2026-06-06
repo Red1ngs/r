@@ -3,30 +3,40 @@ reader:
   update_interval_days: 1
 
   parsing:
-    url_catalog:        "/manga"
-    url_chapters:       "/manga/{translit_name}"
-    url_chapters_load:  "/chapters/load"
-    reward_selector:    ".reward-item"
-    reward_type_attr:   "data-reward-type"
-    reward_id_attr:     "data-reward-id"
+    url_catalog:       "/manga"
+    url_chapters:      "/manga/{translit_name}"
+    url_chapters_load: "/chapters/load"
+    url_candy_claim:   "/halloween/takeCandy?r=822"
+    reward_selector:   ".reward-item"
+    reward_type_attr:  "data-reward-type"
+    reward_id_attr:    "data-reward-id"
 
   reward_slots:
     - name:             "card"
       daily_limit:      10
-      interval_seconds: 5400      # затримка після отримання картки
+      interval_seconds: 5400
       reward_keys:      ["id", "name", "image"]
 
     - name:             "scroll"
-      daily_limit:      3
-      interval_seconds: 1800      # затримка після отримання свитку
-      reward_keys:      ["scroll", "rank", "is_blessed"]
+      daily_limit:      5
+      interval_seconds: 1800
+      reward_keys:      ["scroll_id"]
 
-  reading_mode:
-    mode:              "standard"
-    read_interval_s:   5400       # fallback: слот готовий одразу або всі закриті
-    event_interval_s:  120
-    card_slot:         "card"
-    scroll_slot:       "scroll"
+    - name:             "candy"
+      daily_limit:      20
+      interval_seconds: 120
+      reward_keys:      ["token", "type"]
+
+  reading_modes:
+    standard:
+      slots:               ["card", "scroll"]
+      fallback_interval_s: 5400
+
+    event:
+      slots:               ["candy", "card", "scroll"]
+      fallback_interval_s: 5400
+
+  default_mode: "event"
 
 daily:
   url_balance:        "/balance"

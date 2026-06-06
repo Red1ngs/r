@@ -34,7 +34,6 @@ from src.mangabuff.farmer.parsers import parse_catalog, CATALOG_PAGE_SIZE
 if TYPE_CHECKING:
     from src.core.account import Account
     from src.core.runtime.request_router import RequestContext
-    from src.core.runtime.schedule import TriggerProtocol
 
 log = logging.getLogger(__name__)
 
@@ -50,42 +49,54 @@ def _parse_catalog_page(bot: "Account") -> list[str]:
     inv = bot.inventory.catalog_loader  # type: ignore[attr-defined]
     page = inv.catalog_page
 
+    # 1. Завантажуємо HTML сторінки
     html = bot.session.fetch_manga_catalog(page=page)
     if not html:
         log.warning(f"[{bot.account_id}] CatalogLoader: каталог недоступний (сторінка {page})")
         return []
 
+    # 2. Парсимо манги зі сторінки
     mangas = parse_catalog(html)
     if not mangas:
         log.info(f"[{bot.account_id}] CatalogLoader: сторінка {page} порожня → скидаємо на 1")
         inv.catalog_page = 1
         return []
 
-    # Фікс #5: data_id унікальні в межах однієї сторінки через dict[int, Manga]
-    # (parse_catalog вже повертає dict, де ключ — data_id)
-    seen: set[int] = set()
     translits: list[str] = []
 
+    # 3. Зберігаємо результати та дедуплікуємо (через dict ключ data_id)
+    existing_ids = bot.repo.mangas.get_existing_data_ids(list(mangas.keys()))
     for data_id, manga in mangas.items():
-        if data_id in seen:
+        # Зберігаємо мангу в БД (якщо вже є — оновиться)
+        if data_id in existing_ids:
             continue
-        seen.add(data_id)
-        # Зберігаємо мангу в БД одразу (без глав — глави парсить MangaLoader)
         bot.repo.mangas.upsert(
-             data_id, manga.translit_name, manga.name,
-             manga.rating or "", manga.info or "", manga.image or "",
-         )
+            data_id, 
+            manga.translit_name, 
+            manga.name,
+            manga.rating or "", 
+            manga.info or "", 
+            manga.image or "",
+        )
         translits.append(manga.translit_name)
 
-    # Наступна сторінка = загальна кількість манг в БД / CATALOG_PAGE_SIZE
+    # 4. ЛОГІКА ОКРУГЛЕННЯ ВГОРУ ДЛЯ НАСТУПНОЇ СТОРІНКИ
+    # Дізнаємося загальну кількість манг у базі після оновлення
     total_mangas = bot.repo.mangas.count()
-    next_page = max(1, total_mangas // CATALOG_PAGE_SIZE)
+    
+    # Визначаємо, яку сторінку парсити наступного разу:
+    # 0-29 манг  -> сторінка 1
+    # 30-59 манг -> сторінка 2
+    # 60+ манг   -> сторінка 3
+    inv.catalog_page = (total_mangas // CATALOG_PAGE_SIZE) + 1
 
-    inv.catalog_page = next_page
     log.info(
-        f"[{bot.account_id}] CatalogLoader: сторінка {page} → "
-        f"{len(translits)} манг, total_in_db={total_mangas}, наступна сторінка={next_page}"
+        f"[{bot.account_id}] CatalogLoader: оброблено сторінку {page} → "
+        f"отримано {len(translits)} манг. "
+        f"В базі всього: {total_mangas}. "
+        f"Наступна сторінка для парсингу: {inv.catalog_page}"
     )
+
     return translits
 
 
@@ -127,9 +138,6 @@ class CatalogLoaderProfession(BaseProfession):
 
     async def teardown(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
         pass
-
-    def build_triggers(self, account_id: str) -> list["TriggerProtocol"]:
-        return []
 
     def check_guard(self, bot: "Account") -> bool:
         return not bool(bot.inventory.personal.data.get("is_banned"))

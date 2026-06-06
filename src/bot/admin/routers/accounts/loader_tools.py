@@ -1,10 +1,5 @@
 """
 accounts/loader_tools.py
-
-Інструменти для catalog_loader та manga_loader професій:
-  • Скидання сторінки каталогу (reset_catalog_page)
-
-Пункти меню реєструються автоматично через ProfessionMenuRegistry.
 """
 from __future__ import annotations
 
@@ -43,7 +38,7 @@ async def cb_reset_catalog_page(
         await call.answer("❌ Доступно тільки для catalog_loader", show_alert=True)
         return
 
-    ok, err = svc.reset_catalog_page(acc_id)
+    ok, err = await svc.reset_catalog_page(acc_id)
     if ok:
         await call.answer("✅ Сторінку каталогу скинуто на 1", show_alert=True)
     else:

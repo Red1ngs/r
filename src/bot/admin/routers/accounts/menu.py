@@ -1,7 +1,5 @@
 """
 accounts/menu.py
-
-Меню конкретного акаунта: перегляд, пауза, відновлення, видалення.
 """
 from __future__ import annotations
 
@@ -23,7 +21,7 @@ async def _redraw(call: CallbackQuery, svc: SchedulerService, acc_id: str) -> No
     if info:
         await call.message.edit_text(  # type: ignore[union-attr]
             account_text(info),
-            reply_markup=account_menu_kb(acc_id, info.status, list(info.professions)),
+            reply_markup=account_menu_kb(acc_id, info.status, list(info.professions), info.is_connected),
         )
 
 
@@ -38,7 +36,7 @@ async def cb_menu(call: CallbackQuery, svc: SchedulerService) -> None:
         return
     await call.message.edit_text(  # type: ignore[union-attr]
         account_text(info),
-        reply_markup=account_menu_kb(acc_id, info.status, list(info.professions)),
+        reply_markup=account_menu_kb(acc_id, info.status, list(info.professions), info.is_connected),
     )
     await call.answer()
 
@@ -52,7 +50,7 @@ async def cb_refresh(call: CallbackQuery, svc: SchedulerService) -> None:
         return
     await call.message.edit_text(  # type: ignore[union-attr]
         account_text(info),
-        reply_markup=account_menu_kb(acc_id, info.status, list(info.professions)),
+        reply_markup=account_menu_kb(acc_id, info.status, list(info.professions), info.is_connected),
     )
     await call.answer("🔄 Оновлено")
 
@@ -75,6 +73,31 @@ async def cb_resume(call: CallbackQuery, svc: SchedulerService) -> None:
     await call.answer("▶️ Відновлено" if ok else "❌ Не вдалось", show_alert=not ok)
     if ok:
         await _redraw(call, svc, acc_id)
+
+
+# ── Підключення / відключення сесії ────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("acc:connect:"))
+async def cb_connect(call: CallbackQuery, svc: SchedulerService) -> None:
+    acc_id = call.data.split(":", 2)[2]
+    await call.answer("⏳ Підключаємо…")
+    ok = svc.connect_account(acc_id)
+    if not ok:
+        bot = svc.get_bot(acc_id)
+        err = getattr(bot, "error", "невідома помилка") if bot else "акаунт не знайдено"
+        await call.message.answer(  # type: ignore[union-attr]
+            f"❌ Не вдалось підключити <code>{acc_id}</code>:\n{err}",
+            parse_mode="HTML",
+        )
+    await _redraw(call, svc, acc_id)
+
+
+@router.callback_query(F.data.startswith("acc:disconnect:"))
+async def cb_disconnect(call: CallbackQuery, svc: SchedulerService) -> None:
+    acc_id = call.data.split(":", 2)[2]
+    svc.disconnect_account(acc_id)
+    await call.answer("🔌 Відключено")
+    await _redraw(call, svc, acc_id)
 
 
 # ── Видалення ─────────────────────────────────────────────────────────────────

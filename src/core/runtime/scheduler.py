@@ -1,18 +1,12 @@
 """
 scheduler.py — EventDrivenScheduler. Єдиний Scheduler в системі.
 
-Зміни відносно попередньої версії:
-  1. add_profession_to_account():
-       — резервує слот під lock (container.add_profession з [] triggers)
-         щоб усунути race condition між двома паралельними викликами.
-       — передає profession_priority в _setup_single_profession.
-  2. remove_profession_from_account():
-       — замість container.worker.clear() викликає worker.clear_profession()
-         щоб не знищувати задачі інших profession.
-  3. _setup_professions / _setup_single_profession:
-       — обчислює ProfessionPriority за індексом profession у списку.
-       — передає його в trigger.producer і tag_profession для задач.
-  4. FLIGHT_TIMEOUT знижено до 300 s (з 3600).
+Зміни:
+  - Повністю видалено Tasks, BotWorker, ProfessionPriority та чергу задач.
+  - Повністю прибрано тригери.
+  - Управління AccountMonitors інтегровано у життєвий цикл ядра.
+  - Призупинення акаунта (pause_account) відключає сесію акаунта та монітори,
+    а відновлення (resume_account) — поновлює підключення та запускає монітори.
 """
 from __future__ import annotations
 
@@ -21,37 +15,33 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
+from src.core.monitoring.monitor import BaseMonitor
+from src.core.monitoring.account_monitors import AccountMonitors
+
 if TYPE_CHECKING:
     from src.core.runtime.profession import BaseProfession
 
 from src.core.account import Account
-from src.core.inventory.model import Inventories
+from src.core.inventory.model import DynamicInventories as Inventories
 from src.core.logging.loggers import get_scheduler_logger
 from src.core.runtime.event_bus import EventBus, EventCallback
 from src.core.runtime.request_router import RequestContext, RequestRouter
 from src.core.runtime.conditions import Condition
-from src.core.runtime.profession import BaseProfession
-from src.core.runtime.schedule import RunAt, TriggerProtocol
+from src.core.runtime.profession import BaseProfession, RequestResult
 from src.core.status import AccountStatus
-from src.core.tasks.base import AnyTask, ProfessionPriority, tag_profession
-from src.core.worker import BotWorker
 
 log = get_scheduler_logger()
 
-_MAX_SLEEP = 30.0
-_MIN_SLEEP = 0.5
-
+# Маппінг: яку profession активувати → які монітори підключити.
+_PROFESSION_MONITORS: dict[str, list[str]] = {
+    "reader":  ["reading"],
+    "quiz":    ["quiz"],
+}
 
 def _split_evenly(items: list[Any], n: int) -> list[list[Any]]:
-    """
-    Ділить items на n рівних частин (остання може бути меншою).
-
-        _split_evenly([1,2,3,4,5], 3)  →  [[1,2], [3,4], [5]]
-        _split_evenly([1,2], 5)        →  [[1], [2], [], [], []]
-    """
     if n <= 0:
         return []
-    size = max(1, -(-len(items) // n))   # ceil division
+    size = max(1, -(-len(items) // n))
     return [items[i: i + size] for i in range(0, len(items), size)]
 
 
@@ -59,114 +49,38 @@ def _split_evenly(items: list[Any], n: int) -> list[list[Any]]:
 class AccountContainer:
     """
     Контейнер стану одного акаунта в Scheduler.
-
-    professions: dict[BaseProfession, list[TriggerProtocol]]
-        Ключ — profession об'єкт, значення — її тригери.
-        Порядок dict (insertion order) = пріоритет:
-          перший вставлений → PRIMARY, другий → SECONDARY, решта → BACKGROUND.
     """
-    worker:      BotWorker
-    guard:       Optional[Condition] = None
-    professions: dict["BaseProfession", list[TriggerProtocol]] = field(
-        default_factory=dict, init=False, repr=False
+    bot: Account
+    guard: Optional[Condition] = None
+
+    professions: dict[str, BaseProfession] = field(
+        default_factory=dict
     )
-    # Trigger-об'єкти збережені при pause(); None = акаунт не паузований.
-    _suspended_triggers: Optional[dict["BaseProfession", list[TriggerProtocol]]] = field(
-        default=None, init=False, repr=False
+
+    monitors: dict[str, BaseMonitor] = field(
+        default_factory=dict
     )
 
     def check_account_guard(self, inv: Inventories) -> bool:
         return self.guard is None or self.guard(inv)
 
-    # ── Triggers ──────────────────────────────────────────────────────────────
+    def add_profession(self, profession: "BaseProfession") -> None:
+        self.professions[profession.profession_id] = profession
 
-    @property
-    def triggers(self) -> list[TriggerProtocol]:
-        return [t for ts in self.professions.values() for t in ts]
+    def remove_profession(self, profession: "BaseProfession") -> None:
+        self.professions.pop(profession.profession_id, None)
 
-    def add_profession(
-        self,
-        profession: "BaseProfession",
-        triggers:   list[TriggerProtocol],
-    ) -> None:
-        self.professions[profession] = list(triggers)
-
-    def remove_profession(self, profession: "BaseProfession") -> int:
-        removed = self.professions.pop(profession, [])
-        return len(removed)
-
-    def remove_profession_by_id(self, profession_id: str) -> int:
-        target = next(
-            (p for p in self.professions if p.profession_id == profession_id), None
-        )
-        if target is None:
-            return 0
-        return self.remove_profession(target)
-
-    def remove_trigger(self, trigger: TriggerProtocol) -> None:
-        for ts in self.professions.values():
-            try:
-                ts.remove(trigger)
-                return
-            except ValueError:
-                continue
-
-    def remove_all_triggers(self) -> None:
-        for ts in self.professions.values():
-            ts.clear()
-            
-    def suspend_triggers(self) -> "dict[BaseProfession, list[TriggerProtocol]]":
-        """
-        Зберігає trigger-об'єкти і очищає списки (для pause).
-        trigger._next_fire залишається в об'єкті — resume відновить таймер точно.
-        """
-        snapshot: dict["BaseProfession", list[TriggerProtocol]] = {}
-        for profession, triggers in self.professions.items():
-            snapshot[profession] = list(triggers)
-            triggers.clear()
-        return snapshot
-
-    def restore_triggers(
-        self,
-        snapshot: "dict[BaseProfession, list[TriggerProtocol]]",
-    ) -> None:
-        """
-        Відновлює trigger-об'єкти збережені suspend_triggers().
-        Працює лише для profession що ще присутні в dict (за identity).
-        """
-        for profession, triggers in snapshot.items():
-            if profession in self.professions:
-                self.professions[profession] = list(triggers)
+    def remove_profession_by_id(self, profession_id: str) -> None:
+        self.professions.pop(profession_id, None)
 
     def get_profession(self, profession_id: str) -> Optional["BaseProfession"]:
-        return next(
-            (p for p in self.professions if p.profession_id == profession_id), None
-        )
+        return self.professions.get(profession_id)
 
     def has_profession(self, profession_id: str) -> bool:
-        return any(p.profession_id == profession_id for p in self.professions)
+        return profession_id in self.professions
 
     def profession_list(self) -> list["BaseProfession"]:
-        return list(self.professions.keys())
-
-    def profession_priority(self, profession: "BaseProfession") -> ProfessionPriority:
-        """Повертає ProfessionPriority за позицією у dict (insertion order)."""
-        for idx, p in enumerate(self.professions):
-            if p is profession:
-                return ProfessionPriority.from_index(idx)
-        return ProfessionPriority.BACKGROUND
-
-    # ── Timing ────────────────────────────────────────────────────────────────
-
-    def trigger_names(self) -> list[str]:
-        return [t.name for t in self.triggers]
-
-    def next_trigger_in(self) -> float:
-        finite = [
-            s for t in self.triggers
-            if (s := t.seconds_until()) != float("inf")
-        ]
-        return min(finite) if finite else _MAX_SLEEP
+        return list(self.professions.values())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,22 +129,14 @@ class EventDrivenScheduler:
     def _init(self, on_dead: Optional[Callable[[Account], None]]) -> None:
         self._on_dead = on_dead
 
-        self._containers:    dict[str, AccountContainer] = {}
+        self._containers:  dict[str, AccountContainer] = {}
         self._lock        = threading.Lock()
-        self._stop        = threading.Event()
-        self._wakeup      = threading.Event()
-        self._monitor     = threading.Thread(
-            target=self._monitor_loop,
-            daemon=True,
-            name="scheduler-monitor",
-        )
+        self._monitors:    dict[str, AccountMonitors] = {}
 
         self._event_bus    = EventBus()
         self._router       = RequestRouter()
         self._async_loop:  Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
-        # Глобальний лок: тільки один LoaderProfession парсить одночасно.
-        # Ініціалізується ліниво в async-петлі (asyncio.Lock прив'язаний до loop).
         self._loading_lock: Optional[asyncio.Lock] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -243,16 +149,9 @@ class EventDrivenScheduler:
             name="scheduler-async",
         )
         self._loop_thread.start()
-        self._monitor.start()
         log.info("EventDrivenScheduler started")
 
     def stop(self) -> None:
-        self._stop.set()
-        self._wakeup.set()
-
-        if self._monitor.is_alive():
-            self._monitor.join(timeout=10)
-
         if self._async_loop and self._async_loop.is_running():
             self._async_loop.call_soon_threadsafe(self._async_loop.stop)
         if self._loop_thread and self._loop_thread.is_alive():
@@ -261,14 +160,68 @@ class EventDrivenScheduler:
         with self._lock:
             entries = dict(self._containers)
         for entry in entries.values():
-            entry.worker.stop()
+            entry.bot.disconnect()
 
         log.info("EventDrivenScheduler stopped")
 
     def _run_async_loop(self) -> None:
         asyncio.set_event_loop(self._async_loop)
-        self._loading_lock = asyncio.Lock()   # створюємо в петлі, якій належить
+        self._loading_lock = asyncio.Lock()
         self._async_loop.run_forever()
+
+    # ── Monitors management (internal) ────────────────────────────────────────
+
+    def _get_or_create_monitors(self, account_id: str) -> AccountMonitors:
+        if account_id not in self._monitors:
+            self._monitors[account_id] = AccountMonitors(account_id)
+        return self._monitors[account_id]
+
+    def _attach_monitors_for(self, account_id: str, profession_name: str) -> None:
+        """Підключає монітори, що відповідають вказаній profession."""
+        monitor_ids = _PROFESSION_MONITORS.get(profession_name, [])
+        if not monitor_ids:
+            return
+
+        monitors = self._get_or_create_monitors(account_id)
+        loop = self._async_loop
+        if loop is None or not loop.is_running():
+            return
+        import asyncio
+        asyncio.run_coroutine_threadsafe(
+            monitors.attach_all(self, monitor_ids), loop
+        )
+
+    def _detach_monitor_if_unused(self, account_id: str, monitor_id: str) -> None:
+        """Відключає монітор, якщо жодна з активних професій його більше не потребує."""
+        owners = [
+            prof for prof, mids in _PROFESSION_MONITORS.items()
+            if monitor_id in mids
+        ]
+        if any(self.has_profession(account_id, p) for p in owners):
+            return
+        monitors = self._monitors.get(account_id)
+        if monitors is None:
+            return
+        loop = self._async_loop
+        if loop is None or not loop.is_running():
+            return
+        import asyncio
+        asyncio.run_coroutine_threadsafe(
+            monitors.detach(self, monitor_id), loop
+        )
+
+    def _detach_all_monitors(self, account_id: str) -> None:
+        """Відключає всі монітори акаунта (при видаленні або паузі)."""
+        monitors = self._monitors.pop(account_id, None)
+        if monitors is None:
+            return
+        loop = self._async_loop
+        if loop is None or not loop.is_running():
+            return
+        import asyncio
+        asyncio.run_coroutine_threadsafe(
+            monitors.detach_all(self), loop
+        )
 
     # ── Account management ────────────────────────────────────────────────────
 
@@ -279,15 +232,12 @@ class EventDrivenScheduler:
         professions: list["BaseProfession"],
         guard:       Optional[Condition] = None,
     ) -> None:
-        worker    = BotWorker(bot, on_error=lambda b: self._wakeup.set())
-        container = AccountContainer(worker=worker, guard=guard)
+        container = AccountContainer(bot=bot, guard=guard)
 
         with self._lock:
             if account_id in self._containers:
                 raise ValueError(f"Акаунт {account_id!r} вже існує")
             self._containers[account_id] = container
-
-        worker.start()
 
         if bot.status == AccountStatus.DEAD:
             with self._lock:
@@ -297,8 +247,42 @@ class EventDrivenScheduler:
             return
 
         self._run_async(self._setup_professions(account_id, bot, professions))
-        self._wakeup.set()
         log.info(f"[{account_id}] додано ({len(professions)} professions)")
+
+    def connect_account(self, account_id: str) -> bool:
+        """
+        Встановлює сесію і підключає монітори.
+
+        Пара до add_account(): той реєструє акаунт і піднімає профессії,
+        цей — викликає bot.connect() і лише після успіху чіпляє монітори.
+
+        Повертає True при успіху. При невдачі акаунт залишається
+        зареєстрованим, монітори не підключаються.
+        """
+        with self._lock:
+            container = self._containers.get(account_id)
+        if container is None:
+            log.warning(f"[{account_id}] connect_account: акаунт не знайдено")
+            return False
+
+        if container.bot.is_connected:
+            log.debug(f"[{account_id}] connect_account: вже підключено")
+            self._attach_all_monitors(account_id, container)
+            return True
+
+        ok = container.bot.connect()
+        if not ok:
+            log.error(f"[{account_id}] connect_account: connect() провалився — {container.bot.error}")
+            return False
+
+        self._attach_all_monitors(account_id, container)
+        log.info(f"[{account_id}] connect_account: підключено, монітори активні")
+        return True
+
+    def _attach_all_monitors(self, account_id: str, container: "AccountContainer") -> None:
+        """Чіпляє монітори для всіх активних profession контейнера."""
+        for profession in container.profession_list():
+            self._attach_monitors_for(account_id, profession.profession_id)
 
     def remove_account(self, account_id: str) -> bool:
         with self._lock:
@@ -309,60 +293,47 @@ class EventDrivenScheduler:
         professions = entry.profession_list()
         self._run_async(self._teardown_professions(account_id, professions))
         self._router.unregister_account(account_id)
-        entry.remove_all_triggers()
-        entry.worker.stop()
+        self._detach_all_monitors(account_id)
         log.info(f"[{account_id}] видалено")
         return True
 
     def pause_account(self, account_id: str) -> bool:
         with self._lock:
             container = self._containers.get(account_id)
-        if container is None or container.worker.bot.status == AccountStatus.SUSPENDED:
+        if container is None or container.bot.status == AccountStatus.SUSPENDED:
             return False
-        container.worker.clear()
-        # Зберігаємо trigger-об'єкти з їх _next_fire — щоб resume міг відновити
-        # таймери точно без скидання (не створювати нові об'єкти).
-        # EventBus підписки НЕ знімаємо — вони живуть весь час pause.
-        container._suspended_triggers = container.suspend_triggers()
-        container.worker.bot.status = AccountStatus.SUSPENDED
-        container.worker.stop()
+        
+        # Відключаємо монітори на час паузи
+        self._detach_all_monitors(account_id)
+
+        container.bot.status = AccountStatus.SUSPENDED
+        container.bot.disconnect()  # Закриваємо активне мережеве з'єднання
         log.info(f"[{account_id}] призупинено")
         return True
 
     def resume_account(self, account_id: str) -> bool:
         with self._lock:
             container = self._containers.get(account_id)
-        if container is None or container.worker.bot.status != AccountStatus.SUSPENDED:
+        if container is None or container.bot.status != AccountStatus.SUSPENDED:
             return False
 
-        container.worker.bot.status = AccountStatus.IDLE
-        container.worker.start()
+        container.bot.status = AccountStatus.IDLE
+        
+        if not container.bot.is_connected:
+            container.bot.connect()
 
-        if container.worker.bot.status == AccountStatus.DEAD:
+        if container.bot.status == AccountStatus.DEAD:
             log.error(f"[{account_id}] resume: connect() провалився")
             return False
 
-        # Відновлюємо trigger-об'єкти що були збережені при pause.
-        # Ті самі об'єкти → _next_fire зберігається → таймери не скидаються.
-        # EventBus підписки не чіпаємо — вони живі весь час.
-        suspended = getattr(container, "_suspended_triggers", None)
-        if suspended is not None:
-            container.restore_triggers(suspended)
-            container._suspended_triggers = None
-            self._run_async(
-                self._resume_restore_state(account_id, container.worker.bot, container)
+        # Повноцінно відновлюємо професії та запускаємо монітори заново
+        professions = container.profession_list()
+        self._run_async(
+            self._restore_professions(
+                account_id, container.bot, professions, container
             )
-        else:
-            # Холодний resume (немає snapshot — наприклад після рестарту процесу):
-            # повна реініціалізація через setup() + build_triggers().
-            professions = container.profession_list()
-            self._run_async(
-                self._restore_professions(
-                    account_id, container.worker.bot, professions, container
-                )
-            )
+        )
 
-        self._wakeup.set()
         log.info(f"[{account_id}] відновлено")
         return True
 
@@ -373,14 +344,6 @@ class EventDrivenScheduler:
         account_id: str,
         profession: "BaseProfession",
     ) -> None:
-        """
-        Динамічно додає profession до активного акаунта.
-
-        Race condition protection:
-          Резервуємо слот під lock (add_profession з порожнім списком triggers)
-          перед тим як запустити async setup. Повторний виклик з тим самим
-          profession_id буде відхилено has_profession() ще під lock.
-        """
         with self._lock:
             container = self._containers.get(account_id)
             if container is None:
@@ -390,61 +353,38 @@ class EventDrivenScheduler:
                     f"[{account_id}] profession {profession.profession_id!r} вже зареєстрована"
                 )
                 return
-            # Резервуємо слот — async setup заповнить triggers пізніше
-            container.add_profession(profession, [])
-
-        # Визначаємо пріоритет на основі поточної позиції у dict
-        prof_priority = container.profession_priority(profession)
+            container.add_profession(profession)
 
         self._run_async(
             self._setup_single_profession(
-                account_id, container.worker.bot, profession, container, prof_priority
+                account_id, container.bot, profession, container
             )
         )
 
     async def _setup_single_profession(
         self,
-        account_id:    str,
-        bot:           Account,
-        profession:    "BaseProfession",
-        container:     AccountContainer,
-        prof_priority: ProfessionPriority,
+        account_id: str,
+        bot:        Account,
+        profession: "BaseProfession",
+        container:  AccountContainer,
     ) -> None:
         try:
             await profession.setup(self, account_id)
             self._router.register(account_id, profession)
 
-            raw_triggers = profession.build_triggers(account_id)
             await profession.restore_state(bot)
 
-            # Оновлюємо triggers у вже зарезервованому слоті
-            container.professions[profession] = list(raw_triggers)
-
-            tasks = profession.startup_tasks(bot)
-            if tasks:
-                # Теґуємо задачі profession і коригуємо priority
-                _apply_profession_priority(tasks, profession.profession_id, prof_priority)
-                container.worker.assign(*tasks)
-
-            self._wakeup.set()
-            log.info(
-                f"[{account_id}] dynamic setup {profession.profession_id!r} complete"
-                f" (priority={prof_priority.name})"
-            )
+            self._attach_monitors_for(account_id, profession.profession_id)
+            log.info(f"[{account_id}] dynamic setup {profession.profession_id!r} complete")
         except Exception as e:
-            # Відкочуємо зарезервований слот при помилці setup
             with self._lock:
-                container.professions.pop(profession, None)
+                container.professions.pop(profession.profession_id, None)
             log.error(
                 f"[{account_id}] dynamic setup {profession.profession_id!r} failed: {e}",
                 exc_info=True,
             )
 
     def remove_profession_from_account(self, account_id: str, profession_id: str) -> None:
-        """
-        Видаляє profession з акаунта.
-        Видаляє ТІЛЬКИ задачі цієї profession з черги (не торкається інших).
-        """
         profession_obj: Optional["BaseProfession"] = None
         with self._lock:
             container = self._containers.get(account_id)
@@ -453,40 +393,16 @@ class EventDrivenScheduler:
                 container.remove_profession_by_id(profession_id)
 
         if profession_obj is not None:
-            # Вибіркове очищення черги — тільки задачі цієї profession
-            if container is not None:
-                container.worker.clear_profession(profession_id)
             self._run_async(self._teardown_professions(account_id, [profession_obj]))
+
+        # Відключаємо монітори цієї profession, якщо вони більше не використовуються
+        for monitor_id in _PROFESSION_MONITORS.get(profession_id, []):
+            self._detach_monitor_if_unused(account_id, monitor_id)
 
         self._router.unregister(account_id, profession_id)
         log.info(f"[{account_id}] profession {profession_id!r} dynamically removed")
 
     # ── Public API ────────────────────────────────────────────────────────────
-
-    def wakeup(self) -> None:
-        self._wakeup.set()
-
-    def reschedule_trigger(self, account_id: str, trigger_name: str, run_at: RunAt) -> bool:
-        with self._lock:
-            container = self._containers.get(account_id)
-        if not container:
-            return False
-        for trigger in list(container.triggers):
-            if trigger.name == trigger_name:
-                trigger.reschedule(run_at)
-                log.info(f"[{account_id}] Тригер {trigger_name!r} перенесено на {run_at}")
-                self._wakeup.set()
-                return True
-        log.warning(f"[{account_id}] Тригер {trigger_name!r} не знайдено")
-        return False
-
-    def push_task(self, account_id: str, task: AnyTask) -> bool:
-        with self._lock:
-            entry = self._containers.get(account_id)
-        if entry is None:
-            return False
-        entry.worker.assign(task)
-        return True
 
     def has_account(self, account_id: str) -> bool:
         with self._lock:
@@ -500,7 +416,7 @@ class EventDrivenScheduler:
     def get_bot(self, account_id: str) -> Optional[Account]:
         with self._lock:
             container = self._containers.get(account_id)
-        return container.worker.bot if container else None
+        return container.bot if container else None
 
     def get_entry(self, account_id: str) -> Optional[AccountContainer]:
         with self._lock:
@@ -511,7 +427,6 @@ class EventDrivenScheduler:
             return list(self._containers.keys())
 
     def get_accounts_with_profession(self, profession_id: str) -> list[str]:
-        """Повертає account_id усіх акаунтів що мають активну вказану професію."""
         with self._lock:
             return [
                 account_id
@@ -529,24 +444,6 @@ class EventDrivenScheduler:
         caller:        str   = "system",
         timeout:       float = 30.0,
     ) -> int:
-        """
-        Рівномірно розподіляє items між усіма акаунтами з вказаною професією.
-
-        Знаходить N воркерів → ділить items на N рівних частин →
-        надсилає кожному ask(profession_id, intent, {item_key: chunk}).
-
-        Повертає кількість воркерів яким надіслано завдання.
-        Якщо воркерів немає — логує warning і повертає 0.
-
-        Приклад:
-            dispatched = await scheduler.dispatch_work(
-                profession_id = "manga_loader",
-                intent        = "load_batch",
-                items         = translits,
-                item_key      = "translits",
-                caller        = self._account_id,
-            )
-        """
         workers = self.get_accounts_with_profession(profession_id)
         if not workers:
             log.warning(
@@ -576,30 +473,14 @@ class EventDrivenScheduler:
     def status(self, account_id: str) -> Optional[AccountStatus]:
         with self._lock:
             entry = self._containers.get(account_id)
-        return entry.worker.bot.status if entry else None
+        return entry.bot.status if entry else None
 
     def all_statuses(self) -> dict[str, AccountStatus]:
         with self._lock:
             entries = dict(self._containers)
-        return {aid: e.worker.bot.status for aid, e in entries.items()}
-
-    def queue_size(self, account_id: str) -> Optional[int]:
-        with self._lock:
-            entry = self._containers.get(account_id)
-        return entry.worker.queue_size if entry else None
-
-    def trigger_names(self, account_id: str) -> list[str]:
-        with self._lock:
-            entry = self._containers.get(account_id)
-        return entry.trigger_names() if entry else []
-
-    def seconds_until_next(self, account_id: str) -> Optional[float]:
-        with self._lock:
-            entry = self._containers.get(account_id)
-        return entry.next_trigger_in() if entry else None
+        return {aid: e.bot.status for aid, e in entries.items()}
 
     def profession_names(self, account_id: str) -> list[str]:
-        """Список profession акаунта у порядку пріоритету."""
         with self._lock:
             entry = self._containers.get(account_id)
         if entry is None:
@@ -612,21 +493,14 @@ class EventDrivenScheduler:
         self._event_bus.subscribe(event_name, callback)
 
     async def try_acquire_loader_lock(self) -> bool:
-        """
-        Намагається захопити глобальний лок завантажувача (non-blocking).
-
-        Повертає True якщо лок захоплено — цей лоадер може парсити.
-        Повертає False якщо інший лоадер вже тримає лок — треба пропустити.
-        """
         if self._loading_lock is None:
-            return True   # async-петля ще не готова — дозволяємо як fallback
+            return True
         if self._loading_lock.locked():
             return False
         await self._loading_lock.acquire()
         return True
 
     async def release_loader_lock(self) -> None:
-        """Звільняє глобальний лок завантажувача."""
         if self._loading_lock is not None and self._loading_lock.locked():
             self._loading_lock.release()
 
@@ -647,47 +521,32 @@ class EventDrivenScheduler:
         return await self._event_bus.emit(event_name, payload, source=source)
 
     # ── RequestRouter API ─────────────────────────────────────────────────────
-
+    
     async def ask(
         self,
-        account_id:    str,
+        account_id: str,
         profession_id: str,
-        intent:        str,
-        data:          dict[str, Any],
+        intent: str,
+        data: dict[str, Any] | None = None,
         *,
-        caller:  str   = "system",
-        timeout: float = 30.0,
-    ) -> Any:
+        caller: str = "admin",
+        timeout: float = 60.0,
+    ) -> "RequestResult":
+        from src.core.runtime.profession import RequestResult
+
         bot = self.get_bot(account_id)
         if bot is None:
-            from src.core.runtime.profession import RequestResult
             return RequestResult.deny(f"account {account_id!r} not found")
-        ctx = RequestContext(
-            account_id=account_id,
-            profession_id=profession_id,
-            intent=intent,
-            caller=caller,
-            bot=bot,
-            timeout=timeout,
-        )
-        return await self._router.route(ctx, data)
 
-    def ask_sync(
-        self,
-        account_id:    str,
-        profession_id: str,
-        intent:        str,
-        data:          dict[str, Any],
-        *,
-        caller:  str   = "system",
-        timeout: float = 30.0,
-    ) -> Any:
-        future = asyncio.run_coroutine_threadsafe(
-            self.ask(account_id, profession_id, intent, data,
-                     caller=caller, timeout=timeout),
-            self._async_loop,
+        ctx = RequestContext(
+            account_id    = account_id,
+            profession_id = profession_id,
+            intent        = intent,
+            caller        = caller,
+            bot           = bot,
+            timeout       = timeout,
         )
-        return future.result(timeout=timeout + 1)
+        return await self._router.route(ctx, data or {})
 
     # ── Profession lifecycle (async) ──────────────────────────────────────────
 
@@ -702,57 +561,19 @@ class EventDrivenScheduler:
         if container is None:
             return
 
-        for idx, profession in enumerate(professions):
-            prof_priority = ProfessionPriority.from_index(idx)
+        for profession in professions:
             try:
                 await profession.setup(self, account_id)
                 self._router.register(account_id, profession)
 
-                triggers = profession.build_triggers(account_id)
                 await profession.restore_state(bot)
 
-                container.add_profession(profession, triggers)
+                container.add_profession(profession)
 
-                tasks = profession.startup_tasks(bot)
-                if tasks:
-                    _apply_profession_priority(tasks, profession.profession_id, prof_priority)
-                    container.worker.assign(*tasks)
-
-                log.info(
-                    f"[{account_id}] {profession.profession_id!r} ready"
-                    f" (priority={prof_priority.name})"
-                )
+                log.info(f"[{account_id}] {profession.profession_id!r} ready")
             except Exception as e:
                 log.error(
                     f"[{account_id}] setup {profession.profession_id!r} failed: {e}",
-                    exc_info=True,
-                )
-
-        self._wakeup.set()
-        
-    async def _resume_restore_state(
-        self,
-        account_id: str,
-        bot:        Account,
-        container:  AccountContainer,
-    ) -> None:
-        """
-        Гарячий resume після pause: відновлює лише in-memory state та стартові задачі.
-        НЕ викликає setup() (підписки EventBus живі) і НЕ будує нові triggers
-        (використовуються збережені об'єкти з коректним _next_fire).
-        """
-        for idx, profession in enumerate(container.profession_list()):
-            prof_priority = ProfessionPriority.from_index(idx)
-            try:
-                await profession.restore_state(bot)
-                tasks = profession.startup_tasks(bot)
-                if tasks:
-                    _apply_profession_priority(tasks, profession.profession_id, prof_priority)
-                    container.worker.assign(*tasks)
-                log.info(f"[{account_id}] {profession.profession_id!r} hot-resumed")
-            except Exception as e:
-                log.error(
-                    f"[{account_id}] hot-resume {profession.profession_id!r}: {e}",
                     exc_info=True,
                 )
 
@@ -763,20 +584,16 @@ class EventDrivenScheduler:
         professions: list["BaseProfession"],
         container:   AccountContainer,
     ) -> None:
-        for idx, profession in enumerate(professions):
-            prof_priority = ProfessionPriority.from_index(idx)
+        for profession in professions:
             try:
                 self._router.register(account_id, profession)
 
-                triggers = profession.build_triggers(account_id)
                 await profession.restore_state(bot)
 
-                container.add_profession(profession, triggers)
+                container.add_profession(profession)
 
-                tasks = profession.startup_tasks(bot)
-                if tasks:
-                    _apply_profession_priority(tasks, profession.profession_id, prof_priority)
-                    container.worker.assign(*tasks)
+                # Відновлюємо монітори
+                self._attach_monitors_for(account_id, profession.profession_id)
 
                 log.info(f"[{account_id}] {profession.profession_id!r} resumed")
             except Exception as e:
@@ -797,27 +614,14 @@ class EventDrivenScheduler:
             except Exception as e:
                 log.error(f"[{account_id}] teardown {profession.profession_id!r}: {e}")
 
-
-    # ── Monitor loop (sync) ───────────────────────────────────────────────────
-
-    def _monitor_loop(self) -> None:
-        while not self._stop.is_set():
-            self._wakeup.clear()
-            sleep = self._tick()
-            self._wakeup.wait(timeout=max(_MIN_SLEEP, min(sleep, _MAX_SLEEP)))
-
-    def _tick(self) -> float:
-        self._check_guards()
-        next_in = self._dispatch_triggers()
-        self._reap_dead_workers()
-        return next_in
+    # ── Guard loops ───────────────────────────────────────────────────────────
 
     def _check_guards(self) -> None:
         with self._lock:
             containers = dict(self._containers)
 
         for account_id, entry in containers.items():
-            bot = entry.worker.bot
+            bot = entry.bot
             inv = bot.inventory
 
             if not entry.check_account_guard(inv):
@@ -827,111 +631,38 @@ class EventDrivenScheduler:
 
             for profession in entry.profession_list():
                 if not profession.check_guard(bot):
-                    removed = entry.remove_profession(profession)
-                    # Тільки задачі цієї profession
-                    entry.worker.clear_profession(profession.profession_id)
+                    entry.remove_profession(profession)
                     log.info(
                         f"[{account_id}] {profession.profession_id!r} guard failed "
-                        f"→ {removed} triggers removed"
+                        f"→ profession removed"
                     )
-
-    def _dispatch_triggers(self) -> float:
-        with self._lock:
-            entries = dict(self._containers)
-        next_wakeup = _MAX_SLEEP
-
-        for account_id, entry in entries.items():
-            bot = entry.worker.bot
-            if bot.status in (AccountStatus.DEAD, AccountStatus.SUSPENDED):
-                continue
-
-            to_remove: list[TriggerProtocol] = []
-
-            for trigger in list(entry.triggers):
-                if trigger.is_expired(bot.inventory):
-                    to_remove.append(trigger)
-                    continue
-
-                if not trigger.is_due():
-                    secs = trigger.seconds_until()
-                    if secs != float("inf"):
-                        next_wakeup = min(next_wakeup, secs)
-                    continue
-
-                trigger.dispatch()
-
-                # Визначаємо profession і її пріоритет для цього тригера
-                owning_profession = self._find_trigger_owner(entry, trigger)
-                prof_priority = (
-                    entry.profession_priority(owning_profession)
-                    if owning_profession else ProfessionPriority.PRIMARY
-                )
-                prof_id = owning_profession.profession_id if owning_profession else None
-
-                try:
-                    tasks = list(trigger.producer(bot))
-                except Exception as e:
-                    log.error(f"[{account_id}] trigger {trigger.name!r}: {e}", exc_info=True)
-                    tasks = []
-
-                if tasks:
-                    if prof_id:
-                        _apply_profession_priority(tasks, prof_id, prof_priority)
-                    entry.worker.assign(*tasks)
-                else:
-                    trigger.advance(bot)
-                    if self._is_one_shot(trigger):
-                        to_remove.append(trigger)
-                        continue
-                    secs = trigger.seconds_until()
-                    if secs != float("inf"):
-                        next_wakeup = min(next_wakeup, secs)
-
-            if to_remove:
-                with self._lock:
-                    for t in to_remove:
-                        entry.remove_trigger(t)
-
-        return next_wakeup
-
-    @staticmethod
-    def _find_trigger_owner(
-        container: AccountContainer,
-        trigger:   TriggerProtocol,
-    ) -> Optional["BaseProfession"]:
-        """Знаходить profession-власника тригера."""
-        for profession, triggers in container.professions.items():
-            if trigger in triggers:
-                return profession
-        return None
 
     def _reap_dead_workers(self) -> None:
         with self._lock:
             containers = dict(self._containers)
 
         for account_id, entry in containers.items():
-            if entry.worker.bot.status != AccountStatus.DEAD:
+            if entry.bot.status != AccountStatus.DEAD:
                 continue
             log.warning(f"[{account_id}] dead → cleanup")
-            entry.remove_all_triggers()
-            entry.worker.stop()
+            entry.bot.disconnect()
             with self._lock:
                 self._containers.pop(account_id, None)
             self._router.unregister_account(account_id)
+            self._detach_all_monitors(account_id)
             if self._on_dead:
-                self._on_dead(entry.worker.bot)
+                self._on_dead(entry.bot)
 
     def _kill_account(self, account_id: str, container: AccountContainer) -> None:
-        container.worker.clear()
-        container.remove_all_triggers()
-        container.worker.bot.mark_dead("account guard failed")
-        container.worker.bot.repo.inventory.save(account_id, container.worker.bot.inventory)
-        container.worker.stop()
+        container.bot.mark_dead("account guard failed")
+        container.bot.repo.inventory.save(account_id, container.bot.inventory)
+        container.bot.disconnect()
         with self._lock:
             self._containers.pop(account_id, None)
         self._router.unregister_account(account_id)
+        self._detach_all_monitors(account_id)
         if self._on_dead:
-            self._on_dead(container.worker.bot)
+            self._on_dead(container.bot)
 
     # ── Async bridge ──────────────────────────────────────────────────────────
 
@@ -948,31 +679,3 @@ class EventDrivenScheduler:
             future.result()
         except Exception as e:
             log.error(f"[Scheduler] async error: {e}", exc_info=True)
-
-    @staticmethod
-    def _is_one_shot(trigger: TriggerProtocol) -> bool:
-        val = getattr(trigger, "is_one_shot", None)
-        if callable(val):
-            return bool(val())
-        return bool(val) if val is not None else False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _apply_profession_priority(
-    tasks:         list[AnyTask],
-    profession_id: str,
-    prof_priority: ProfessionPriority,
-) -> None:
-    """
-    In-place:
-      1. Проставляє source_profession якщо ще не встановлено.
-      2. Коригує priority задачі відповідно до ProfessionPriority profession.
-    """
-    tag_profession(tasks, profession_id)
-    if prof_priority == ProfessionPriority.PRIMARY:
-        return  # Не зміщуємо — задачі Primary profession ідуть без штрафу
-    for task in tasks:
-        task.priority = prof_priority.adjust(task.priority)  # type: ignore[attr-defined]

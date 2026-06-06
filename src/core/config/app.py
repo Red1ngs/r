@@ -33,6 +33,7 @@ class ParsingConfig:
     url_catalog:       str
     url_chapters:      str
     url_chapters_load: str
+    url_candy_claim:   str
     reward_selector:   str
     reward_type_attr:  str
     reward_id_attr:    str
@@ -46,47 +47,42 @@ class ParsingConfig:
             url_catalog=str(d.get("url_catalog", "/manga")),
             url_chapters=str(d.get("url_chapters", "/manga/{translit_name}")),
             url_chapters_load=str(d.get("url_chapters_load", "/chapters/load")),
+            url_candy_claim=str(d.get("url_candy_claim", "/halloween/takeCandy?r=822")),
         )
 
 
 @dataclass(frozen=True)
-class ReadingModeCfg:
+class ReadingModeDef:
     """
-    Конфігурація режиму читання.
+    Визначення одного режиму читання.
 
-    standard:
-      - читання кожні read_interval_s секунд (default 5400 = 1.5 год) —
-        використовується як fallback коли SlotScheduler повертає 0
-        (всі слоти готові одразу, наприклад після рестарту).
-      - затримки після нагород визначаються виключно через
-        reward_slots[n].interval_seconds — дублювання cooldown тут відсутнє.
+    name          — унікальна назва режиму (збігається з ключем у reading_modes).
+    slots         — список імен reward_slots що визначають інтервал читання.
+                    ReadingMonitor бере interval_seconds першого знайденого слота.
+                    Якщо список порожній — використовується fallback_interval_s.
+    fallback_interval_s — затримка коли жоден слот зі списку не знайдено
+                    або slots порожній (default 5400 = 1.5 год).
 
-    event:
-      - читання кожні event_interval_s секунд (default 120 = 2 хв).
-
-    card_slot / scroll_slot:
-      Імена слотів з reward_slots що ідентифікують картку / свиток.
-      Використовуються тригером для визначення типу нагороди.
+    Приклад у YAML:
+        reading_modes:
+          standard:
+            slots: ["card"]
+            fallback_interval_s: 5400
+          event:
+            slots: ["card", "scroll"]
+            fallback_interval_s: 120
     """
-    mode:             str
-    read_interval_s:  float
-    event_interval_s: float
-    card_slot:        str
-    scroll_slot:      str
+    name:                 str
+    slots:                tuple[str, ...]
+    fallback_interval_s:  float
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ReadingModeCfg":
+    def from_dict(cls, name: str, d: dict[str, Any]) -> "ReadingModeDef":
         return cls(
-            mode=str(d.get("mode", "standard")),
-            read_interval_s=float(d.get("read_interval_s", 5400.0)),
-            event_interval_s=float(d.get("event_interval_s", 120.0)),
-            card_slot=str(d.get("card_slot", "card")),
-            scroll_slot=str(d.get("scroll_slot", "scroll")),
+            name=name,
+            slots=tuple(d.get("slots", [])),
+            fallback_interval_s=float(d.get("fallback_interval_s", 5400.0)),
         )
-
-    @property
-    def is_event(self) -> bool:
-        return self.mode == "event"
 
 
 @dataclass(frozen=True)
@@ -95,19 +91,79 @@ class ReaderAppCfg:
     update_interval_days: int
     parsing:              ParsingConfig
     reward_slots:         tuple[RewardSlotCfg, ...]
-    reading_mode:         ReadingModeCfg
+    reading_modes:        dict[str, ReadingModeDef]
+    default_mode:         str
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ReaderAppCfg":
+        reward_slots = tuple(
+            RewardSlotCfg.from_dict(s) for s in d.get("reward_slots", [])
+        )
+
+        raw_modes: dict[str, Any] = d.get("reading_modes", {})
+        reading_modes = {
+            name: ReadingModeDef.from_dict(name, cfg)
+            for name, cfg in raw_modes.items()
+        }
+
+        # Якщо reading_modes не задано — генеруємо мінімальний fallback
+        if not reading_modes:
+            reading_modes = {
+                "standard": ReadingModeDef(
+                    name="standard",
+                    slots=(),
+                    fallback_interval_s=5400.0,
+                )
+            }
+
+        default_mode = str(d.get("default_mode", next(iter(reading_modes))))
+
         return cls(
             url_add_history=str(d.get("url_add_history", "/addHistory")),
             update_interval_days=int(d.get("update_interval_days", 1)),
             parsing=ParsingConfig.from_dict(d.get("parsing", {})),
-            reward_slots=tuple(
-                RewardSlotCfg.from_dict(s) for s in d.get("reward_slots", [])
-            ),
-            reading_mode=ReadingModeCfg.from_dict(d.get("reading_mode", {})),
+            reward_slots=reward_slots,
+            reading_modes=reading_modes,
+            default_mode=default_mode,
         )
+
+    def get_mode(self, name: str) -> ReadingModeDef:
+        """Повертає режим за іменем або default_mode якщо не знайдено."""
+        return self.reading_modes.get(name) or self.reading_modes[self.default_mode]
+
+    def interval_for_mode(self, mode_name: str) -> float:
+        """
+        Повертає interval_seconds для режиму.
+
+        Шукає перший reward_slot чиє ім'я є у mode.slots.
+        Якщо нічого не знайдено — повертає mode.fallback_interval_s.
+        """
+        mode = self.get_mode(mode_name)
+        slot_map = {s.name: s for s in self.reward_slots}
+        for slot_name in mode.slots:
+            slot = slot_map.get(slot_name)
+            if slot is not None:
+                return slot.interval_seconds
+        return mode.fallback_interval_s
+    
+    def next_available_slot_for_mode(
+        self,
+        mode_name: str,
+        slot_counts: dict[str, int],
+    ) -> Optional[RewardSlotCfg]:
+        """
+        Перший слот активного режиму у якого count < daily_limit.
+        Повертає None якщо всі слоти вичерпані (або mode.slots порожній).
+        """
+        mode = self.get_mode(mode_name)
+        slot_map = {s.name: s for s in self.reward_slots}
+        for slot_name in mode.slots:
+            slot = slot_map.get(slot_name)
+            if slot is None:
+                continue
+            if slot_counts.get(slot_name, 0) < slot.daily_limit:
+                return slot
+        return None
 
     def find_slot(self, reward: dict[str, Any]) -> Optional[RewardSlotCfg]:
         for slot in self.reward_slots:
@@ -153,10 +209,35 @@ class DailyCfg:
 
 
 @dataclass(frozen=True)
+class StartupCfg:
+    """
+    Параметри плавного запуску акаунтів.
+
+    app.yaml:
+        startup:
+          connect_delay: 5.0       # пауза між connect() двох акаунтів (сек)
+          connect_timeout: 30.0    # таймаут одного connect()
+          skip_failed: true        # пропустити збійний акаунт, не зупиняти старт
+    """
+    connect_delay:   float = 5.0
+    connect_timeout: float = 30.0
+    skip_failed:     bool  = True
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "StartupCfg":
+        return cls(
+            connect_delay=float(d.get("connect_delay", 5.0)),
+            connect_timeout=float(d.get("connect_timeout", 30.0)),
+            skip_failed=bool(d.get("skip_failed", True)),
+        )
+
+
+@dataclass(frozen=True)
 class AppConfig:
-    reader: ReaderAppCfg
-    daily:  DailyCfg
-    quiz:   QuizCfg
+    reader:  ReaderAppCfg
+    daily:   DailyCfg
+    quiz:    QuizCfg
+    startup: StartupCfg
 
     @classmethod
     def from_dict(cls, raw_data: dict[str, Any]) -> "AppConfig":
@@ -164,6 +245,7 @@ class AppConfig:
             reader=ReaderAppCfg.from_dict(raw_data.get("reader", {})),
             daily=DailyCfg.from_dict(raw_data.get("daily", {})),
             quiz=QuizCfg.from_dict(raw_data.get("quiz", {})),
+            startup=StartupCfg.from_dict(raw_data.get("startup", {})),
         )
 
     @classmethod
