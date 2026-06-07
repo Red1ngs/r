@@ -275,6 +275,16 @@ class DailyProfession(BaseProfession):
 
         if not needs_daily and not needs_calendar:
             log.info("🎁 Всі бонуси на сьогодні вже зібрано")
+            if self._scheduler is not None:
+                self._scheduler.emit_event(
+                    "daily.claimed",
+                    {
+                        "account_id": bot.account_id,
+                        "day": bot.inventory.daily.day,           
+                        "last_daily_claimed": bot.inventory.daily.last_daily_claimed,
+                    },
+                    source=bot.account_id)
+                
             return RequestResult.approve(data={"status": "all_claimed"})
 
         # Парсимо календар, якщо день стріку ще невідомий
@@ -331,6 +341,12 @@ class DailyProfession(BaseProfession):
                     log.info(f"✅ Календарний бонус зібрано: {result}")
                 else:
                     log.warning(f"⚠️ Не вдалося зібрати календарний бонус: {result}")
+                    # Сервер відповів, але бонус недоступний (напр. 422).
+                    # Вважаємо календар «зробленим» на сьогодні, щоб монітор
+                    # не смикав сервер знову і знову до наступного дня.
+                    inv.last_calendar_claimed = to_day
+                    inv.can_claim_calendar    = False
+                    bot.repo.inventory.save(self._account_id, bot.inventory)
             except Exception as e:
                 log.error(f"❌ Помилка під час збору календарного бонусу: {e}", exc_info=True)
 
@@ -338,13 +354,11 @@ class DailyProfession(BaseProfession):
         if claimed_any:
             bot.repo.inventory.save(self._account_id, bot.inventory)
 
-            both_done = (
-                inv.last_daily_claimed    == to_day
-                and inv.last_calendar_claimed == to_day
-            )
+        if inv.last_daily_claimed == to_day:
+            both_done = inv.last_calendar_claimed == to_day
             payload = {
                 "account_id":    bot.account_id,
-                "daily_done":    inv.last_daily_claimed    == to_day,
+                "daily_done":    True,
                 "calendar_done": inv.last_calendar_claimed == to_day,
                 "calendar_day":  inv.day,
             }

@@ -292,6 +292,11 @@ class ReadingMonitor(BaseMonitor):
 
         if not result.approved:
             log.warning(f"[ReadingMonitor] ask відхилено: {result.reason}")
+            # При помилці (наприклад 429) — retry через нормальний інтервал,
+            # а не одразу, щоб не флудити сервер.
+            if not self._sleeping and not self._slot_limit_reached:
+                await self._schedule_next()
+            return
 
         # Плануємо наступний цикл тільки якщо не переведено у sleeping
         if not self._sleeping and not self._slot_limit_reached:
@@ -355,12 +360,20 @@ class ReadingMonitor(BaseMonitor):
                 inv = getattr(bot.inventory, "reader", None)
                 if inv is not None:
                     inv.reset_slot_counts()
-                    log.info("[ReadingMonitor] daily.claimed → slot_counts скинуто")
+                    bot.repo.inventory.save(self._account_id, bot.inventory)
+                    log.info("[ReadingMonitor] daily.claimed → slot_counts скинуто та збережено")
 
-        log.info("[ReadingMonitor] daily.claimed → достроковий ask")
         self._sleeping = False
         self._slot_limit_reached = False
-        await self._schedule_next(delay=0.0)
+
+        # Використовуємо нормальний інтервал замість delay=0 —
+        # щоб не надсилати do_read одразу після щойно зробленого читання.
+        # Слоти щойно скинуто, тому _interval() поверне інтервал першого слота.
+        delay = self._interval()
+        if delay < 0:
+            delay = 0.0
+        log.info(f"[ReadingMonitor] daily.claimed → наступний ask через {delay:.0f}s")
+        await self._schedule_next(delay=delay)
 
     async def _on_chapters_exhausted(self, payload: dict[str, Any]) -> None:
         """Reader повідомив що глав немає — переходимо у sleeping."""
@@ -419,6 +432,21 @@ class ReadingMonitor(BaseMonitor):
             f"count={new_count}/{slot.daily_limit}"
         )
 
+        # Bug 1: persist slot_counts immediately
+        bot.repo.inventory.save(self._account_id, bot.inventory)
+
+        # Bug 2+3: claim any reward with a token BEFORE emitting slot_limit_reached
+        if reward.get("token"):
+            result = await scheduler.ask(
+                account_id    = self._account_id,
+                profession_id = "reader",
+                intent        = "claim_candy",
+                data          = reward,
+                caller        = "reading_monitor",
+            )
+            if not result.approved:
+                log.warning(f"[ReadingMonitor] ask відхилено: {result.reason}")
+
         if new_count >= slot.daily_limit:
             log.info(
                 f"[ReadingMonitor] slot={slot.name!r} досяг ліміту "
@@ -434,15 +462,3 @@ class ReadingMonitor(BaseMonitor):
                 },
                 source=self._account_id,
             )
-            
-        if reward.get("type") == "candy":
-            result = await scheduler.ask(
-                account_id    = self._account_id,
-                profession_id = "reader",
-                intent        = "claim_candy",
-                data          =  reward,
-                caller        = "reading_monitor",
-            )
-
-            if not result.approved:
-                log.warning(f"[ReadingMonitor] ask відхилено: {result.reason}")

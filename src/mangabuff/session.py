@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 import threading
 from typing import Any, Dict, Generator, Optional
 from urllib.parse import unquote
@@ -10,7 +9,7 @@ from httpx._types import URLTypes
 
 from src.core.config.bot import BotConfig
 from src.core.config.app import AppConfig
-from src.core.utils.rate_limiter import RateLimiter
+from src.core.utils.proxy_rate_limiter import proxy_limiter_registry
 from src.mangabuff.csrf_token import get_csrf_from_html
 from src.mangabuff.daily.parser import get_claimable_day
 from src.utils.log_section import section
@@ -154,7 +153,9 @@ class BotTransport:
         self.headers       = RequestHeaders(bot_config)
         self.client:       Optional[httpx.Client] = None
         self.saved_cookies = httpx.Cookies()
-        self._rate_limiter = RateLimiter(min_interval=random.uniform(1.0, 3.0))  # Виправлення: додано випадковий інтервал між 1 і 3 секундами
+        self._rate_limiter = proxy_limiter_registry.get_or_create(
+            bot_config.network.proxy
+        )
 
         self._create_client()
 

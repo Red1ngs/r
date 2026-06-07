@@ -34,8 +34,9 @@ log = get_scheduler_logger()
 
 # Маппінг: яку profession активувати → які монітори підключити.
 _PROFESSION_MONITORS: dict[str, list[str]] = {
-    "reader":  ["reading"],
-    "quiz":    ["quiz"],
+    "reader": ["reading"],
+    "quiz":   ["quiz"],
+    "daily":  ["daily"],
 }
 
 def _split_evenly(items: list[Any], n: int) -> list[list[Any]]:

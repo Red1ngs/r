@@ -21,7 +21,7 @@ from src.mangabuff.personal.inventory import PersonalInventory
 from src.mangabuff.farmer.manga_loader import MangaLoaderProfession
 from src.mangabuff.farmer.catalog_loader import CatalogLoaderProfession
 from src.mangabuff.farmer.reader import ReaderProfession
-from src.mangabuff.daily.build import DailyProfession
+from src.mangabuff.daily.build import DailyMonitor, DailyProfession
 from src.mangabuff.quiz.build import QuizProfession
 
 # Монітори
@@ -58,6 +58,7 @@ def register_monitors() -> None:
     """
     monitor_registry.register("reading", ReadingMonitor)
     monitor_registry.register("quiz", QuizMonitor)
+    monitor_registry.register("daily", DailyMonitor)
 
 
 def register_recorders() -> None:

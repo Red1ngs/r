@@ -23,6 +23,12 @@ quiz/quiz_monitor.py — QuizMonitor.
     2. ask("do_answer") — відповісти, зберегти наступне питання або закрити сесію
     3. Повторювати п.2 з затримкою answer_delay поки сесія активна і ліміт не досягнуто
 
+Таймінг:
+    - Після do_open чекаємо answer_delay перед першою відповіддю.
+    - answer_delay витримується ЗАВЖДИ — і після успіху, і після 429.
+    - Після break (rejected) цикл завершується вже після sleep,
+      тому новий цикл від daily.claimed/restart не прийде на "гарячий" сервер.
+
 Події що слухає:
     daily.claimed          → скинути лічильник + стартувати (тільки daily)
     quiz.limit_reached     → зупинити цикл
@@ -121,14 +127,24 @@ class QuizMonitor(BaseMonitor):
         """
         Один повний цикл: open → answer × N.
 
-        Перевіряє стан inventory перед кожною дією —
-        якщо ліміт вже досягнуто або режим не підходить, просто виходить.
+        Таймінг:
+            answer_delay береться з inventory на початку кожної ітерації.
+            sleep завжди виконується — і після успіху, і після відмови (429).
+            Після do_open також чекаємо answer_delay перед першою відповіддю,
+            щоб сервер встиг "охолонути" після попередньої сесії.
         """
         scheduler = self._scheduler
         if scheduler is None or not self._active:
             return
 
         log = get_account_logger(self._account_id)
+
+        if self._waiting_for_daily():
+            log.info(
+                "[QuizMonitor] daily ще не зібрано — "
+                "чекаємо daily.claimed (не плануємо наступний цикл)"
+            )
+            return
 
         if not self._should_run():
             log.debug("[QuizMonitor] _run_cycle: умова запуску не виконана → пропускаємо")
@@ -148,6 +164,12 @@ class QuizMonitor(BaseMonitor):
                 log.warning(f"[QuizMonitor] do_open відхилено: {result.reason}")
                 return
 
+            # Затримка після відкриття сесії — перед першою відповіддю.
+            # Захист від 429 якщо попередня сесія закінчилась щойно.
+            answer_delay = self._get_answer_delay()
+            if answer_delay > 0:
+                await asyncio.sleep(answer_delay)
+
         # ── Цикл відповідей ────────────────────────────────────────────────────
         while self._active and self._should_run():
             inv = self._get_inv()
@@ -164,23 +186,54 @@ class QuizMonitor(BaseMonitor):
                 caller        = "quiz_monitor",
             )
 
+            # Завжди чекаємо answer_delay — незалежно від результату.
+            # Якщо відповідь відхилена (429), пауза критична перед break,
+            # щоб новий цикл (від daily.claimed чи restart) не прийшов
+            # на "гарячий" сервер.
+            if answer_delay > 0:
+                await asyncio.sleep(answer_delay)
+
             if not result.approved:
                 log.warning(f"[QuizMonitor] do_answer відхилено: {result.reason}")
                 break
 
             # Profession емітує quiz.limit_reached / quiz.session_ended →
             # _on_limit_reached / _on_session_ended зупинять цикл.
-            # Чекаємо answer_delay і перевіряємо стан знову.
-            if answer_delay > 0:
-                await asyncio.sleep(answer_delay)
 
     # ── State helpers ─────────────────────────────────────────────────────────
+
+    def _waiting_for_daily(self) -> bool:
+        """
+        True = треба чекати daily.claimed перед стартом квіза.
+        False = можна починати (daily profession відсутня або бонус вже зібрано).
+
+        Логіка ідентична ReadingMonitor._waiting_for_daily():
+          - Якщо profession "daily" не зареєстрована → False.
+          - Якщо daily зібрано сьогодні (last_daily_claimed == today()) → False.
+          - Інакше → True.
+        """
+        scheduler = self._scheduler
+        if scheduler is None:
+            return False
+
+        if not scheduler.has_profession(self._account_id, "daily"):
+            return False
+
+        bot = scheduler.get_bot(self._account_id)
+        if bot is None:
+            return False
+
+        daily_inv = getattr(bot.inventory, "daily", None)
+        if daily_inv is None:
+            return False
+
+        return daily_inv.last_daily_claimed != today()
 
     def _should_run(self) -> bool:
         """
         Чи можна зараз запускати/продовжувати цикл.
 
-        daily: ліміт не вичерпано сьогодні
+        daily: ліміт не вичерпано сьогодні і daily вже зібрано
         fixed: fixed_done == False
         """
         inv = self._get_inv()
@@ -190,7 +243,10 @@ class QuizMonitor(BaseMonitor):
         if inv.mode == "fixed":
             return not inv.fixed_done
 
-        # daily
+        # daily — чекаємо поки бонус не зібрано
+        if self._waiting_for_daily():
+            return False
+
         if inv.answers_reset_date != today():
             # Новий день — daily.claimed ще не прийшов, чекаємо
             return False
@@ -238,8 +294,12 @@ class QuizMonitor(BaseMonitor):
             log.info(f"[QuizMonitor] reset_daily відхилено: {result.reason}")
             return
 
-        log.info("[QuizMonitor] reset_daily approved → стартуємо цикл")
-        self._start_cycle(delay=0.0)
+        # Якщо старий цикл ще не завершився (спить після 429) —
+        # _start_cycle скасує його через _cancel_cycle(), але новий
+        # стартує з answer_delay затримкою, щоб не бити в "гарячий" сервер.
+        delay = self._get_answer_delay()
+        log.info(f"[QuizMonitor] reset_daily approved → стартуємо цикл (delay={delay}s)")
+        self._start_cycle(delay=delay)
 
     async def _on_limit_reached(self, payload: dict[str, Any]) -> None:
         """Ліміт досягнуто → зупиняємо поточний цикл."""
