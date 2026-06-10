@@ -50,7 +50,7 @@ async def cb_force_parse_start(
     svc: SchedulerService,
 ) -> None:
     acc_id = call.data.split(":", 2)[2]
-    info   = svc.account_info(acc_id)
+    info   = await svc.account_info(acc_id)
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return
@@ -111,7 +111,7 @@ async def cb_mark_read_start(
     svc: SchedulerService,
 ) -> None:
     acc_id = call.data.split(":", 2)[2]
-    info   = svc.account_info(acc_id)
+    info   = await svc.account_info(acc_id)
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return

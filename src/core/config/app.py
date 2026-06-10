@@ -25,7 +25,10 @@ class RewardSlotCfg:
     def matches(self, reward: dict[str, Any]) -> bool:
         if not self.reward_keys:
             return True
-        return any(key in reward for key in self.reward_keys)
+        # all() — слот матчиться тільки якщо в reward присутні ВСІ reward_keys.
+        # any() давало хибні спрацювання: наприклад candy {"token","type","id"}
+        # матчився як card, бо "id" є в обох, а card стоїть першим у списку.
+        return all(key in reward for key in self.reward_keys)
 
 
 @dataclass(frozen=True)

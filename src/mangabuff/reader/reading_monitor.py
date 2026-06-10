@@ -141,10 +141,6 @@ class ReadingMonitor(BaseMonitor):
             delay = self._interval()
             if delay < 0:
                 return
-        loop = self._scheduler._async_loop
-        if loop is None or not loop.is_running():
-            return
-
         async def _fire() -> None:
             try:
                 await asyncio.sleep(delay)
@@ -158,7 +154,7 @@ class ReadingMonitor(BaseMonitor):
                     exc_info=True
                 )
 
-        self._wakeup_task = loop.create_task(_fire())
+        self._wakeup_task = asyncio.ensure_future(_fire())
 
     def _cancel_wakeup(self) -> None:
         if self._wakeup_task and not self._wakeup_task.done():
@@ -204,11 +200,12 @@ class ReadingMonitor(BaseMonitor):
             f"[ReadingMonitor] всі слоти mode={mode_name!r} вичерпано → "
             f"emit reader.slot_limit_reached"
         )
-        scheduler.emit_event(
+        # emit_event є async — запускаємо як task з поточного event loop
+        asyncio.ensure_future(scheduler.emit_event(
             "reader.slot_limit_reached",
             {"account_id": self._account_id, "mode": mode_name, "counts": slot_counts},
             source=self._account_id,
-        )
+        ))
         return -1.0
 
     # ── Daily guard ───────────────────────────────────────────────────────────
@@ -452,7 +449,7 @@ class ReadingMonitor(BaseMonitor):
                 f"[ReadingMonitor] slot={slot.name!r} досяг ліміту "
                 f"{slot.daily_limit} → emit reader.slot_limit_reached"
             )
-            await scheduler.emit_event_async(
+            await scheduler.emit_event(
                 "reader.slot_limit_reached",
                 {
                     "account_id":  self._account_id,

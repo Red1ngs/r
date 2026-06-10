@@ -56,7 +56,7 @@ async def cmd_stats(message: Message, state: FSMContext, svc: SchedulerService) 
     acc_id = parts[1].strip() if len(parts) > 1 else None
 
     if acc_id:
-        info = svc.account_info(acc_id)
+        info = await svc.account_info(acc_id)
         if info is None:
             await nav_answer(message, state, f"❌ Акаунт <code>{acc_id}</code> не знайдено")
             return
@@ -69,7 +69,7 @@ async def cmd_stats(message: Message, state: FSMContext, svc: SchedulerService) 
         )
         return
 
-    snapshot    = svc.snapshot()
+    snapshot    = await svc.snapshot()
     status_count: dict[str, int] = {}
     for acc in snapshot.accounts:
         status_count[acc.status] = status_count.get(acc.status, 0) + 1
@@ -79,6 +79,7 @@ async def cmd_stats(message: Message, state: FSMContext, svc: SchedulerService) 
     lines.append("<b>За статусами:</b>")
     for status, count in sorted(status_count.items()):
         lines.append(f"  {status}: {count}")
+        
     if snapshot.accounts:
         lines.append("\n<b>Деталі:</b>")
         for acc in snapshot.accounts:
@@ -100,7 +101,7 @@ async def cmd_stats(message: Message, state: FSMContext, svc: SchedulerService) 
 @router.callback_query(F.data.startswith("stats:acc:"))
 async def cb_stats_account(call: CallbackQuery, svc: SchedulerService) -> None:
     acc_id = call.data.split(":", 2)[2]  # type: ignore[union-attr]
-    info   = svc.account_info(acc_id)
+    info   = await svc.account_info(acc_id)
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return

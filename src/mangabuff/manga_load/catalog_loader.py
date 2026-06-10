@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
 from src.core.runtime.scheduler import EventDrivenScheduler
-from src.mangabuff.farmer.parsers import parse_catalog, CATALOG_PAGE_SIZE
+from src.mangabuff.manga_load.parsers import parse_catalog, CATALOG_PAGE_SIZE
 
 if TYPE_CHECKING:
     from src.core.account import Account
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def _parse_catalog_page(bot: "Account") -> list[str]:
+async def _parse_catalog_page(bot: "Account") -> list[str]:
     """
     Парсить поточну сторінку каталогу для цього акаунта.
 
@@ -50,7 +50,7 @@ def _parse_catalog_page(bot: "Account") -> list[str]:
     page = inv.catalog_page
 
     # 1. Завантажуємо HTML сторінки
-    html = bot.session.fetch_manga_catalog(page=page)
+    html = await bot.session.fetch_manga_catalog(page=page)
     if not html:
         log.warning(f"[{bot.account_id}] CatalogLoader: каталог недоступний (сторінка {page})")
         return []
@@ -180,7 +180,7 @@ class CatalogLoaderProfession(BaseProfession):
             return
 
         try:
-            translits = _parse_catalog_page(bot)
+            translits = await _parse_catalog_page(bot)
 
             if not translits:
                 log.info(f"[{self._account_id}] CatalogLoaderProfession: каталог порожній або недоступний")
@@ -201,7 +201,7 @@ class CatalogLoaderProfession(BaseProfession):
             log.exception(f"[{self._account_id}] CatalogLoaderProfession: помилка")
             # При помилці — знімаємо лок і будимо читачів щоб не зависли
             await self._scheduler.release_loader_lock()
-            self._scheduler.emit_event("loader.chapters_ready", {"error": True},
+            await self._scheduler.emit_event("loader.chapters_ready", {"error": True},
                                        source=self._account_id)
         # Лок знімає MangaLoaderProfession після завершення останнього батчу,
         # або тут якщо dispatch_work повернув 0 (немає manga_loader'ів).

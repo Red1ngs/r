@@ -13,19 +13,21 @@ from src.core.monitoring.monitor import monitor_registry
 # Інвентарі
 from src.mangabuff.daily.inventory import DailyInventory
 from src.mangabuff.quiz.inventory import QuizInventory
-from src.mangabuff.farmer.inventory import CatalogLoaderInventory, ReaderInventory, LoaderInventory
+from src.mangabuff.manga_load.inventory import CatalogLoaderInventory, LoaderInventory
+from src.mangabuff.reader.inventory import ReaderInventory
 from src.mangabuff.alliance.inventory import AllianceInventory
 from src.mangabuff.personal.inventory import PersonalInventory
 
 # Професії
-from src.mangabuff.farmer.manga_loader import MangaLoaderProfession
-from src.mangabuff.farmer.catalog_loader import CatalogLoaderProfession
-from src.mangabuff.farmer.reader import ReaderProfession
-from src.mangabuff.daily.build import DailyMonitor, DailyProfession
+from src.mangabuff.manga_load.manga_loader import MangaLoaderProfession
+from src.mangabuff.manga_load.catalog_loader import CatalogLoaderProfession
+from src.mangabuff.reader.reader import ReaderProfession
+from src.mangabuff.daily.daily_monitor import DailyMonitor
+from src.mangabuff.daily.build import DailyProfession
 from src.mangabuff.quiz.build import QuizProfession
 
 # Монітори
-from src.mangabuff.farmer.reading_monitor import ReadingMonitor
+from src.mangabuff.reader.reading_monitor import ReadingMonitor
 from src.mangabuff.quiz.quiz_monitor import QuizMonitor
 
 # Статистика

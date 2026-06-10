@@ -29,7 +29,7 @@ async def cb_reset_catalog_page(
     svc: SchedulerService,
 ) -> None:
     acc_id = call.data.split(":", 2)[2]
-    info   = svc.account_info(acc_id)
+    info   = await svc.account_info(acc_id)
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return

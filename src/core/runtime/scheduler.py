@@ -1,12 +1,32 @@
 """
 scheduler.py — EventDrivenScheduler. Єдиний Scheduler в системі.
 
-Зміни:
-  - Повністю видалено Tasks, BotWorker, ProfessionPriority та чергу задач.
-  - Повністю прибрано тригери.
-  - Управління AccountMonitors інтегровано у життєвий цикл ядра.
-  - Призупинення акаунта (pause_account) відключає сесію акаунта та монітори,
-    а відновлення (resume_account) — поновлює підключення та запускає монітори.
+Виправлення відносно попередньої версії:
+  BUG-1: connect_account() — `ok` ніколи не присвоювалась, NameError при провалі.
+  BUG-2: stop() — після зупинки loop викликав _run_async(disconnect()) на мертвому loop,
+          корутина ніколи не виконувалась. Замінено на asyncio.run() в новому loop.
+  BUG-3: resume_account() — run_coroutine_threadsafe().result() в async-контексті
+          дедлочило (блокувало той самий потік що веде loop). Замінено на await.
+  BUG-4: _attach_all_monitors() — async метод викликав _run_async(_attach_monitors_for(...))
+          тобто await self._run_async(self._run_async(coro)) — подвійне обгортання
+          у fire-and-forget, монітори прикріплювались без очікування. Виправлено:
+          _attach_monitors_for тепер async і викликається через await.
+  BUG-5: _reap_dead_workers() — _detach_all_monitors() викликався без await (sync
+          обгортки вже немає), а також _run_async(disconnect()) — аналогічно BUG-2.
+  BUG-6: _setup_single_profession() — self._attach_monitors_for(...) без await і
+          без _run_async — результат coroutine ніколи не awaited.
+  BUG-7: proxy_queue.py enqueue() — asyncio.get_event_loop() deprecated у Python 3.10+,
+          замінено на asyncio.get_running_loop().
+
+  ДУБЛЮВАННЯ-1: emit_event / emit_event_async — два публічних async методи що роблять
+          ледь різні речі (один через _run_async fire-and-forget, інший напряму).
+          Перший ніколи не поверне кількість підписників, другий — надлишковий alias.
+          Залишено лише emit_event як справжній await.
+  ДУБЛЮВАННЯ-2: _attach_monitors_for / _detach_monitor_if_unused / _detach_all_monitors —
+          були sync-обгортками що всередині запускали run_coroutine_threadsafe.
+          Всі три переведені в async, sync-обгортки прибрано.
+  ДУБЛЮВАННЯ-3: StartupManager.run() мав хибний коментар «connect_account() синхронний → executor»
+          (виконував await без executor). Коментар видалено.
 """
 from __future__ import annotations
 
@@ -28,6 +48,7 @@ from src.core.runtime.event_bus import EventBus, EventCallback
 from src.core.runtime.request_router import RequestContext, RequestRouter
 from src.core.runtime.conditions import Condition
 from src.core.runtime.profession import BaseProfession, RequestResult
+from src.core.runtime.proxy_queue import proxy_queue_manager
 from src.core.status import AccountStatus
 
 log = get_scheduler_logger()
@@ -97,7 +118,7 @@ class EventDrivenScheduler:
     # ── Singleton ─────────────────────────────────────────────────────────────
 
     @classmethod
-    def initialize(
+    async def initialize(
         cls,
         on_dead: Optional[Callable[[Account], None]] = None,
     ) -> "EventDrivenScheduler":
@@ -116,11 +137,11 @@ class EventDrivenScheduler:
         return cls._instance
 
     @classmethod
-    def _reset_for_tests(cls) -> None:
+    async def _reset_for_tests(cls) -> None:
         with cls._init_lock:
             if cls._instance is not None:
                 try:
-                    cls._instance.stop()
+                    await cls._instance.stop()
                 except Exception:
                     pass
             cls._instance = None
@@ -150,19 +171,46 @@ class EventDrivenScheduler:
             name="scheduler-async",
         )
         self._loop_thread.start()
+
+        self._wait_for_loop_ready()
         log.info("EventDrivenScheduler started")
 
-    def stop(self) -> None:
+    def _wait_for_loop_ready(self, timeout: float = 5.0) -> None:
+        """Чекає поки asyncio loop в окремому потоці реально запустився."""
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._async_loop and self._async_loop.is_running():
+                return
+            time.sleep(0.01)
+        raise RuntimeError("EventDrivenScheduler: async loop не запустився за відведений час")
+
+    async def stop(self) -> None:
         if self._async_loop and self._async_loop.is_running():
+            # Graceful shutdown proxy_queue воркерів — перед зупинкою loop
+            future = asyncio.run_coroutine_threadsafe(
+                proxy_queue_manager.shutdown_all(), self._async_loop
+            )
+            try:
+                future.result(timeout=15.0)
+            except Exception as e:
+                log.warning(f"proxy_queue shutdown error: {e}")
+
             self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+
         if self._loop_thread and self._loop_thread.is_alive():
             self._loop_thread.join(timeout=10)
 
+        # FIX: stop() є async-методом — asyncio.run() тут заборонено (вже є running loop).
+        # Scheduler loop вже зупинено вище (call_soon_threadsafe + join),
+        # тому disconnect() викликаємо прямим await у поточному (main) loop.
         with self._lock:
             entries = dict(self._containers)
-        for entry in entries.values():
-            entry.bot.disconnect()
 
+        await asyncio.gather(
+            *(entry.bot.disconnect() for entry in entries.values()),
+            return_exceptions=True,
+        )
         log.info("EventDrivenScheduler stopped")
 
     def _run_async_loop(self) -> None:
@@ -170,29 +218,25 @@ class EventDrivenScheduler:
         self._loading_lock = asyncio.Lock()
         self._async_loop.run_forever()
 
-    # ── Monitors management (internal) ────────────────────────────────────────
+    # ── Monitors management (internal, async) ─────────────────────────────────
 
     def _get_or_create_monitors(self, account_id: str) -> AccountMonitors:
         if account_id not in self._monitors:
             self._monitors[account_id] = AccountMonitors(account_id)
         return self._monitors[account_id]
 
-    def _attach_monitors_for(self, account_id: str, profession_name: str) -> None:
+    # FIX BUG-4 / ДУБЛЮВАННЯ-2: всі три методи тепер async — ніяких sync-обгорток
+    # з run_coroutine_threadsafe всередині async-контексту.
+
+    async def _attach_monitors_for(self, account_id: str, profession_name: str) -> None:
         """Підключає монітори, що відповідають вказаній profession."""
         monitor_ids = _PROFESSION_MONITORS.get(profession_name, [])
         if not monitor_ids:
             return
-
         monitors = self._get_or_create_monitors(account_id)
-        loop = self._async_loop
-        if loop is None or not loop.is_running():
-            return
-        import asyncio
-        asyncio.run_coroutine_threadsafe(
-            monitors.attach_all(self, monitor_ids), loop
-        )
+        await monitors.attach_all(self, monitor_ids)
 
-    def _detach_monitor_if_unused(self, account_id: str, monitor_id: str) -> None:
+    async def _detach_monitor_if_unused(self, account_id: str, monitor_id: str) -> None:
         """Відключає монітор, якщо жодна з активних професій його більше не потребує."""
         owners = [
             prof for prof, mids in _PROFESSION_MONITORS.items()
@@ -203,30 +247,18 @@ class EventDrivenScheduler:
         monitors = self._monitors.get(account_id)
         if monitors is None:
             return
-        loop = self._async_loop
-        if loop is None or not loop.is_running():
-            return
-        import asyncio
-        asyncio.run_coroutine_threadsafe(
-            monitors.detach(self, monitor_id), loop
-        )
+        await monitors.detach(self, monitor_id)
 
-    def _detach_all_monitors(self, account_id: str) -> None:
+    async def _detach_all_monitors(self, account_id: str) -> None:
         """Відключає всі монітори акаунта (при видаленні або паузі)."""
         monitors = self._monitors.pop(account_id, None)
         if monitors is None:
             return
-        loop = self._async_loop
-        if loop is None or not loop.is_running():
-            return
-        import asyncio
-        asyncio.run_coroutine_threadsafe(
-            monitors.detach_all(self), loop
-        )
+        await monitors.detach_all(self)
 
     # ── Account management ────────────────────────────────────────────────────
 
-    def add_account(
+    async def add_account(
         self,
         account_id:  str,
         bot:         Account,
@@ -247,18 +279,14 @@ class EventDrivenScheduler:
                 self._on_dead(bot)
             return
 
-        self._run_async(self._setup_professions(account_id, bot, professions))
+        await self._setup_professions(account_id, bot, professions)
         log.info(f"[{account_id}] додано ({len(professions)} professions)")
 
-    def connect_account(self, account_id: str) -> bool:
+    async def connect_account(self, account_id: str) -> bool:
         """
         Встановлює сесію і підключає монітори.
 
-        Пара до add_account(): той реєструє акаунт і піднімає профессії,
-        цей — викликає bot.connect() і лише після успіху чіпляє монітори.
-
-        Повертає True при успіху. При невдачі акаунт залишається
-        зареєстрованим, монітори не підключаються.
+        Повертає True при успіху.
         """
         with self._lock:
             container = self._containers.get(account_id)
@@ -268,71 +296,74 @@ class EventDrivenScheduler:
 
         if container.bot.is_connected:
             log.debug(f"[{account_id}] connect_account: вже підключено")
-            self._attach_all_monitors(account_id, container)
+            await self._attach_all_monitors(account_id, container)
             return True
 
-        ok = container.bot.connect()
+        # FIX BUG-1: результат connect() тепер зберігається в ok
+        ok = await container.bot.connect()
+
         if not ok:
             log.error(f"[{account_id}] connect_account: connect() провалився — {container.bot.error}")
             return False
 
-        self._attach_all_monitors(account_id, container)
+        await self._attach_all_monitors(account_id, container)
         log.info(f"[{account_id}] connect_account: підключено, монітори активні")
         return True
 
-    def _attach_all_monitors(self, account_id: str, container: "AccountContainer") -> None:
+    async def _attach_all_monitors(self, account_id: str, container: "AccountContainer") -> None:
         """Чіпляє монітори для всіх активних profession контейнера."""
         for profession in container.profession_list():
-            self._attach_monitors_for(account_id, profession.profession_id)
+            # FIX BUG-4: прямий await, без _run_async fire-and-forget
+            await self._attach_monitors_for(account_id, profession.profession_id)
 
-    def remove_account(self, account_id: str) -> bool:
+    async def remove_account(self, account_id: str) -> bool:
         with self._lock:
             entry = self._containers.pop(account_id, None)
         if entry is None:
             return False
 
         professions = entry.profession_list()
-        self._run_async(self._teardown_professions(account_id, professions))
+        await self._teardown_professions(account_id, professions)
         self._router.unregister_account(account_id)
-        self._detach_all_monitors(account_id)
+        await self._detach_all_monitors(account_id)
         log.info(f"[{account_id}] видалено")
         return True
 
-    def pause_account(self, account_id: str) -> bool:
+    async def pause_account(self, account_id: str) -> bool:
         with self._lock:
             container = self._containers.get(account_id)
         if container is None or container.bot.status == AccountStatus.SUSPENDED:
             return False
-        
-        # Відключаємо монітори на час паузи
-        self._detach_all_monitors(account_id)
 
+        await self._detach_all_monitors(account_id)
         container.bot.status = AccountStatus.SUSPENDED
-        container.bot.disconnect()  # Закриваємо активне мережеве з'єднання
+        await container.bot.disconnect()
         log.info(f"[{account_id}] призупинено")
         return True
 
-    def resume_account(self, account_id: str) -> bool:
+    async def resume_account(self, account_id: str) -> bool:
         with self._lock:
             container = self._containers.get(account_id)
         if container is None or container.bot.status != AccountStatus.SUSPENDED:
             return False
 
         container.bot.status = AccountStatus.IDLE
-        
+
         if not container.bot.is_connected:
-            container.bot.connect()
+            # FIX BUG-3: прямий await замість run_coroutine_threadsafe().result()
+            # що блокувало async-потік (дедлок).
+            ok = await container.bot.connect()
+            if not ok:
+                log.error(f"[{account_id}] resume: connect() провалився")
+                return False
 
         if container.bot.status == AccountStatus.DEAD:
-            log.error(f"[{account_id}] resume: connect() провалився")
+            log.error(f"[{account_id}] resume: акаунт мертвий після connect()")
             return False
 
-        # Повноцінно відновлюємо професії та запускаємо монітори заново
         professions = container.profession_list()
-        self._run_async(
-            self._restore_professions(
-                account_id, container.bot, professions, container
-            )
+        await self._restore_professions(
+            account_id, container.bot, professions, container
         )
 
         log.info(f"[{account_id}] відновлено")
@@ -340,7 +371,7 @@ class EventDrivenScheduler:
 
     # ── Dynamic Profession Management ─────────────────────────────────────────
 
-    def add_profession_to_account(
+    async def add_profession_to_account(
         self,
         account_id: str,
         profession: "BaseProfession",
@@ -356,10 +387,8 @@ class EventDrivenScheduler:
                 return
             container.add_profession(profession)
 
-        self._run_async(
-            self._setup_single_profession(
-                account_id, container.bot, profession, container
-            )
+        await self._setup_single_profession(
+            account_id, container.bot, profession, container
         )
 
     async def _setup_single_profession(
@@ -372,10 +401,9 @@ class EventDrivenScheduler:
         try:
             await profession.setup(self, account_id)
             self._router.register(account_id, profession)
-
             await profession.restore_state(bot)
-
-            self._attach_monitors_for(account_id, profession.profession_id)
+            # FIX BUG-6: await замість непоміченого виклику без await
+            await self._attach_monitors_for(account_id, profession.profession_id)
             log.info(f"[{account_id}] dynamic setup {profession.profession_id!r} complete")
         except Exception as e:
             with self._lock:
@@ -385,7 +413,7 @@ class EventDrivenScheduler:
                 exc_info=True,
             )
 
-    def remove_profession_from_account(self, account_id: str, profession_id: str) -> None:
+    async def remove_profession_from_account(self, account_id: str, profession_id: str) -> None:
         profession_obj: Optional["BaseProfession"] = None
         with self._lock:
             container = self._containers.get(account_id)
@@ -394,11 +422,10 @@ class EventDrivenScheduler:
                 container.remove_profession_by_id(profession_id)
 
         if profession_obj is not None:
-            self._run_async(self._teardown_professions(account_id, [profession_obj]))
+            await self._teardown_professions(account_id, [profession_obj])
 
-        # Відключаємо монітори цієї profession, якщо вони більше не використовуються
         for monitor_id in _PROFESSION_MONITORS.get(profession_id, []):
-            self._detach_monitor_if_unused(account_id, monitor_id)
+            await self._detach_monitor_if_unused(account_id, monitor_id)
 
         self._router.unregister(account_id, profession_id)
         log.info(f"[{account_id}] profession {profession_id!r} dynamically removed")
@@ -505,24 +532,21 @@ class EventDrivenScheduler:
         if self._loading_lock is not None and self._loading_lock.locked():
             self._loading_lock.release()
 
-    def emit_event(
-        self,
-        event_name: str,
-        payload:    dict[str, Any],
-        source:     str = "system",
-    ) -> None:
-        self._run_async(self._event_bus.emit(event_name, payload, source=source))
-
-    async def emit_event_async(
+    async def emit_event(
         self,
         event_name: str,
         payload:    dict[str, Any],
         source:     str = "system",
     ) -> int:
+        """
+        ДУБЛЮВАННЯ-1 виправлено: єдиний метод emit_event — повноцінний await,
+        повертає кількість успішних підписників.
+        emit_event_async() видалено — він був надлишковим alias-ом.
+        """
         return await self._event_bus.emit(event_name, payload, source=source)
 
     # ── RequestRouter API ─────────────────────────────────────────────────────
-    
+
     async def ask(
         self,
         account_id: str,
@@ -566,11 +590,8 @@ class EventDrivenScheduler:
             try:
                 await profession.setup(self, account_id)
                 self._router.register(account_id, profession)
-
                 await profession.restore_state(bot)
-
                 container.add_profession(profession)
-
                 log.info(f"[{account_id}] {profession.profession_id!r} ready")
             except Exception as e:
                 log.error(
@@ -588,14 +609,9 @@ class EventDrivenScheduler:
         for profession in professions:
             try:
                 self._router.register(account_id, profession)
-
                 await profession.restore_state(bot)
-
                 container.add_profession(profession)
-
-                # Відновлюємо монітори
-                self._attach_monitors_for(account_id, profession.profession_id)
-
+                await self._attach_monitors_for(account_id, profession.profession_id)
                 log.info(f"[{account_id}] {profession.profession_id!r} resumed")
             except Exception as e:
                 log.error(
@@ -617,7 +633,7 @@ class EventDrivenScheduler:
 
     # ── Guard loops ───────────────────────────────────────────────────────────
 
-    def _check_guards(self) -> None:
+    async def _check_guards(self) -> None:
         with self._lock:
             containers = dict(self._containers)
 
@@ -627,7 +643,7 @@ class EventDrivenScheduler:
 
             if not entry.check_account_guard(inv):
                 log.warning(f"[{account_id}] account guard failed → kill")
-                self._kill_account(account_id, entry)
+                await self._kill_account(account_id, entry)
                 continue
 
             for profession in entry.profession_list():
@@ -638,7 +654,7 @@ class EventDrivenScheduler:
                         f"→ profession removed"
                     )
 
-    def _reap_dead_workers(self) -> None:
+    async def _reap_dead_workers(self) -> None:
         with self._lock:
             containers = dict(self._containers)
 
@@ -646,37 +662,23 @@ class EventDrivenScheduler:
             if entry.bot.status != AccountStatus.DEAD:
                 continue
             log.warning(f"[{account_id}] dead → cleanup")
-            entry.bot.disconnect()
+            # FIX BUG-5: прямий await, а не _run_async (ми вже в async-контексті)
+            await entry.bot.disconnect()
             with self._lock:
                 self._containers.pop(account_id, None)
             self._router.unregister_account(account_id)
-            self._detach_all_monitors(account_id)
+            await self._detach_all_monitors(account_id)
             if self._on_dead:
                 self._on_dead(entry.bot)
 
-    def _kill_account(self, account_id: str, container: AccountContainer) -> None:
+    async def _kill_account(self, account_id: str, container: AccountContainer) -> None:
         container.bot.mark_dead("account guard failed")
         container.bot.repo.inventory.save(account_id, container.bot.inventory)
-        container.bot.disconnect()
+        await container.bot.disconnect()
+
         with self._lock:
             self._containers.pop(account_id, None)
         self._router.unregister_account(account_id)
-        self._detach_all_monitors(account_id)
+        await self._detach_all_monitors(account_id)
         if self._on_dead:
             self._on_dead(container.bot)
-
-    # ── Async bridge ──────────────────────────────────────────────────────────
-
-    def _run_async(self, coro: Any) -> None:
-        if self._async_loop is None or not self._async_loop.is_running():
-            log.warning("[Scheduler] async loop not running, skipping coroutine")
-            return
-        future = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
-        future.add_done_callback(self._log_async_error)
-
-    @staticmethod
-    def _log_async_error(future: asyncio.Future) -> None:
-        try:
-            future.result()
-        except Exception as e:
-            log.error(f"[Scheduler] async error: {e}", exc_info=True)

@@ -127,30 +127,31 @@ class QuizProfession(BaseProfession):
             return RequestResult.approve(data={"status": "already_open"})
 
         log.info("📝 Quiz: відкриваємо сесію…")
-        question = bot.safe_session.quiz_start()
+        question = await bot.safe_session.quiz_start()
 
-        if question is None:
+        data = question.data
+        if data is None:
             log.warning("⚠️ /quiz/start не відповів")
             return RequestResult.deny("quiz_start returned None")
 
-        inv.open_session(question)
+        inv.open_session(data)
 
         log.info(
             f"✅ Сесія відкрита | "
-            f"q_id={question.get('id')} | "
-            f"{question.get('question', '')[:60]}"
+            f"q_id={data.get('id')} | "
+            f"{data.get('question', '')[:60]}"
         )
 
         if self._scheduler is not None:
-            self._scheduler.emit_event(
+            await self._scheduler.emit_event(
                 "quiz.session_opened",
-                {"account_id": ctx.account_id, "question_id": question.get("id")},
+                {"account_id": ctx.account_id, "question_id": question.data.get("id")},
                 source=ctx.account_id,
             )
 
         return RequestResult.approve(data={
-            "question_id": question.get("id"),
-            "question":    question.get("question", ""),
+            "question_id": data.get("id"),
+            "question":    data.get("question", ""),
         })
 
     # ── do_answer ─────────────────────────────────────────────────────────────
@@ -182,17 +183,17 @@ class QuizProfession(BaseProfession):
             f"{question.get('question', '')[:60]} → «{answer_text}»"
         )
 
-        result = bot.safe_session.quiz_answer(answer_text)
+        result = await bot.safe_session.quiz_answer(answer_text)
 
-        if result is None:
+        if result.data is None:
             log.warning("⚠️ /quiz/answer не відповів")
             return RequestResult.deny("quiz_answer returned None")
 
-        status = result.get("status")
+        status = result.data.get("status")
 
         # ── Правильна відповідь ────────────────────────────────────────────────
         if status in ("success", "milestone"):
-            inv.correct_count = result.get("correct_count", inv.correct_count + 1)
+            inv.correct_count = result.data.get("correct_count", inv.correct_count + 1)
             counter = inv.increment_counter()
 
             log.info(
@@ -203,7 +204,7 @@ class QuizProfession(BaseProfession):
             )
 
             if self._scheduler is not None:
-                self._scheduler.emit_event(
+                await self._scheduler.emit_event(
                     "quiz.answered_correct",
                     {
                         "account_id":    ctx.account_id,
@@ -218,16 +219,16 @@ class QuizProfession(BaseProfession):
             if status == "milestone":
                 log.info(
                     f"🏅 Milestone! "
-                    f"milestone={result.get('milestone')} "
-                    f"message={result.get('message', '')!r}"
+                    f"milestone={result.data.get('milestone')} "
+                    f"message={result.data.get('message', '')!r}"
                 )
                 if self._scheduler is not None:
-                    self._scheduler.emit_event(
+                    await self._scheduler.emit_event(
                         "quiz.milestone",
                         {
                             "account_id":    ctx.account_id,
-                            "milestone":     result.get("milestone"),
-                            "message":       result.get("message"),
+                            "milestone":     result.data.get("milestone"),
+                            "message":       result.data.get("message"),
                             "correct_count": inv.correct_count,
                         },
                         source=ctx.account_id,
@@ -242,7 +243,7 @@ class QuizProfession(BaseProfession):
                 inv.close_session(today())
 
                 if self._scheduler is not None:
-                    self._scheduler.emit_event(
+                    await self._scheduler.emit_event(
                         "quiz.limit_reached",
                         {
                             "account_id":    ctx.account_id,
@@ -256,7 +257,7 @@ class QuizProfession(BaseProfession):
                 return RequestResult.approve(data={"status": "limit"})
 
             # ── Наступне питання ──────────────────────────────────────────────
-            next_question = result.get("question")
+            next_question = result.data.get("question")
             if next_question:
                 inv.current_question = next_question
                 log.info(f"➡️  Наступне питання id={next_question.get('id')}")
@@ -274,12 +275,12 @@ class QuizProfession(BaseProfession):
             log.info(
                 f"❌ Невірна відповідь. "
                 f"Результат: {inv.correct_count}. "
-                f"mode={inv.mode}. {result.get('message', '')}"
+                f"mode={inv.mode}. {result.data.get('message', '')}"
             )
             inv.close_session(today())
 
             if self._scheduler is not None:
-                self._scheduler.emit_event(
+                await self._scheduler.emit_event(
                     "quiz.session_ended",
                     {
                         "account_id":    ctx.account_id,
@@ -402,7 +403,7 @@ class QuizProfession(BaseProfession):
 
         # Повідомляємо монітор щоб стартував негайно
         if self._scheduler is not None:
-            self._scheduler.emit_event(
+            await self._scheduler.emit_event(
                 "quiz.force_restarted",
                 {"account_id": ctx.account_id},
                 source=ctx.account_id,

@@ -28,7 +28,7 @@ _EMPTY_KB = InlineKeyboardMarkup(inline_keyboard=[[
 
 @router.message(Command("accounts"))
 async def cmd_accounts(message: Message, state: FSMContext, svc: SchedulerService) -> None:
-    snapshot = svc.snapshot()
+    snapshot = await svc.snapshot()
     if not snapshot.accounts:
         await nav_answer(message, state, "📭 Акаунтів ще немає.\n\nДодай перший:", _EMPTY_KB)
     else:
@@ -41,7 +41,7 @@ async def cmd_accounts(message: Message, state: FSMContext, svc: SchedulerServic
 
 @router.callback_query(F.data == "acc:list")
 async def cb_list(call: CallbackQuery, svc: SchedulerService) -> None:
-    snapshot = svc.snapshot()
+    snapshot = await svc.snapshot()
     if not snapshot.accounts:
         await call.message.edit_text("📭 Акаунтів немає.", reply_markup=_EMPTY_KB)  # type: ignore[union-attr]
     else:

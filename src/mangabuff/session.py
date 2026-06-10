@@ -1,35 +1,115 @@
 from __future__ import annotations
 
-import threading
-from typing import Any, Dict, Generator, Optional
+import functools
+from enum import Enum, auto
+from dataclasses import dataclass
+from typing import Any, Dict, Generic, Literal, Optional, TypeVar, Callable, Awaitable, ParamSpec, Concatenate
 from urllib.parse import unquote
 
-import httpx
-from httpx._types import URLTypes
+from curl_cffi.requests import AsyncSession, Response
+import curl_cffi.requests as _cffi
 
 from src.core.config.bot import BotConfig
 from src.core.config.app import AppConfig
-from src.core.utils.proxy_rate_limiter import proxy_limiter_registry
+from src.core.runtime.proxy_queue import proxy_queue_manager, RateLimitedError
 from src.mangabuff.csrf_token import get_csrf_from_html
 from src.mangabuff.daily.parser import get_claimable_day
 from src.utils.log_section import section
-from src.utils.logging import log_request, log_response
-
-from src.utils.logging import _log as log
+from src.utils.logging import log_request_curl, log_response_curl, log_payload_curl  # noqa: F401
+from src.utils.logging import get_logger as log
 
 
 # ===========================================================================
-# ДОПОМІЖНІ КЛАСИ (Headers та Auth)
+# HttpResult — контракт повернення бізнес-методів
+# ===========================================================================
+
+class FailReason(Enum):
+    NETWORK   = auto()  # таймаут, з'єднання відхилено, будь-який виняток
+    AUTH      = auto()  # 419 після retry, PermissionError
+    NOT_FOUND = auto()  # 404
+    SERVER    = auto()  # 5xx або неочікуваний статус
+    BAD_DATA  = auto()  # 200, але тіло порожнє або не те що очікували
+    DENIED    = auto()  # сервер явно відмовив (403, success=false тощо)
+
+
+T = TypeVar("T")
+R = TypeVar("R")
+P = ParamSpec("P")
+
+# fix #7: Literal замість HttpMethod зі сторонньої бібліотеки — уникає невідповідності типів
+HttpMethodStr = Literal["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+
+
+@dataclass(frozen=True)
+class HttpResult(Generic[T]):
+    ok:     bool
+    data:   Optional[T]          = None
+    reason: Optional[FailReason] = None
+
+    
+    def __post_init__(self) -> None:
+        if self.ok and self.reason is not None:
+            raise ValueError("Успішний результат не повинен мати reason")
+        if not self.ok and self.reason is None:
+            raise ValueError("Невдалий результат повинен мати reason")
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+# Конструктори винесені як функції — єдиний надійний спосіб
+# дати Pylance повну інформацію про тип T при Generic dataclass.
+def http_success(data: T) -> HttpResult[T]:
+    """Створює успішний HttpResult з конкретним значенням."""
+    return HttpResult(ok=True, data=data)
+
+
+def http_success_none() -> HttpResult[None]:
+    """Створює успішний HttpResult без даних."""
+    return HttpResult(ok=True, data=None)
+
+
+def http_fail(reason: FailReason) -> HttpResult[Any]:
+    """Створює невдалий HttpResult."""
+    return HttpResult(ok=False, reason=reason)
+
+
+# fix #4: R замість T — TypeVar прив'язаний до конкретного виклику декоратора,
+#          що дозволяє mypy/pyright коректно виводити тип повернення кожного методу
+def http_call(
+    func: Callable[Concatenate["BotSession", P], Awaitable[HttpResult[R]]],
+) -> Callable[Concatenate["BotSession", P], Awaitable[HttpResult[R]]]:
+    @functools.wraps(func)
+    async def wrapper(self: "BotSession", *args: P.args, **kwargs: P.kwargs) -> HttpResult[R]:
+        try:
+            return await func(self, *args, **kwargs)
+        except PermissionError:
+            log().error(f"  → {func.__name__}: auth error")
+            return http_fail(FailReason.AUTH)
+        except Exception as e:
+            log().error(f"  → {func.__name__}: {e}")
+            return http_fail(FailReason.NETWORK)
+    return wrapper
+
+
+# ===========================================================================
+# РІВЕНЬ 1: Headers
 # ===========================================================================
 
 class RequestHeaders:
-    def __init__(self, config: BotConfig):
+    def __init__(self, config: BotConfig) -> None:
         self.common      = config.browser
         self.base_url    = config.client.base_url
         self.host        = config.client.host
         self.referer:    Optional[str] = None
         self.xsrf_token: Optional[str] = None
         self.csrf_token: Optional[str] = None
+
+    def reset(self) -> None:
+        """Скидає стан токенів і referer — викликається після закриття сесії."""
+        self.referer    = None
+        self.xsrf_token = None
+        self.csrf_token = None
 
     def get_navigation(self) -> Dict[str, str]:
         headers: Dict[str, str] = self.common.to_dict()
@@ -65,129 +145,60 @@ class RequestHeaders:
         return headers
 
 
-class BotAuth(httpx.Auth):
-    """
-    Автоматичне оновлення CSRF-токену при 419.
-
-    ВИПРАВЛЕННЯ: замість спроби мутувати вже відправлений request,
-    при 419 робимо re-login і yield новий request зі свіжими заголовками.
-    Це єдиний надійний спосіб — httpx не гарантує, що мутація headers
-    старого request об'єкта буде застосована до повторного yield.
-    """
-
-    def __init__(self, transport: "BotTransport"):
-        self.transport = transport
-        # Один lock на транспорт — захищає від паралельного re-login
-        # (хоча кожен бот має свій потік, defensively)
-        self._relogin_lock = threading.Lock()
-
-    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
-        response = yield request
-
-        if response.status_code != 419:
-            return
-
-        # Намагаємось отримати lock без блокування — якщо хтось вже
-        # ре-логіниться (не наш кейс, але safe), просто пропускаємо.
-        acquired = self._relogin_lock.acquire(blocking=True, timeout=30)
-        if not acquired:
-            log().error("  → 419: не вдалось отримати relogin lock за 30с")
-            return
-
-        try:
-            log().warning("  → 419 CSRF expired — re-logging in")
-            success = False
-            try:
-                success = self.transport.login(force=True)
-            except Exception as e:
-                log().error(f"  → re-login failed: {e}")
-
-            if not success:
-                log().error("  → re-login failed, request aborted")
-                raise PermissionError("Session expired and re-login failed")
-
-            # Будуємо новий request з актуальними заголовками та cookies.
-            # НЕ мутуємо старий request — створюємо новий через httpx.Request.
-            new_headers = dict(request.headers)
-
-            # Оновлюємо CSRF-токени
-            if self.transport.headers.csrf_token:
-                new_headers["X-CSRF-TOKEN"] = self.transport.headers.csrf_token
-            if self.transport.headers.xsrf_token:
-                new_headers["X-XSRF-TOKEN"] = self.transport.headers.xsrf_token
-
-            # Оновлюємо cookies з клієнта
-            if self.transport.client:
-                cookie_str = "; ".join(
-                    f"{k}={v}" for k, v in self.transport.client.cookies.items()
-                )
-                if cookie_str:
-                    new_headers["Cookie"] = cookie_str
-
-            new_request = httpx.Request(
-                method=request.method,
-                url=request.url,
-                headers=new_headers,
-                content=request.content,
-            )
-            yield new_request
-
-        finally:
-            self._relogin_lock.release()
-
-
 # ===========================================================================
-# РІВЕНЬ 1: ТРАНСПОРТ (HTTP, Cookies, Auth, CSRF)
+# РІВЕНЬ 2: ТРАНСПОРТ (HTTP, Cookies, Auth, CSRF)
 # ===========================================================================
 
 class BotTransport:
     """
-    Низькорівневий HTTP-клієнт. Відповідає ТІЛЬКИ за:
+    Низькорівневий async HTTP-клієнт на curl_cffi.AsyncSession.
+
+    Відповідає ТІЛЬКИ за:
     - Зберігання сесії (cookies)
-    - Логін і підтримку авторизації (через BotAuth)
+    - Логін і підтримку авторизації (419 → re-login)
     - Відправку сирих HTTP-запитів (.get, .post)
+
+    Кожен запит проходить через proxy_queue_manager.enqueue_coro() —
+    гарантує послідовне виконання запитів per-proxy без 429-колізій.
     """
 
-    def __init__(self, bot_config: BotConfig):
-        self.bot_config    = bot_config
-        self.headers       = RequestHeaders(bot_config)
-        self.client:       Optional[httpx.Client] = None
-        self.saved_cookies = httpx.Cookies()
-        self._rate_limiter = proxy_limiter_registry.get_or_create(
-            bot_config.network.proxy
-        )
+    def __init__(self, bot_config: BotConfig) -> None:
+        self.bot_config = bot_config
+        self.headers    = RequestHeaders(bot_config)
+        self._client:   Optional[AsyncSession] = None
 
+        proxy_queue_manager.ensure(bot_config.network.proxy)
         self._create_client()
 
     def _create_client(self) -> None:
-        """Створює новий httpx.Client, зберігаючи накопичені cookies."""
-        if self.client is not None:
-            self._update_cookies(self.client.cookies)
-            self.client.close()
+        """Створює новий AsyncSession, переносячи cookies зі старого."""
+        saved_cookies: Dict[str, str] = {}
+        if self._client is not None:
+            saved_cookies = dict(self._client.cookies)
+            self._client  = None
 
-        self.client = httpx.Client(
-            base_url=self.bot_config.client.base_url,
-            http2=False,
-            proxy=self.bot_config.network.proxy,
+        proxy = self.bot_config.network.proxy
+        self._client = AsyncSession(
+            headers=self.bot_config.browser.to_dict(),
+            cookies=saved_cookies,
+            proxies={"https": proxy, "http": proxy} if proxy else None,
             timeout=self.bot_config.network.timeout,
-            follow_redirects=True,
-            cookies=self.saved_cookies,
-            auth=BotAuth(self),
-            event_hooks={"request": [log_request], "response": [log_response]},
+            allow_redirects=True,
+            impersonate="chrome120",
         )
 
-    def authenticate(self, force: bool = False) -> None:
-        if not self.login(force=force):
-            self.close()
+    async def authenticate(self, force: bool = False) -> None:
+        if not await self.login(force=force):
+            await self.close()
             raise PermissionError("Authentication failed")
 
-    def login(self, force: bool = False) -> bool:
-        if not self.client:
+    async def login(self, force: bool = False) -> bool:
+        if not self._client:
             return False
         if self.bot_config.client.cookies:
-            self._update_cookies(self.bot_config.client.cookies)
+            self._client.cookies.update(self.bot_config.client.cookies)
 
-        if not force and self.check_auth():
+        if not force and await self.check_auth():
             return True
 
         auth = self.bot_config.client.auth
@@ -196,29 +207,27 @@ class BotTransport:
             return False
 
         section(f"auth  {auth.email}")
-        return self._fetch_csrf() and self._submit_login()
+        return await self._fetch_csrf() and await self._submit_login()
 
-    def _fetch_csrf(self) -> bool:
-        assert self.client
+    async def _fetch_csrf(self) -> bool:
+        assert self._client
         self.headers.referer = self.bot_config.client.base_url
         try:
-            r = self.get("/login", headers=self.headers.get_navigation())
+            r = await self.get("/login", headers=self.headers.get_navigation())
             r.raise_for_status()
             token, _ = get_csrf_from_html(r.text)
             if not token:
                 return False
-
             self.headers.csrf_token = token
-            xsrf = self.client.cookies.get("XSRF-TOKEN")
-            if xsrf:
+            if xsrf := self._client.cookies.get("XSRF-TOKEN"):
                 self.headers.xsrf_token = unquote(xsrf)
             return True
         except Exception as e:
             log().error(f"  → _fetch_csrf error: {e}")
             return False
 
-    def _submit_login(self) -> bool:
-        assert self.client and self.bot_config.client.auth
+    async def _submit_login(self) -> bool:
+        assert self._client and self.bot_config.client.auth
         self.headers.referer = f"{self.bot_config.client.base_url}/login"
         payload = {
             "email":    self.bot_config.client.auth.email,
@@ -226,12 +235,11 @@ class BotTransport:
             "_token":   self.headers.csrf_token or "",
         }
         try:
-            r = self.post("/login", data=payload, headers=self.headers.get_ajax(is_post=True))
+            r = await self.post("/login", data=payload, headers=self.headers.get_ajax(is_post=True))
             if r.status_code not in (200, 204, 302):
                 log().warning(f"  → login POST returned {r.status_code}")
                 return False
-            self._update_cookies(self.client.cookies)
-            ok = self.check_auth()
+            ok = await self.check_auth()
             if not ok:
                 log().warning("  → login POST ok але check_auth провалився")
             return ok
@@ -239,17 +247,15 @@ class BotTransport:
             log().error(f"  → _submit_login error: {e}")
             return False
 
-    def check_auth(self) -> bool:
-        assert self.client
+    async def check_auth(self) -> bool:
+        assert self._client
         try:
-            r = self.get(self.bot_config.client.base_url, headers=self.headers.get_navigation())
+            r = await self.get(self.bot_config.client.base_url, headers=self.headers.get_navigation())
             r.raise_for_status()
             token, user_name = get_csrf_from_html(r.text)
             if token and user_name:
                 self.headers.csrf_token = token
-                # Оновлюємо XSRF з cookies після успішного GET
-                xsrf = self.client.cookies.get("XSRF-TOKEN")
-                if xsrf:
+                if xsrf := self._client.cookies.get("XSRF-TOKEN"):
                     self.headers.xsrf_token = unquote(xsrf)
                 log().info(f"  → ✅ {user_name}")
                 return True
@@ -258,84 +264,116 @@ class BotTransport:
             log().error(f"  → check_auth error: {e}")
             return False
 
-    def _update_cookies(self, new_cookies: dict[str, str] | httpx.Cookies) -> None:
-        self.saved_cookies.update(new_cookies)
-        if self.client:
-            self.client.cookies.update(new_cookies)
+    # fix #5: close() тепер скидає весь стан headers — наступний login стартує чисто
+    async def close(self) -> None:
+        self._client = None
+        self.headers.reset()
 
-    def close(self) -> None:
-        if self.client:
-            self._update_cookies(self.client.cookies)
-            self.client.close()
-            self.client = None
+    # ── HTTP ──────────────────────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Внутрішні методи HTTP
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _json(r: Response) -> dict[str, Any]:
+        """Повертає тіло відповіді як dict. Єдине місце де придушується Unknown від curl_cffi."""
+        return r.json()  # type: ignore[no-any-return]
 
-    def get(self, url: URLTypes, external: bool = False, **kwargs: Any) -> httpx.Response:
-        assert self.client
+    def _url(self, url: str) -> str:
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+        return f"{self.bot_config.client.base_url.rstrip('/')}/{url.lstrip('/')}"
 
-        if not external:
-            self._rate_limiter.wait()
-
-        if external:
-            kwargs.setdefault("headers", self.bot_config.browser.to_dict())
-            kwargs["auth"] = None
-        else:
-            if xsrf := self.client.cookies.get("XSRF-TOKEN"):
-                self.headers.xsrf_token = unquote(xsrf)
-            kwargs.setdefault("headers", self.headers.get_navigation())
-
-        return self.client.get(url, **kwargs)
-
-    def post(self, url: URLTypes, external: bool = False, **kwargs: Any) -> httpx.Response:
-        assert self.client
-
-        if not external:
-            self._rate_limiter.wait()
+    async def _request(self, method: HttpMethodStr, url: str, external: bool = False, **kwargs: Any) -> Response:
+        assert self._client
+        full_url = url if external else self._url(url)
 
         if external:
             kwargs.setdefault("headers", self.bot_config.browser.to_dict())
-            kwargs["auth"] = None
-        else:
-            if xsrf := self.client.cookies.get("XSRF-TOKEN"):
-                self.headers.xsrf_token = unquote(xsrf)
-            kwargs.setdefault("headers", self.headers.get_ajax(is_post=True))
+            kwargs.setdefault("proxies", None)
+            log_payload_curl(method, full_url, params=kwargs.get("params"), data=kwargs.get("data"), json_body=kwargs.get("json"))
+            t    = log_request_curl(method, full_url, kwargs.get("headers", {}))
+            resp = await self._client.request(method, full_url, **kwargs)
+            log_response_curl(resp.status_code, full_url, resp.content, resp.headers.get("content-type", ""), t)
+            return resp
 
-        return self.client.post(url, **kwargs)
+        if xsrf := self._client.cookies.get("XSRF-TOKEN"):
+            self.headers.xsrf_token = unquote(xsrf)
+
+        # Крок 1: payload ДО запиту
+        log_payload_curl(method, full_url, params=kwargs.get("params"), data=kwargs.get("data"), json_body=kwargs.get("json"))
+        # Крок 2: сам запит
+        t        = log_request_curl(method, full_url, kwargs.get("headers", {}))
+        response = await proxy_queue_manager.enqueue_coro(
+            proxy = self.bot_config.network.proxy,
+            coro  = self._client.request(method, full_url, **kwargs),  # type: ignore[union-attr]
+            label = f"{method} {url}",
+        )
+        # Крок 3: відповідь ДО валідації статусу
+        log_response_curl(response.status_code, full_url, response.content, response.headers.get("content-type", ""), t)
+
+        if response.status_code == 419:
+            log().warning("  → 419 CSRF expired — re-logging in")
+            if not await self.login(force=True):
+                raise PermissionError("Session expired and re-login failed")
+            if "headers" in kwargs:
+                if self.headers.csrf_token:
+                    kwargs["headers"]["X-CSRF-TOKEN"] = self.headers.csrf_token
+                if self.headers.xsrf_token:
+                    kwargs["headers"]["X-XSRF-TOKEN"] = self.headers.xsrf_token
+            log_payload_curl(method, full_url, params=kwargs.get("params"), data=kwargs.get("data"), json_body=kwargs.get("json"))
+            t        = log_request_curl(method, full_url, kwargs.get("headers", {}))
+            response = await proxy_queue_manager.enqueue_coro(
+                proxy = self.bot_config.network.proxy,
+                coro  = self._client.request(method, full_url, **kwargs),  # type: ignore[union-attr]
+                label = f"{method} {url} (retry after 419)",
+            )
+            log_response_curl(response.status_code, full_url, response.content, response.headers.get("content-type", ""), t)
+
+        if response.status_code == 429:
+            raise RateLimitedError(float(response.headers.get("Retry-After", 15.0)))
+
+        return response
+
+    async def get(self, url: str, external: bool = False, **kwargs: Any) -> Response:
+        kwargs.setdefault("headers", self.headers.get_navigation())
+        return await self._request("GET", url, external=external, **kwargs)
+
+    async def post(self, url: str, external: bool = False, **kwargs: Any) -> Response:
+        kwargs.setdefault("headers", self.headers.get_ajax(is_post=True))
+        return await self._request("POST", url, external=external, **kwargs)
 
 
 # ===========================================================================
-# РІВЕНЬ 2: ENDPOINTS (Бізнес-логіка)
+# РІВЕНЬ 3: ENDPOINTS (Бізнес-логіка)
 # ===========================================================================
 
 class BotSession(BotTransport):
     """
-    Високорівневий клас, який містить виключно бізнес-методи (API).
+    Високорівневий клас з бізнес-методами API.
+
+    Кожен метод позначений @http_call — транспортні винятки (мережа, auth)
+    перехоплює декоратор і повертає http_fail(FailReason.*).
+    Метод всередині просто перевіряє статус і повертає success/fail.
     """
 
-    def __init__(self, bot_config: BotConfig, app_config: AppConfig):
+    def __init__(self, bot_config: BotConfig, app_config: AppConfig) -> None:
         super().__init__(bot_config)
-
         self.app_config = app_config
-        self.daily  = self.app_config.daily
-        self.reader = self.app_config.reader
+        self.daily  = app_config.daily
+        self.reader = app_config.reader
 
-    # ── Utils / Proxy ────────────────────────────────────────────────
+    # ── Utils / Proxy ─────────────────────────────────────────────────────────
 
-    def check_proxy(self) -> bool:
+    async def check_proxy(self) -> bool:
         if not self.bot_config.network.proxy:
             return True
         try:
-            # Запит через проксі
-            r = self.get("https://api.ipify.org", external=True, timeout=10)
+            r = await self.get("https://api.ipify.org", external=True, timeout=10)
             r.raise_for_status()
             proxy_ip = r.text.strip()
 
-            # Запит без проксі для порівняння
-            import httpx as _httpx
-            real_ip = _httpx.get("https://api.ipify.org", timeout=10).text.strip()
+            # fix #2: AsyncSession закривається через async with — усуває витік ресурсів
+            async with _cffi.AsyncSession() as session:
+                real_r = await session.get("https://api.ipify.org", timeout=10)
+            real_ip = real_r.text.strip()
 
             if proxy_ip == real_ip:
                 log().error(f"  → Proxy IP збігається з реальним ({real_ip}) — проксі не працює")
@@ -347,162 +385,121 @@ class BotSession(BotTransport):
             log().error(f"  → Proxy check failed: {e}")
             return False
 
-    # ── Daily Bonus ──────────────────────────────────────────────────
+    # ── Daily ─────────────────────────────────────────────────────────────────
 
-    def fetch_daily_streak(self) -> Optional[int]:
-        try:
-            url = self.daily.url_balance
-            r = self.get(url, timeout=15)
-            r.raise_for_status()
+    @http_call
+    async def fetch_daily_streak(self) -> HttpResult[Optional[int]]:
+        r = await self.get(self.daily.url_balance, timeout=15)
+        r.raise_for_status()
+        day = get_claimable_day(
+            r.text,
+            item_selector=self.daily.item_selector,
+            claim_text=self.daily.claim_text,
+            day_attr=self.daily.day_attr,
+        )
+        if day is not None:
+            log().info(f"  → день {day} доступний")
+            return http_success(int(day))
+        log().info("  → бонус недоступний сьогодні")
+        return http_success_none()
 
-            day = get_claimable_day(
-                r.text,
-                item_selector=self.daily.item_selector,
-                claim_text=self.daily.claim_text,
-                day_attr=self.daily.day_attr,
-            )
-            if day is not None:
-                log().info(f"  → день {day} доступний")
-                return int(day)
+    @http_call
+    async def claim_calendar(self, day: int | str) -> HttpResult[dict[str, Any]]:
+        r = await self.post(self.daily.url_calendar_claim.format(day), timeout=15)
+        if r.status_code == 200:
+            log().info("  → отримано")
+            return http_success(self._json(r))
+        log().warning(f"  → claim_calendar: {r.status_code} {self._json(r).get('message', '') if r.content else ''}")
+        return http_fail(FailReason.DENIED)
 
-            log().info("  → бонус недоступний сьогодні")
-            return None
-        except Exception as e:
-            log().error(f"  → /balance error: {e}")
-            return None
+    @http_call
+    async def claim_daily(self) -> HttpResult[dict[str, Any]]:
+        r = await self.post(self.daily.url_ping, timeout=15)
+        if r.status_code == 200:
+            log().info("  → отримано")
+            return http_success(self._json(r))
+        log().warning(f"  → claim_daily: {r.status_code} {self._json(r).get('message', '') if r.content else ''}")
+        return http_fail(FailReason.DENIED)
 
-    def claim_calendar(self, day: int | str) -> tuple[bool, dict[str, Any]]:
-        try:
-            url = self.daily.url_calendar_claim.format(day)
-            r = self.post(url, timeout=15)
-            if r.status_code == 200:
-                log().info("  → отримано")
-                return True, r.json()
-            log().warning(f"  → {r.status_code} {r.json().get('message', '')}")
-            return False, r.json()
-        except Exception as e:
-            log().error(f"  → claim_calendar error: {e}")
-            return False, {}
+    # ── Reader ────────────────────────────────────────────────────────────────
 
-    def claim_daily(self) -> tuple[bool, dict[str, Any]]:
-        try:
-            url = self.daily.url_ping
-            r = self.post(url, timeout=15)
-            if r.status_code == 200:
-                log().info("  → отримано")
-                return True, r.json()
-            log().warning(f"  → {r.status_code} {r.json().get('message', '')}")
-            return False, r.json()
-        except Exception as e:
-            log().error(f"  → claim_daily error: {e}")
-            return False, {}
+    # fix #8: dict[str, Any] замість голого dict — точніша типізація
+    @http_call
+    async def submit_add_history(self, items: list[dict[str, Any]]) -> HttpResult[dict[str, Any]]:
+        body = {
+            f"items[{i}][{k}]": v
+            for i, item in enumerate(items)
+            for k, v in item.items()
+        }
+        r = await self.post(self.reader.url_add_history, data=body)
+        if r.status_code == 200:
+            data = self._json(r) if r.content else {}
+            return http_success(data)
+        log().warning(f"  → submit_add_history: {r.status_code}")
+        return http_fail(FailReason.SERVER)
 
-    # ── Reader ───────────────────────────────────────────────────────
+    @http_call
+    async def claim_candy(self, token: str) -> HttpResult[dict[str, Any]]:
+        r = await self.post(self.reader.parsing.url_candy_claim, data={"token": token}, timeout=15)
+        if r.status_code == 200:
+            data: dict[str, Any] = self._json(r) if r.content else {}
+            log().info("  → цукерка отримана")
+            return http_success(data)
+        log().warning(f"  → claim_candy: {r.status_code} {self._json(r).get('message', '') if r.content else ''}")
+        return http_fail(FailReason.DENIED)
 
-    def submit_add_history(self, items: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
-        try:
-            body = {
-                f"items[{i}][{k}]": v
-                for i, item in enumerate(items)
-                for k, v in item.items()
-            }
-            r = self.post(self.reader.url_add_history, data=body)
-            if r.status_code == 200 and r.content:
-                return r.json()
-            return None
-        except Exception:
-            return None
-        
-    def claim_candy(self, token: str) -> tuple[bool, dict[str, Any]]:
-        try:
-            url = self.reader.parsing.url_candy_claim
-            r = self.post(url, data={"token": token}, timeout=15)
-            if r.status_code == 200:
-                if r.content:
-                    log().info("  → цукерка отримана")
-                    return True, r.json()
-                # Сервер повернув 200 але без контенту (OK)
-                log().info("  → цукерка отримана (порожня відповідь)")
-                return True, {}
-            if r.content:
-                log().warning(f"  → claim_candy: {r.status_code} {r.json().get('message', '')}")
-                return False, r.json()
-            log().warning(f"  → claim_candy: {r.status_code} (без контенту)")
-            return False, {}
-        except Exception as e:
-            log().error(f"  → claim_candy error: {e}")
-            return False, {}
+    @http_call
+    async def fetch_manga_catalog(self, page: int = 1) -> HttpResult[str]:
+        r = await self.get(self.reader.parsing.url_catalog, params={"page": page}, timeout=15)
+        r.raise_for_status()
+        return http_success(r.text)
 
-    def fetch_manga_catalog(self, page: int = 1) -> Optional[str]:
-        try:
-            url = self.reader.parsing.url_catalog
-            r = self.get(url, params={"page": page}, timeout=15)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            log().error(f"  → fetch_manga_catalog error: {e}")
-            return None
+    # fix #1: доданий @http_call — метод тепер захищений від власних несподіваних винятків
+    @http_call
+    async def fetch_manga_chapters(self, translit_name: str, manga_data_id: int) -> HttpResult[str]:
+        page = await self.fetch_manga_page(translit_name)
+        if not page or page.data is None:
+            return http_fail(FailReason.NOT_FOUND)
+        more = await self._fetch_more_chapters(manga_data_id)
+        return http_success(page.data + (more.data or ""))
 
-    def fetch_manga_chapters(self, translit_name: str, manga_data_id: int) -> Optional[str]:
-        page_html = self.fetch_manga_page(translit_name)
-        if not page_html:
-            return None
-        more_html = self._fetch_more_chapters(manga_data_id)
-        return page_html + more_html
+    @http_call
+    async def fetch_manga_page(self, translit_name: str) -> HttpResult[str]:
+        r = await self.get(
+            self.reader.parsing.url_chapters.format(translit_name=translit_name),
+            timeout=15,
+        )
+        r.raise_for_status()
+        self.headers.referer = str(r.url)
+        return http_success(r.text)
 
-    def fetch_manga_page(self, translit_name: str) -> Optional[str]:
-        try:
-            url = self.reader.parsing.url_chapters.format(translit_name=translit_name)
-            r = self.get(url, timeout=15)
-            r.raise_for_status()
-            self.headers.referer = str(r.url)
-            return r.text
-        except Exception as e:
-            log().error(f"  → fetch_manga_page error: {e}")
-            return None
+    @http_call
+    async def _fetch_more_chapters(self, manga_data_id: int) -> HttpResult[str]:
+        r = await self.post(
+            self.reader.parsing.url_chapters_load,
+            data={"manga_id": manga_data_id},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return http_success(self._json(r).get("content", ""))
 
-    def _fetch_more_chapters(self, manga_data_id: int) -> str:
-        try:
-            url = self.reader.parsing.url_chapters_load
-            r = self.post(url, data={"manga_id": manga_data_id}, timeout=15)
-            r.raise_for_status()
-            return r.json().get("content", "")
-        except Exception as e:
-            log().warning(f"  → fetch_more_chapters error: {e}")
-            return ""
-        
-    # ── Quiz ───────────────────────────────────────────────────────
-    
-    def quiz_start(self) -> Optional[dict[str, Any]]:
-        """
-        POST /quiz/start — відкриває нову сесію та повертає перше питання.
-        Повертає dict питання або None при помилці.
-        """
-        try:
-            r = self.post("/quiz/start", timeout=15)
-            if r.status_code == 200:
-                return r.json().get("question")
-            log().warning(f"  → quiz_start: {r.status_code}")
-            return None
-        except Exception as e:
-            log().error(f"  → quiz_start error: {e}")
-            return None
-        
-    def quiz_answer(self, answer: str) -> Optional[dict[str, Any]]:
-        """
-        POST /quiz/answer  body: answer=<текст>
-        Повертає повну відповідь сервера або None при мережевій помилці.
-        """
-        try:
-            r = self.post(
-                "/quiz/answer",
-                data={"answer": answer},
-                timeout=15,
-            )
-            if r.status_code == 200:
-                return r.json()
-            log().warning(f"  → quiz_answer: {r.status_code}")
-            return None
-        except Exception as e:
-            log().error(f"  → quiz_answer error: {e}")
-            return None
+    # ── Quiz ──────────────────────────────────────────────────────────────────
+
+    @http_call
+    async def quiz_start(self) -> HttpResult[dict[str, Any]]:
+        r = await self.post("/quiz/start", timeout=15)
+        if r.status_code == 200:
+            question = self._json(r).get("question")
+            if question is None:
+                return http_fail(FailReason.BAD_DATA)
+            return http_success(question)
+        log().warning(f"  → quiz_start: {r.status_code}")
+        return http_fail(FailReason.SERVER)
+
+    @http_call
+    async def quiz_answer(self, answer: str) -> HttpResult[dict[str, Any]]:
+        r = await self.post("/quiz/answer", data={"answer": answer}, timeout=15)
+        if r.status_code == 200:
+            return http_success(self._json(r))
+        log().warning(f"  → quiz_answer: {r.status_code}")
+        return http_fail(FailReason.SERVER)

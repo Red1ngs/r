@@ -52,13 +52,6 @@ set_timezone("Europe/Kiev")
 from src.core.account import Account
 from src.core.runtime.scheduler import EventDrivenScheduler
 
-def on_dead(bot: Account) -> None:
-    log.critical(f"[DEAD] '{bot.account_id}': {bot.error}")
-
-scheduler = EventDrivenScheduler.initialize(on_dead=on_dead)
-scheduler.start()
-log.info("Scheduler initialized (empty)")
-
 # ── Services ──────────────────────────────────────────────────────────────────
 from src.bot.admin.services.scheduler_service import SchedulerService
 from src.database.repository.account import AccountRepository
@@ -67,6 +60,7 @@ from src.core.runtime.startup_manager import StartupManager, StartupConfig
 
 async def restore_accounts(
     service:     SchedulerService,
+    scheduler:   EventDrivenScheduler,
     repository:  AccountRepository,
     startup_cfg: StartupConfig,
 ) -> None:
@@ -82,7 +76,7 @@ async def restore_accounts(
     registered: list[str] = []
 
     for row in repository.get_all_accounts():
-        ok, err = service.add_account(row.id, row.email)
+        ok, err = await service.add_account(row.id, row.email)
         if not ok:
             log.warning(f"[restore] '{row.id}' пропущено: {err}")
             continue
@@ -117,6 +111,14 @@ from src.bot.admin.runner import AdminBotRunner
 
 
 async def main() -> None:
+    def on_dead(bot: Account) -> None:
+        log.critical(f"[DEAD] '{bot.account_id}': {bot.error}")
+
+    scheduler = await EventDrivenScheduler.initialize(on_dead=on_dead)
+    log.info("Scheduler initialized (empty)")
+
+    scheduler.start()
+    
     startup_cfg = StartupConfig.from_app_config(app_cfg)
     admin_bot = None
 
@@ -124,7 +126,7 @@ async def main() -> None:
         admin_cfg = AdminBotConfig.from_env()
         svc = SchedulerService(repositories, app_cfg)
 
-        await restore_accounts(svc, repositories.accounts, startup_cfg)
+        await restore_accounts(svc, scheduler, repositories.accounts, startup_cfg)
 
         admin_bot = AdminBotRunner(admin_cfg, svc)
         admin_bot.start()
@@ -137,7 +139,7 @@ async def main() -> None:
             await asyncio.sleep(30)
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutdown requested")
-        scheduler.stop()
+        await scheduler.stop()
         if admin_bot:
             admin_bot.stop()
         log.info("Shutdown complete")

@@ -106,15 +106,11 @@ class QuizMonitor(BaseMonitor):
         if scheduler is None or not self._active:
             return
 
-        loop = scheduler._async_loop
-        if loop is None or not loop.is_running():
-            return
-
         async def _run() -> None:
             await asyncio.sleep(delay)
             await self._run_cycle()
 
-        self._cycle_task = loop.create_task(_run())
+        self._cycle_task = asyncio.ensure_future(_run())
 
     def _cancel_cycle(self) -> None:
         if self._cycle_task and not self._cycle_task.done():

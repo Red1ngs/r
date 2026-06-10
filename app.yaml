@@ -1,5 +1,5 @@
 reader:
-  url_add_history: "/addHistory"
+  url_add_history: "/addHistory?r=702"
   update_interval_days: 1
 
   parsing:
@@ -49,4 +49,4 @@ daily:
 quiz:
   mode:         "daily"
   answer_limit: 10
-  answer_delay: 8.0
+  answer_delay: 1.0

@@ -12,7 +12,7 @@ from ._common import account_text, account_menu_kb, professions_manage_kb
 router = Router(name="accounts:profession")
 
 
-def _professions_text(acc_id: str, professions: list[str]) -> str:
+async def _professions_text(acc_id: str, professions: list[str]) -> str:
     if not professions:
         return f"🎓 <b>Акаунт {acc_id}</b>\n\nПрофесій ще не призначено."
     lines = "\n".join(
@@ -30,12 +30,12 @@ def _professions_text(acc_id: str, professions: list[str]) -> str:
 @router.callback_query(F.data.startswith("acc:professions:"))
 async def cb_professions_menu(call: CallbackQuery, svc: SchedulerService) -> None:
     acc_id = call.data.split(":", 2)[2]
-    info   = svc.account_info(acc_id)
+    info   = await svc.account_info(acc_id)
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return
     await call.message.edit_text(
-        _professions_text(acc_id, info.professions),
+        await _professions_text(acc_id, info.professions),
         reply_markup=professions_manage_kb(acc_id, info.professions),
     )
     await call.answer()
@@ -51,15 +51,15 @@ async def cb_prof_add(call: CallbackQuery, svc: SchedulerService) -> None:
         return
 
     acc_id, prof_name = parts[2], parts[3]
-    ok, err = svc.add_profession(acc_id, prof_name)
+    ok, err = await svc.add_profession(acc_id, prof_name)
     if not ok:
         await call.answer(f"❌ {err}", show_alert=True)
         return
 
-    info = svc.account_info(acc_id)
+    info = await svc.account_info(acc_id)
     if info:
         await call.message.edit_text(
-            _professions_text(acc_id, info.professions),
+            await _professions_text(acc_id, info.professions),
             reply_markup=professions_manage_kb(acc_id, info.professions),
         )
     await call.answer(f"✅ Професію {prof_name!r} додано")
@@ -75,15 +75,15 @@ async def cb_prof_remove(call: CallbackQuery, svc: SchedulerService) -> None:
         return
 
     acc_id, prof_name = parts[2], parts[3]
-    ok, err = svc.remove_profession(acc_id, prof_name)
+    ok, err = await svc.remove_profession(acc_id, prof_name)
     if not ok:
         await call.answer(f"❌ {err}", show_alert=True)
         return
 
-    info = svc.account_info(acc_id)
+    info = await svc.account_info(acc_id)
     if info:
         await call.message.edit_text(
-            _professions_text(acc_id, info.professions),
+            await _professions_text(acc_id, info.professions),
             reply_markup=professions_manage_kb(acc_id, info.professions),
         )
     await call.answer(f"✅ Професію {prof_name!r} видалено")

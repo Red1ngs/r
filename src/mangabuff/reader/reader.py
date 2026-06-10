@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
 from src.core.runtime.scheduler import EventDrivenScheduler
-from src.mangabuff.farmer.inventory import ReaderInventory
+from src.mangabuff.reader.inventory import ReaderInventory
 
 if TYPE_CHECKING:
     from src.core.account import Account
@@ -132,7 +132,7 @@ class ReaderProfession(BaseProfession):
         if not sequence:
             log.info("📖 Непрочитаних глав немає → chapters_exhausted")
             if self._scheduler is not None:
-                self._scheduler.emit_event(
+                await self._scheduler.emit_event(
                     "reader.chapters_exhausted",
                     {"account_id": bot.account_id},
                     source=bot.account_id,
@@ -141,21 +141,26 @@ class ReaderProfession(BaseProfession):
 
         log.info(f"📖 Знайдено непрочитані глави ({len(sequence)}): {', '.join(mangas)}")
 
-        reward = bot.safe_session.submit_add_history([
+        reward = await bot.safe_session.submit_add_history([
             {"manga_id": ch["manga_id"], "chapter_id": ch["chapter_id"]}
             for ch in sequence
         ])
 
+        if not reward.ok:
+            log.warning("📖 submit_add_history провалився — глави не позначено як прочитані")
+            return RequestResult.deny("submit_add_history failed")
+
+        data = reward.data or {}
+        reward_data = data  # alias for clarity below
+        
         for ch in sequence:
             bot.repo.chapters.mark_chapter_read(bot.account_id, int(ch["chapter_id"]))
 
-        log.info(
-            f"📖 Прочитано {len(sequence)} глав: {', '.join(mangas)}"
-            + (f" | нагорода: {reward}" if reward else "")
-        )
+        reward_str = f" | нагорода: {reward_data}" if reward_data else ""
+        log.info(f"📖 Прочитано {len(sequence)} глав: {', '.join(mangas)}{reward_str}")
 
         if self._scheduler is not None:
-            self._scheduler.emit_event(
+            await self._scheduler.emit_event(
                 "reader.chapters_read",
                 {
                     "account_id": bot.account_id,
@@ -164,17 +169,17 @@ class ReaderProfession(BaseProfession):
                 },
                 source=bot.account_id,
             )
-            if reward:
-                self._scheduler.emit_event(
+            if reward_data:
+                await self._scheduler.emit_event(
                     "reader.reward_received",
-                    {"account_id": bot.account_id, "reward": reward},
+                    {"account_id": bot.account_id, "reward": reward_data},
                     source=bot.account_id,
                 )
 
         return RequestResult.approve(data={
             "read":   len(sequence),
             "mangas": mangas,
-            "reward": reward,
+            "reward": reward_data,
         })
 
     async def _handle_claim_candy(
@@ -188,12 +193,11 @@ class ReaderProfession(BaseProfession):
             return RequestResult.deny("token обов'язковий")
 
         bot = ctx.bot
-        success, reward = bot.safe_session.claim_candy(token)
-        if not success:
+        reward = await bot.safe_session.claim_candy(token)
+        if not reward.ok:
             return RequestResult.deny("Не вдалося отримати цукерку")
 
-        return RequestResult.approve(data={"reward": reward})
-
+        return RequestResult.approve(data={"reward": reward.data})
     # ── get_state ─────────────────────────────────────────────────────────────
 
     async def _handle_get_state(self, ctx: "RequestContext") -> RequestResult:
@@ -211,7 +215,7 @@ class ReaderProfession(BaseProfession):
         """
         Оновлює ReadingParams що ReadingMonitor передаватиме при наступних ask.
         """
-        from src.mangabuff.farmer.reading_monitor import ReadingParams
+        from src.mangabuff.reader.reading_monitor import ReadingParams
 
         params = ReadingParams(
             limit        = int(data.get("limit", 2)),

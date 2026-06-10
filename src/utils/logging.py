@@ -22,6 +22,7 @@ import json
 import logging
 import time
 from contextvars import ContextVar
+from typing import Any
 from urllib.parse import unquote
 
 import httpx
@@ -45,8 +46,13 @@ def set_http_logger(logger: logging.Logger) -> None:
     _http_logger.set(logger)
 
 
-def _log() -> logging.Logger:
+def get_logger() -> logging.Logger:
+    """Повертає поточний логер для HTTP-трафіку поточного потоку."""
     return _http_logger.get()
+
+
+# Зворотна сумісність — не видаляти до повного рефакторингу
+_log = get_logger
 
 
 # ── Хелпери ───────────────────────────────────────────────────────────────────
@@ -109,3 +115,82 @@ def log_response(response: httpx.Response) -> None:
         level,
         f"  ←  {status}  {elapsed_ms}ms  {_short_path(response.url)}{suffix}",
     )
+
+# ── curl_cffi logging helpers ─────────────────────────────────────────────────
+# curl_cffi не підтримує event hooks як httpx, тому логування робиться
+# вручну в BotTransport._request() через ці функції.
+#
+# Порядок логів для кожного запиту:
+#   1. log_payload_curl  — що передано (params/data/json) ДО відправки
+#   2. log_request_curl  — сам запит (METHOD URL)
+#   3. log_response_curl — що прийшло (STATUS ms body) ДО будь-якої валідації
+
+
+def _format_payload(data: Any) -> str:
+    """Серіалізує payload у читабельний рядок, маскуючи чутливі поля."""
+    if not data:
+        return ""
+    if isinstance(data, bytes):
+        return _body_hint(data, "application/x-www-form-urlencoded")
+    if isinstance(data, dict):
+        masked = {
+            k: "***" if str(k) in _SENSITIVE else v
+            for k, v in data.items()
+        }
+        # Компактний формат: key=value  key2=value2
+        parts = [f"{k}={v}" for k, v in masked.items()]
+        return "  ".join(parts)
+    return str(data)[:200]
+
+
+def log_payload_curl(
+    method: str,
+    url: str,
+    *,
+    params: Any = None,
+    data: Any = None,
+    json_body: Any = None,
+) -> None:
+    """
+    Крок 1: логує що передається в запит ДО його відправки.
+
+    Виклик:
+        log_payload_curl("POST", url, data=body_dict)
+        log_payload_curl("GET",  url, params={"page": 1})
+    """
+    parts: list[str] = []
+    if params:
+        parts.append(f"params={_format_payload(params)}")
+    if data:
+        parts.append(f"data={_format_payload(data)}")
+    if json_body:
+        parts.append(f"json={_format_payload(json_body)}")
+
+    if not parts:
+        return  # нема тіла — не засмічуємо лог
+
+    _log().debug(f"  ↑  {method:<5} {url}  {' | '.join(parts)}")
+
+
+def log_request_curl(method: str, url: str, headers: dict, body: Any = None) -> float:
+    """
+    Крок 2: логує сам HTTP-запит (METHOD URL).
+    Повертає monotonic timestamp для розрахунку elapsed у log_response_curl.
+
+    Примітка: body тут ігнорується — payload вже залогований у log_payload_curl.
+    Параметр залишено для зворотної сумісності.
+    """
+    t = time.monotonic()
+    _log().debug(f"  →  {method:<5} {url}")
+    return t
+
+
+def log_response_curl(status: int, url: str, body: bytes, content_type: str, started: float) -> None:
+    """
+    Крок 3: логує сиру відповідь одразу після отримання, ДО будь-якої валідації.
+    """
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    hint   = _body_hint(body, content_type)
+    level  = logging.DEBUG if status < 400 else logging.WARNING
+    suffix = f"  {hint}" if hint else ""
+    _log().log(level, f"  ←  {status}  {elapsed_ms}ms  {url}{suffix}")

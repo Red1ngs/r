@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
 from src.core.runtime.scheduler import EventDrivenScheduler
-from src.mangabuff.farmer.parsers import parse_chapters, parse_manga_data_id, parse_manga_views
+from src.mangabuff.manga_load.parsers import parse_chapters, parse_manga_data_id, parse_manga_views
 
 if TYPE_CHECKING:
     from src.core.account import Account
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 from src.core.logging.loggers import get_account_logger
 
 
-def _load_manga_batch(bot: "Account", translits: list[str]) -> int:
+async def _load_manga_batch(bot: "Account", translits: list[str]) -> int:
     """
     Парсить глави для кожного translit_name з батчу і зберігає в БД.
     Повертає кількість збережених глав.
@@ -52,7 +52,7 @@ def _load_manga_batch(bot: "Account", translits: list[str]) -> int:
             get_account_logger(bot.account_id).warning(f"[{bot.account_id}] manga_loader: акаунт відключено, батч скасовано")
             return 0  # або raise відповідний виняток
 
-        html = bot.session.fetch_manga_chapters(translit_name, manga_row.data_id)
+        html = await bot.safe_session.fetch_manga_chapters(translit_name, manga_row.data_id)
         if not html:
             get_account_logger(bot.account_id).warning(
                 f"MangaLoader: "
@@ -79,7 +79,7 @@ def _load_manga_batch(bot: "Account", translits: list[str]) -> int:
     return total_chapters
 
 
-def _force_load_manga(bot: "Account", translit_name: str) -> int:
+async def _force_load_manga(bot: "Account", translit_name: str) -> int:
     """
     Парсить та зберігає глави для translit_name без залежності від каталогу.
 
@@ -99,7 +99,7 @@ def _force_load_manga(bot: "Account", translit_name: str) -> int:
 
     if manga_row is None:
         # Манга невідома — отримуємо сторінку щоб дізнатися data_id
-        page_html = bot.session.fetch_manga_page(translit_name)  # noqa: SLF001
+        page_html = await bot.safe_session.fetch_manga_page(translit_name)  # noqa: SLF001
         if not page_html:
             logger.warning(
                 f"force_parse: "
@@ -128,7 +128,7 @@ def _force_load_manga(bot: "Account", translit_name: str) -> int:
             f"нова манга {translit_name!r} зареєстрована в БД (data_id={data_id})"
         )
 
-    html = bot.session.fetch_manga_chapters(translit_name, manga_row.data_id)
+    html = await bot.safe_session.fetch_manga_chapters(translit_name, manga_row.data_id)
     if not html:
         logger.warning(
             f"force_parse: "
@@ -213,7 +213,7 @@ class MangaLoaderProfession(BaseProfession):
         )
 
         try:
-            saved = _load_manga_batch(ctx.bot, translits)
+            saved = await _load_manga_batch(ctx.bot, translits)
             get_account_logger(ctx.account_id).info(
                 f"MangaLoaderProfession: "
                 f"батч завершено — {saved} глав збережено"
@@ -226,7 +226,7 @@ class MangaLoaderProfession(BaseProfession):
             # Знімаємо лок і будимо всіх читачів після кожного батчу.
             if self._scheduler is not None:
                 await self._scheduler.release_loader_lock()
-                self._scheduler.emit_event(
+                await self._scheduler.emit_event(
                     "loader.chapters_ready",
                     {},
                     source=self._account_id,
@@ -251,7 +251,7 @@ class MangaLoaderProfession(BaseProfession):
             total_chapters = 0
             saved_mangas   = 0
             for translit_name in translits:
-                chapters = _force_load_manga(ctx.bot, translit_name)
+                chapters = await _force_load_manga(ctx.bot, translit_name)
                 total_chapters += chapters
                 if chapters > 0:
                     saved_mangas += 1

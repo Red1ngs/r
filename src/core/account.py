@@ -80,20 +80,28 @@ class Account:
     def is_connected(self) -> bool:
         return self._session is not None
 
-    def connect(self) -> bool:
+    async def connect(self) -> bool:
         try:
             from src.mangabuff.session import BotSession
+            from src.utils.logging import set_http_logger
+
             session = BotSession(self.bot_config, self.app_config)
 
             if self.bot_config.network.proxy:
-                if not session.check_proxy():
-                    session.close()
+                if not await session.check_proxy():
+                    await session.close()
                     return self._fail("Проксі недоступне або не працює")
 
-            session.authenticate()
+            await session.authenticate()
             self._session = session
             self.status   = AccountStatus.IDLE
             self.error    = None
+
+            # FIX: прив'язуємо HTTP-логер до акаунта одразу після connect().
+            # set_http_logger() використовує ContextVar — логи session.py
+            # тепер потраплять у logs/accounts/{account_id}.log.
+            set_http_logger(get_account_logger(self.account_id))
+
             self._log.info("✅ Підключено")
             return True
         except PermissionError:
@@ -101,9 +109,9 @@ class Account:
         except Exception as e:
             return self._fail(f"Помилка підключення: {e}")
 
-    def disconnect(self) -> None:
+    async def disconnect(self) -> None:
         if self._session:
-            self._session.close()
+            await self._session.close()
             self._session = None
             self._log.info("🔌 Відключено")
 

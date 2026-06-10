@@ -14,9 +14,9 @@ reader/inventory.py — типізовані інвентарі.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
-    Any, Optional,
+    Any
 )
 
 from src.core.inventory.model import BaseInventory
@@ -100,49 +100,3 @@ class ReaderInventory(BaseInventory):
             f"limit={p.get('limit', 2)} "
             f"slot_counts={self.slot_counts}>"
         )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LoaderInventory
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class LoaderInventory(BaseInventory):
-    """
-    Зберігає стан LoaderProfession між запусками.
-
-    catalog_page — фікс #6: кожен акаунт пам'ятає свою сторінку каталогу
-                   незалежно від кількості манг у спільній БД.
-    """
-
-    @property
-    def catalog_page(self) -> int:
-        """Остання успішно оброблена сторінка каталогу (1-based)."""
-        return int(self.data.get("catalog_page", 1))
-
-    @catalog_page.setter
-    def catalog_page(self, value: int) -> None:
-        self.data["catalog_page"] = max(1, value)
-
-    def __repr__(self) -> str:
-        return f"<LoaderInventory catalog_page={self.catalog_page}>"
-    
-    
-@dataclass
-class CatalogLoaderInventory(BaseInventory):
-    """
-    Per-account стан CatalogLoaderProfession.
-
-    catalog_page — фікс #6: кожен акаунт пам'ятає свою сторінку каталогу
-                   незалежно від кількості манг у спільній БД.
-    """
-
-    @property
-    def catalog_page(self) -> int:
-        return int(self.data.get("catalog_page", 1))
-
-    @catalog_page.setter
-    def catalog_page(self, value: int) -> None:
-        self.data["catalog_page"] = max(1, value)
-
-    def __repr__(self) -> str:
-        return f"<CatalogLoaderInventory catalog_page={self.catalog_page}>"

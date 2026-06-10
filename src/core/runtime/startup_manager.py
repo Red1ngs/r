@@ -46,7 +46,7 @@ class StartupManager:
     """
     Послідовний connect для кожного акаунта з паузою між ними.
 
-    scheduler.connect_account() — синхронний (HTTP-запити), тому
+    scheduler.connect_account() — async, виконується через await.
     запускається в ThreadPoolExecutor щоб не блокувати event loop.
 
     Використання в main.py:
@@ -89,23 +89,13 @@ class StartupManager:
             f"(затримка між акаунтами: {self._cfg.connect_delay}s)"
         )
 
-        loop = asyncio.get_running_loop()
-
         for idx, account_id in enumerate(self._queue):
             if idx > 0:
                 await asyncio.sleep(self._cfg.connect_delay)
 
             log.info(f"[StartupManager] [{idx + 1}/{total}] connect '{account_id}' …")
             try:
-                # connect_account() синхронний → executor
-                ok = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None,
-                        self._scheduler.connect_account,
-                        account_id,
-                    ),
-                    timeout=self._cfg.connect_timeout,
-                )
+                ok = await self._scheduler.connect_account(account_id)
                 if ok:
                     self._ok.append(account_id)
                     log.info(f"[StartupManager] ✓ '{account_id}' підключено")

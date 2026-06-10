@@ -126,19 +126,19 @@ class SchedulerService:
 
     # ── Читання стану ─────────────────────────────────────────────────────────
 
-    def snapshot(self) -> SchedulerSnapshot:
+    async def snapshot(self) -> SchedulerSnapshot:
         scheduler = self._scheduler
         accounts = [
             info
             for acc_id in scheduler.account_ids()
-            if (info := self._build_info(acc_id, scheduler)) is not None
+            if (info := await self._build_info(acc_id, scheduler)) is not None
         ]
         return SchedulerSnapshot(total_accounts=len(accounts), accounts=accounts)
 
-    def account_info(self, account_id: str) -> Optional[AccountInfo]:
-        return self._build_info(account_id, self._scheduler)
+    async def account_info(self, account_id: str) -> Optional[AccountInfo]:
+        return await self._build_info(account_id, self._scheduler)
 
-    def _build_info(self, acc_id: str, scheduler: EventDrivenScheduler) -> Optional[AccountInfo]:
+    async def _build_info(self, acc_id: str, scheduler: EventDrivenScheduler) -> Optional[AccountInfo]:
         bot    = scheduler.get_bot(acc_id)
         status = scheduler.status(acc_id)
         if bot is None or status is None:
@@ -162,31 +162,31 @@ class SchedulerService:
             is_connected = bot.is_connected,
         )
 
-    def account_ids(self) -> list[str]:
+    async def account_ids(self) -> list[str]:
         return self._scheduler.account_ids()
 
-    def get_bot(self, account_id: str):
+    async def get_bot(self, account_id: str):
         """Повертає Account або None. Використовується StartupManager."""
         return self._scheduler.get_bot(account_id)
 
-    def connect_account(self, account_id: str) -> bool:
+    async def connect_account(self, account_id: str) -> bool:
         """
         Встановлює сесію і підключає монітори.
         Делегує в scheduler.connect_account() — єдине місце де це відбувається.
         """
-        return self._scheduler.connect_account(account_id)
+        return await self._scheduler.connect_account(account_id)
 
-    def disconnect_account(self, account_id: str) -> bool:
+    async def disconnect_account(self, account_id: str) -> bool:
         """Закриває сесію акаунта без зупинки профессій."""
         bot = self._scheduler.get_bot(account_id)
         if bot is None:
             return False
-        bot.disconnect()
+        await bot.disconnect()
         return True
 
     # ── Створення акаунта ─────────────────────────────────────────────────────
 
-    def add_account(
+    async def add_account(
         self,
         account_id: str,
         email:      str,
@@ -229,7 +229,7 @@ class SchedulerService:
                 )
 
         try:
-            scheduler.add_account(account_id, bot, professions=professions)
+            await self._scheduler.add_account(account_id, bot, professions=professions)
         except ValueError as e:
             return False, str(e)
 
@@ -237,7 +237,7 @@ class SchedulerService:
 
     # ── Управління professions ────────────────────────────────────────────────
 
-    def add_profession(
+    async def add_profession(
         self,
         account_id:    str,
         profession_name: str,
@@ -257,14 +257,14 @@ class SchedulerService:
             return False, f"Помилка збірки profession {profession_name!r}: {e}"
 
         try:
-            scheduler.add_profession_to_account(account_id, profession)
+            await self._scheduler.add_profession_to_account(account_id, profession)
         except Exception as e:
             return False, f"Не вдалося додати профессію в ядро: {e}"
 
         self._repo.accounts.add_profession(account_id, profession_name, priority=priority)
         return True, ""
 
-    def remove_profession(
+    async def remove_profession(
         self,
         account_id:      str,
         profession_name: str,
@@ -273,11 +273,11 @@ class SchedulerService:
         if not scheduler.has_account(account_id):
             return False, f"Акаунт {account_id!r} не знайдено"
 
-        scheduler.remove_profession_from_account(account_id, profession_name)
+        await scheduler.remove_profession_from_account(account_id, profession_name)
         self._repo.accounts.remove_profession(account_id, profession_name)
         return True, ""
 
-    def set_professions(
+    async def set_professions(
         self,
         account_id:  str,
         profession_names: list[str],
@@ -290,13 +290,13 @@ class SchedulerService:
         target  = list(dict.fromkeys(profession_names))
 
         for name in current - set(target):
-            scheduler.remove_profession_from_account(account_id, name)
+            await scheduler.remove_profession_from_account(account_id, name)
 
         for idx, name in enumerate(target):
             if not scheduler.has_profession(account_id, name):
                 try:
                     profession = profession_factory.build(name)
-                    scheduler.add_profession_to_account(account_id, profession)
+                    await scheduler.add_profession_to_account(account_id, profession)
                 except Exception as e:
                     return False, f"Помилка profession {name!r}: {e}"
 
@@ -305,8 +305,8 @@ class SchedulerService:
 
     # ── Видалення акаунта ─────────────────────────────────────────────────────
 
-    def remove(self, account_id: str) -> bool:
-        ok = self._scheduler.remove_account(account_id)
+    async def remove(self, account_id: str) -> bool:
+        ok = await self._scheduler.remove_account(account_id)
         if ok:
             _erase_credentials(account_id)
         return ok
@@ -393,5 +393,5 @@ class SchedulerService:
             return True, res.data or {}
         return False, {}
 
-    def pause(self, account_id: str)  -> bool: return self._scheduler.pause_account(account_id)
-    def resume(self, account_id: str) -> bool: return self._scheduler.resume_account(account_id)
+    async def pause(self, account_id: str)  -> bool: return await self._scheduler.pause_account(account_id)
+    async def resume(self, account_id: str) -> bool: return await self._scheduler.resume_account(account_id)
