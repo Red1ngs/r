@@ -23,7 +23,7 @@ reader:
       reward_keys:      ["scroll_id"]
 
     - name:             "candy"
-      daily_limit:      20
+      daily_limit:      35
       interval_seconds: 180
       reward_keys:      ["token", "type"]
 
