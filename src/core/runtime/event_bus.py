@@ -54,13 +54,21 @@ class EventBus:
         enriched = {**payload, "_event": event_name, "_source": source}
         log.debug(f"[EventBus] emit {event_name!r} → {len(listeners)} subscribers")
         results = await asyncio.gather(
-            *(self._safe_call(cb, enriched) for cb in listeners),
+            # FIX Bug 11: перейменовано _safe_call → _call_subscriber,
+            # щоб назва відповідала реальній поведінці (логує + re-raise).
+            *(self._call_subscriber(cb, enriched) for cb in listeners),
             return_exceptions=True,
         )
         errors = sum(1 for r in results if isinstance(r, Exception))
         return len(listeners) - errors
 
-    async def _safe_call(self, cb: EventCallback, payload: dict[str, Any]) -> None:
+    async def _call_subscriber(self, cb: EventCallback, payload: dict[str, Any]) -> None:
+        """
+        Викликає callback. При помилці — логує і прокидає далі (в gather
+        з return_exceptions=True), щоб помилка одного підписника не заважала
+        іншим. Назва відображає реальну поведінку: НЕ «safe» (не поглинає
+        помилки), а «call subscriber».
+        """
         try:
             await cb(payload)
         except Exception as e:

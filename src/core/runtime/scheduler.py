@@ -196,21 +196,30 @@ class EventDrivenScheduler:
             except Exception as e:
                 log.warning(f"proxy_queue shutdown error: {e}")
 
+            # FIX Bug 5: disconnect() має виконуватись всередині scheduler loop,
+            # бо BotSession (curl_cffi.AsyncSession) була створена в ньому.
+            # Закривати сесію з чужого loop'у — resource leak / помилки.
+            with self._lock:
+                entries = dict(self._containers)
+
+            if entries:
+                disconnect_future = asyncio.run_coroutine_threadsafe(
+                    asyncio.gather(
+                        *(entry.bot.disconnect() for entry in entries.values()),
+                        return_exceptions=True,
+                    ),
+                    self._async_loop,
+                )
+                try:
+                    disconnect_future.result(timeout=15.0)
+                except Exception as e:
+                    log.warning(f"disconnect error during stop: {e}")
+
             self._async_loop.call_soon_threadsafe(self._async_loop.stop)
 
         if self._loop_thread and self._loop_thread.is_alive():
             self._loop_thread.join(timeout=10)
 
-        # FIX: stop() є async-методом — asyncio.run() тут заборонено (вже є running loop).
-        # Scheduler loop вже зупинено вище (call_soon_threadsafe + join),
-        # тому disconnect() викликаємо прямим await у поточному (main) loop.
-        with self._lock:
-            entries = dict(self._containers)
-
-        await asyncio.gather(
-            *(entry.bot.disconnect() for entry in entries.values()),
-            return_exceptions=True,
-        )
         log.info("EventDrivenScheduler stopped")
 
     def _run_async_loop(self) -> None:
@@ -265,19 +274,20 @@ class EventDrivenScheduler:
         professions: list["BaseProfession"],
         guard:       Optional[Condition] = None,
     ) -> None:
+        # FIX Bug 8: НЕ додаємо container до self._containers до перевірки
+        # статусу DEAD та успішного setup_professions. Якщо між check і
+        # setup хтось викличе get_bot() — він не отримає незавершений акаунт.
+        if bot.status == AccountStatus.DEAD:
+            if self._on_dead:
+                self._on_dead(bot)
+            return
+
         container = AccountContainer(bot=bot, guard=guard)
 
         with self._lock:
             if account_id in self._containers:
                 raise ValueError(f"Акаунт {account_id!r} вже існує")
             self._containers[account_id] = container
-
-        if bot.status == AccountStatus.DEAD:
-            with self._lock:
-                self._containers.pop(account_id, None)
-            if self._on_dead:
-                self._on_dead(bot)
-            return
 
         await self._setup_professions(account_id, bot, professions)
         log.info(f"[{account_id}] додано ({len(professions)} professions)")
@@ -648,11 +658,25 @@ class EventDrivenScheduler:
 
             for profession in entry.profession_list():
                 if not profession.check_guard(bot):
+                    # FIX Bug 6: повний teardown — unsubscribe EventBus,
+                    # виклик profession.teardown(), unregister з router,
+                    # відключення моніторів що більше не потрібні.
                     entry.remove_profession(profession)
                     log.info(
                         f"[{account_id}] {profession.profession_id!r} guard failed "
                         f"→ profession removed"
                     )
+                    self._event_bus.unsubscribe_owner(profession)
+                    try:
+                        await profession.teardown(self, account_id)
+                    except Exception as e:
+                        log.error(
+                            f"[{account_id}] teardown {profession.profession_id!r} "
+                            f"after guard fail: {e}"
+                        )
+                    self._router.unregister(account_id, profession.profession_id)
+                    for monitor_id in _PROFESSION_MONITORS.get(profession.profession_id, []):
+                        await self._detach_monitor_if_unused(account_id, monitor_id)
 
     async def _reap_dead_workers(self) -> None:
         with self._lock:
@@ -662,11 +686,13 @@ class EventDrivenScheduler:
             if entry.bot.status != AccountStatus.DEAD:
                 continue
             log.warning(f"[{account_id}] dead → cleanup")
-            # FIX BUG-5: прямий await, а не _run_async (ми вже в async-контексті)
+            # FIX Bug 5: прямий await, а не _run_async (ми вже в async-контексті)
             await entry.bot.disconnect()
             with self._lock:
                 self._containers.pop(account_id, None)
             self._router.unregister_account(account_id)
+            # FIX Bug 7: detach monitors ДО виклику on_dead,
+            # щоб callback бачив коректний стан (без живих моніторів).
             await self._detach_all_monitors(account_id)
             if self._on_dead:
                 self._on_dead(entry.bot)

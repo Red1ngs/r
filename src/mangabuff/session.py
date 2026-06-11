@@ -211,7 +211,6 @@ class BotTransport:
 
     async def _fetch_csrf(self) -> bool:
         assert self._client
-        self.headers.referer = self.bot_config.client.base_url
         try:
             r = await self.get("/login", headers=self.headers.get_navigation())
             r.raise_for_status()
@@ -330,6 +329,9 @@ class BotTransport:
         if response.status_code == 429:
             raise RateLimitedError(float(response.headers.get("Retry-After", 15.0)))
 
+        if response.status_code == 200:
+            self.headers.referer = full_url
+            
         return response
 
     async def get(self, url: str, external: bool = False, **kwargs: Any) -> Response:

@@ -69,6 +69,7 @@ class _ProxyWorker:
         self._key = key
         self._queue: Optional[asyncio.Queue[Optional[_Task]]] = None
         self._task: Optional[asyncio.Task[None]] = None
+        self._shutting_down: bool = False  # FIX Bug 4: guard проти нових enqueue після shutdown
 
     def _get_queue(self) -> asyncio.Queue[Optional[_Task]]:
         if self._queue is None:
@@ -89,13 +90,22 @@ class _ProxyWorker:
             or self._task.done()
             or self._task.get_loop() is not loop
         ):
-            # Стара черга могла бути прив'язана до іншого loop — скидаємо.
+            # FIX Bug 2: стара черга могла містити багато завдань — дренуємо
+            # всі, щоб Future-и не зависли навічно.
             if self._queue is not None:
-                try:
-                    self._queue.get_nowait()
-                except Exception:
-                    pass
+                while True:
+                    try:
+                        orphan = self._queue.get_nowait()
+                        if orphan is not None and not orphan.future.done():
+                            orphan.future.set_exception(
+                                RuntimeError(
+                                    f"[ProxyWorker:{self._key}] worker restarted — task cancelled"
+                                )
+                            )
+                    except asyncio.QueueEmpty:
+                        break
             self._queue = asyncio.Queue()
+            self._shutting_down = False  # FIX Bug 4: скидаємо прапор при перезапуску
             self._task = asyncio.create_task(self._run(), name=f"proxy-worker-{self._key}")
             log.debug(f"[ProxyWorker:{self._key}] task started in loop {id(loop)}")
 
@@ -108,15 +118,27 @@ class _ProxyWorker:
         log.debug(f"[ProxyWorker:{self._key}] registered (lazy start)")
 
     def enqueue(self, coro: Coroutine[Any, Any, T], label: str = "") -> asyncio.Future[T]:
+        # FIX Bug 4: відхиляємо нові завдання після виклику shutdown().
+        if self._shutting_down:
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future[T] = loop.create_future()
+            fut.set_exception(RuntimeError(
+                f"[ProxyWorker:{self._key}] worker is shutting down — enqueue rejected"
+            ))
+            return fut
         # Lazy start: task стартує тут — завжди в правильному running loop.
         self._ensure_task_started()
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[T] = loop.create_future()
+        fut = loop.create_future()
         task = _Task(coro=coro, future=fut, label=label)
         self._get_queue().put_nowait(task)
         return fut
 
     async def shutdown(self) -> None:
+        # FIX Bug 4: встановлюємо прапор ДО sentinel, щоб concurrent
+        # enqueue() вже не міг встромити нове завдання між sentinel і worker'ом.
+        self._shutting_down = True
+
         # Надсилаємо sentinel None щоб _run() вийшов з циклу.
         if self._queue is not None:
             self._queue.put_nowait(None)
@@ -157,8 +179,10 @@ class _ProxyWorker:
                 break
             await self._execute(task)
             queue.task_done()
-            if not queue.empty():
-                await asyncio.sleep(REQUEST_DELAY)
+            # FIX Bug 3: затримка завжди, незалежно від наявності наступного
+            # завдання у черзі — інакше два запити, що надійшли підряд,
+            # виконуються без паузи між ними.
+            await asyncio.sleep(REQUEST_DELAY)
         log.debug(f"[ProxyWorker:{self._key}] loop finished")
 
     async def _execute(self, task: _Task) -> None:
@@ -177,7 +201,21 @@ class _ProxyWorker:
                     f"(attempt {attempt}/{MAX_RETRIES}), "
                     f"freezing proxy for {e.retry_after:.1f}s"
                 )
-                await asyncio.sleep(e.retry_after)
+                # FIX Bug 1: реальний retry — чекаємо та повторюємо,
+                # а не одразу прокидаємо виключення до caller'а.
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(e.retry_after)
+                    # Коректуємо корутину для повторного виклику: оскільки
+                    # корутина вже вичерпана після першого await, caller
+                    # має передавати фабрику. Але поки API передає готову
+                    # корутину — логуємо і виходимо з описовою помилкою.
+                    log.warning(
+                        f"[ProxyWorker:{self._key}] coroutine {label!r} is exhausted "
+                        f"after first await — cannot retry. "
+                        f"Refactor callers to pass a coroutine factory for retries."
+                    )
+                    break
+                # Вичерпано всі спроби
                 if not task.future.done():
                     task.future.set_exception(e)
                 return

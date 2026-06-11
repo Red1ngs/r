@@ -150,9 +150,14 @@ class ReaderProfession(BaseProfession):
             log.warning("📖 submit_add_history провалився — глави не позначено як прочитані")
             return RequestResult.deny("submit_add_history failed")
 
-        data = reward.data or {}
-        reward_data = data  # alias for clarity below
-        
+        # FIX Bug 9: використовуємо окрему змінну reward_data замість
+        # перезапису параметра data — щоб уникнути shadowing і потенційних
+        # помилок у майбутньому коді після цього рядка.
+        reward_data = reward.data or {}
+
+        # FIX Bug 10: mark_chapter_read викликається лише після того, як
+        # перевірено reward.ok вище — тобто сервер підтвердив отримання.
+        # (Перевірка вже є, але тепер явно задокументована як пов'язана з Bug 10.)
         for ch in sequence:
             bot.repo.chapters.mark_chapter_read(bot.account_id, int(ch["chapter_id"]))
 
