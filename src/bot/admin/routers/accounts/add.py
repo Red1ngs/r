@@ -70,7 +70,7 @@ async def fsm_wait_id(message: Message, state: FSMContext, svc: SchedulerService
     if not acc_id or " " in acc_id:
         await _edit(_TITLE + "❌ ID не може бути порожнім або містити пробіли.\nКрок 1/4: Введи ID ще раз:", cancel_add_kb())
         return
-    if acc_id in svc.account_ids():
+    if acc_id in await svc.account_ids():
         await _edit(_TITLE + f"❌ Акаунт <code>{acc_id}</code> вже існує.\nКрок 1/4: Введи інший ID:", cancel_add_kb())
         return
 
@@ -175,7 +175,7 @@ async def _finish_from_call(
             reply_markup=_error_kb(),
         )
         return
-    ok, err = svc.add_account(acc_id, email, password, proxy)
+    ok, err = await svc.add_account(acc_id, email, password, proxy)
     if ok:
         await call.message.edit_text(  # type: ignore[union-attr]
             f"✅ Акаунт <code>{acc_id}</code> додано!\n\n"
@@ -212,7 +212,7 @@ async def _finish_from_msg(
         )
         return
     
-    ok, err = svc.add_account(acc_id, email, password, proxy)
+    ok, err = await svc.add_account(acc_id, email, password, proxy)
     if ok:
         text = (
             f"✅ Акаунт <code>{acc_id}</code> додано!\n\n"
