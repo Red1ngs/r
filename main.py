@@ -138,8 +138,13 @@ async def main() -> None:
         while True:
             await asyncio.sleep(30)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        log.info("Shutdown requested")
-        await scheduler.stop()
+        log.info("Shutdown requested...")
+        try:
+            # Обмежуємо час на очищення ресурсів
+            await asyncio.wait_for(scheduler.stop(), timeout=20.0)
+        except asyncio.TimeoutError:
+            log.warning("Shutdown timed out, forcing exit")
+        
         if admin_bot:
             admin_bot.stop()
         log.info("Shutdown complete")

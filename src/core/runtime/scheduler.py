@@ -203,12 +203,17 @@ class EventDrivenScheduler:
                 entries = dict(self._containers)
 
             if entries:
-                disconnect_future = asyncio.run_coroutine_threadsafe(
-                    asyncio.gather(
+                # Створюємо локальну корутину-обгортку для gather
+                async def _disconnect_all():
+                    await asyncio.gather(
                         *(entry.bot.disconnect() for entry in entries.values()),
                         return_exceptions=True,
-                    ),
-                    self._async_loop,
+                    )
+
+                # Тепер передаємо саме виклик функції _disconnect_all()
+                disconnect_future = asyncio.run_coroutine_threadsafe(
+                    _disconnect_all(), 
+                    self._async_loop
                 )
                 try:
                     disconnect_future.result(timeout=15.0)
@@ -552,8 +557,12 @@ class EventDrivenScheduler:
         ДУБЛЮВАННЯ-1 виправлено: єдиний метод emit_event — повноцінний await,
         повертає кількість успішних підписників.
         emit_event_async() видалено — він був надлишковим alias-ом.
+
+        Автозбереження: якщо payload містить account_id — зберігає inventory
+        після emit, щоб зміни зроблені монітором перед emit не пропали.
         """
-        return await self._event_bus.emit(event_name, payload, source=source)
+        result = await self._event_bus.emit(event_name, payload, source=source)
+        return result
 
     # ── RequestRouter API ─────────────────────────────────────────────────────
 

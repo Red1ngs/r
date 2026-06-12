@@ -50,7 +50,9 @@ async def _parse_catalog_page(bot: "Account") -> list[str]:
     page = inv.catalog_page
 
     # 1. Завантажуємо HTML сторінки
-    html = await bot.session.fetch_manga_catalog(page=page)
+    result = await bot.safe_session.fetch_manga_catalog(page=page)
+    html = result.data if result.ok else None
+    
     if not html:
         log.warning(f"[{bot.account_id}] CatalogLoader: каталог недоступний (сторінка {page})")
         return []

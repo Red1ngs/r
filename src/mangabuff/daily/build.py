@@ -123,8 +123,7 @@ class DailyProfession(BaseProfession):
                     inv.day                = day
                     inv.can_claim_calendar = True
                 
-                # Зберігаємо проміжний стан парсингу календаря
-                bot.repo.inventory.save(self._account_id, bot.inventory)
+                # Проміжний стан буде збережено автоматично через ask (auto-save в router)
             except Exception as e:
                 log.error(f"❌ Помилка отримання дня стріку: {e}", exc_info=True)
                 return RequestResult.deny(f"parse_error: {e}")
@@ -169,14 +168,10 @@ class DailyProfession(BaseProfession):
                     # не смикав сервер знову і знову до наступного дня.
                     inv.last_calendar_claimed = to_day
                     inv.can_claim_calendar    = False
-                    bot.repo.inventory.save(self._account_id, bot.inventory)
             except Exception as e:
                 log.error(f"❌ Помилка під час збору календарного бонусу: {e}", exc_info=True)
 
-        # Зберігаємо зміни у БД та емітимо події за потреби
-        if claimed_any:
-            bot.repo.inventory.save(self._account_id, bot.inventory)
-
+        # Зміни будуть збережені автоматично через auto-save в router після завершення ask
         if inv.last_daily_claimed == to_day:
             both_done = inv.last_calendar_claimed == to_day
             payload: dict[str, Any] = {
@@ -218,7 +213,7 @@ class DailyProfession(BaseProfession):
         inv.last_daily_claimed    = None  # type: ignore[assignment]
         inv.last_calendar_claimed = None  # type: ignore[assignment]
         inv.can_claim_calendar    = False
-        ctx.bot.repo.inventory.save(ctx.account_id, ctx.bot.inventory)
+        # Збереження відбудеться автоматично через auto-save в router після ask
 
         get_account_logger(ctx.account_id).info(
             "DailyProfession: force_claim → стан скинуто. Емітуємо подію для монітора."

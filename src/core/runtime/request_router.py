@@ -53,7 +53,7 @@ class RequestRouter:
             f"intent={ctx.intent!r} caller={ctx.caller!r}"
         )
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 profession.handle_request(ctx.intent, data, ctx),
                 timeout=ctx.timeout,
             )
@@ -62,3 +62,14 @@ class RequestRouter:
         except Exception as e:
             log.error(f"[Router] {ctx.profession_id!r}: {e}", exc_info=True)
             return RequestResult.deny(f"internal error: {e}")
+
+        # Автозбереження інвентарю лише якщо approved — тільки тоді
+        # profession реально змінила стан. Deny = нічого не змінилось.
+        # Profession не повинна викликати repo.inventory.save() напряму.
+        if result.approved:
+            try:
+                ctx.bot.repo.inventory.save(ctx.account_id, ctx.bot.inventory)
+            except Exception as e:
+                log.warning(f"[Router] auto-save inventory failed for {ctx.account_id!r}: {e}")
+
+        return result

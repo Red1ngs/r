@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from src.mangabuff.manga_load.inventory import ReaderInventory
+    from src.mangabuff.reader.inventory import ReaderInventory
     from src.mangabuff.personal.inventory import PersonalInventory
     from src.mangabuff.manga_load.inventory import LoaderInventory
     from src.mangabuff.alliance.inventory import AllianceInventory

@@ -65,7 +65,7 @@ class ReaderInventory(BaseInventory):
     def slot_counts(self) -> dict[str, int]:
         """Повертає {} якщо дата застаріла."""
         from src.utils.time import today
-        if self.data.get("slot_counts_date", "") != today():
+        if self.slot_counts_date != today():
             return {}
         return dict(self.data.get("slot_counts", {}))
 
@@ -79,7 +79,7 @@ class ReaderInventory(BaseInventory):
         """
         from src.utils.time import today
         t = today()
-        if self.data.get("slot_counts_date", "") != t:
+        if self.slot_counts_date != t:
             self.data["slot_counts"] = {}
             self.data["slot_counts_date"] = t
         counts: dict[str, int] = self.data.setdefault("slot_counts", {})

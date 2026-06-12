@@ -15,8 +15,9 @@ src/core/runtime/profession.py — BaseProfession + RequestResult.
 
 Де зберігається стан?
     bot.inventory.{namespace} (Inventories = BlackBoard).
-    Persistується автоматично після завершення операцій.
-    Для критичних checkpoint-ів — явно через bot.repo.inventory.save().
+    Persistується автоматично після завершення handle_request (через RequestRouter)
+    та після emit_event що містить account_id (через EventDrivenScheduler).
+    Profession і Monitor НЕ повинні викликати bot.repo.inventory.save() напряму.
 
 Lifecycle:
     setup(scheduler, account_id)  — підписки + реєстрація

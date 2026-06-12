@@ -350,16 +350,6 @@ class ReadingMonitor(BaseMonitor):
             return
         log = get_account_logger(self._account_id)
 
-        scheduler = self._scheduler
-        if scheduler is not None:
-            bot = scheduler.get_bot(self._account_id)
-            if bot is not None:
-                inv = getattr(bot.inventory, "reader", None)
-                if inv is not None:
-                    inv.reset_slot_counts()
-                    bot.repo.inventory.save(self._account_id, bot.inventory)
-                    log.info("[ReadingMonitor] daily.claimed → slot_counts скинуто та збережено")
-
         self._sleeping = False
         self._slot_limit_reached = False
 
@@ -428,9 +418,6 @@ class ReadingMonitor(BaseMonitor):
             f"[ReadingMonitor] slot={slot.name!r} "
             f"count={new_count}/{slot.daily_limit}"
         )
-
-        # Bug 1: persist slot_counts immediately
-        bot.repo.inventory.save(self._account_id, bot.inventory)
 
         # Bug 2+3: claim any reward with a token BEFORE emitting slot_limit_reached
         if reward.get("token"):

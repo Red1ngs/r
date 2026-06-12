@@ -365,9 +365,6 @@ class SchedulerService:
             },
         )
         if res.approved:
-            bot = self._scheduler.get_bot(account_id)
-            if bot:
-                self._repo.inventory.save(account_id, bot.inventory)
             return True
         return False
 

@@ -52,7 +52,9 @@ async def _load_manga_batch(bot: "Account", translits: list[str]) -> int:
             get_account_logger(bot.account_id).warning(f"[{bot.account_id}] manga_loader: акаунт відключено, батч скасовано")
             return 0  # або raise відповідний виняток
 
-        html = await bot.safe_session.fetch_manga_chapters(translit_name, manga_row.data_id)
+        result = await bot.safe_session.fetch_manga_chapters(translit_name, manga_row.data_id)
+        html = result.data if result.ok else None
+        
         if not html:
             get_account_logger(bot.account_id).warning(
                 f"MangaLoader: "
@@ -99,7 +101,8 @@ async def _force_load_manga(bot: "Account", translit_name: str) -> int:
 
     if manga_row is None:
         # Манга невідома — отримуємо сторінку щоб дізнатися data_id
-        page_html = await bot.safe_session.fetch_manga_page(translit_name)  # noqa: SLF001
+        result = await bot.safe_session.fetch_manga_page(translit_name) 
+        page_html = result.data if result.ok else None
         if not page_html:
             logger.warning(
                 f"force_parse: "
@@ -128,7 +131,8 @@ async def _force_load_manga(bot: "Account", translit_name: str) -> int:
             f"нова манга {translit_name!r} зареєстрована в БД (data_id={data_id})"
         )
 
-    html = await bot.safe_session.fetch_manga_chapters(translit_name, manga_row.data_id)
+    result = await bot.safe_session.fetch_manga_chapters(translit_name, manga_row.data_id)
+    html = result.data if result.ok else None
     if not html:
         logger.warning(
             f"force_parse: "

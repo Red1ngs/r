@@ -206,9 +206,10 @@ class ReaderProfession(BaseProfession):
     # ── get_state ─────────────────────────────────────────────────────────────
 
     async def _handle_get_state(self, ctx: "RequestContext") -> RequestResult:
-        inv: ReaderInventory = ctx.bot.inventory.reader  # type: ignore[attr-defined]
-        params_raw = inv.data.get("reading_params", {})
-        return RequestResult.approve(data={"reading_params": params_raw})
+        inv: ReaderInventory = ctx.bot.inventory.reader  
+        return RequestResult.approve(
+            data={"reading_params": inv.reading_params}
+        )
 
     # ── set_reading_params ────────────────────────────────────────────────────
 

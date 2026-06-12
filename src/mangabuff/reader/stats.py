@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from src.utils.time import format_ts, now_ts
 
@@ -48,7 +48,7 @@ class ReaderRewardStats:
     def record(
         self,
         slot_name:   str,
-        reward:      Optional[dict],
+        reward:      Optional[dict[str, Any]],
         ts:          Optional[float] = None,
     ) -> None:
         """
