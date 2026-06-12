@@ -417,8 +417,12 @@ class EventDrivenScheduler:
             await profession.setup(self, account_id)
             self._router.register(account_id, profession)
             await profession.restore_state(bot)
-            # FIX BUG-6: await замість непоміченого виклику без await
-            await self._attach_monitors_for(account_id, profession.profession_id)
+            # Монітори підключаємо тільки якщо сесія вже встановлена.
+            # Якщо ні — connect_account() підключить їх через _attach_all_monitors()
+            # коли сесія буде готова (hot-add: connect одразу після add_account;
+            # cold-start: StartupManager.run() → connect_account()).
+            if bot.is_connected:
+                await self._attach_monitors_for(account_id, profession.profession_id)
             log.info(f"[{account_id}] dynamic setup {profession.profession_id!r} complete")
         except Exception as e:
             with self._lock:

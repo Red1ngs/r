@@ -21,8 +21,9 @@ core/runtime/proxy_queue.py — черга HTTP-запитів per-proxy.
     └── "__no_proxy__"        → _ProxyWorker → asyncio.Queue → sequential
 
 Використання в BotTransport:
-    # В __init__ — реєструємо воркер:
-    proxy_queue_manager.ensure(bot_config.network.proxy)
+    # НЕ викликати ensure() з __init__ — він може виконуватись в aiogram-loop,
+    # тоді як реальні запити підуть з scheduler-loop → Future cross-loop error.
+    # Воркер реєструється лінько при першому enqueue_coro() у правильному loop.
 
     # В get() і post():
     return await proxy_queue_manager.enqueue_coro(

@@ -167,7 +167,15 @@ class BotTransport:
         self.headers    = RequestHeaders(bot_config)
         self._client:   Optional[AsyncSession] = None
 
-        proxy_queue_manager.ensure(bot_config.network.proxy)
+        # НЕ викликаємо proxy_queue_manager.ensure() тут.
+        # BotTransport.__init__ може виконуватись в aiogram-loop (наприклад,
+        # під час hot-add акаунта через бот), тоді як реальні запити йдуть
+        # з scheduler-loop. Якщо ensure() зареєструє воркер в aiogram-loop,
+        # а перший enqueue() відбудеться вже в scheduler-loop — Future
+        # виявиться прив'язаною до іншого loop → RuntimeError.
+        # Реєстрація воркера відкладена до першого enqueue() через
+        # proxy_queue_manager.enqueue_coro() → worker.enqueue() →
+        # _ensure_task_started() — завжди у правильному running loop.
         self._create_client()
 
     def _create_client(self) -> None:

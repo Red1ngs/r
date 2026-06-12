@@ -233,6 +233,15 @@ class SchedulerService:
         except ValueError as e:
             return False, str(e)
 
+        # Встановлюємо сесію одразу після реєстрації.
+        # Без цього будь-яка profession що спробує safe_session до наступного
+        # StartupManager.run() (якого при hot-add немає) — отримає RuntimeError.
+        ok = await self._scheduler.connect_account(account_id)
+        if not ok:
+            err = bot.error or "connect() повернув False"
+            await self._scheduler.remove_account(account_id)
+            return False, f"Акаунт зареєстровано, але сесія не встановлена: {err}"
+
         return True, ""
 
     # ── Управління professions ────────────────────────────────────────────────
