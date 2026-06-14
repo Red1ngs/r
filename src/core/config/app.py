@@ -8,10 +8,29 @@ from typing import Optional, Any
 
 @dataclass(frozen=True)
 class RewardSlotCfg:
-    name:             str
-    daily_limit:      int
-    interval_seconds: float
-    reward_keys:      tuple[str, ...] = ()
+    name:                  str
+    daily_limit:           int
+    interval_seconds:      float
+    reward_keys:           tuple[str, ...] = ()
+    max_chapters_per_slot: int             = 0
+    """
+    Максимальна кількість глав що можна витратити на цей слот.
+    Якщо > 0 — після витрати такої кількості глав (навіть якщо слот ще не
+    заповнено нагородами) монітор переходить до наступного слота не чекаючи
+    заповнення поточного.
+    0 = ліміт вимкнено (стара поведінка — перемикатись лише по daily_limit).
+
+    app.yaml:
+        reward_slots:
+          - name: card
+            daily_limit: 5
+            interval_seconds: 120
+            max_chapters_per_slot: 20   # переключитись після 20 глав
+          - name: scroll
+            daily_limit: 3
+            interval_seconds: 300
+            max_chapters_per_slot: 0    # без ліміту по главах (за замовчуванням)
+    """
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RewardSlotCfg":
@@ -20,6 +39,7 @@ class RewardSlotCfg:
             daily_limit=int(d.get("daily_limit", 0)),
             interval_seconds=float(d.get("interval_seconds", 0.0)),
             reward_keys=tuple(d.get("reward_keys", [])),
+            max_chapters_per_slot=int(d.get("max_chapters_per_slot", 0)),
         )
 
     def matches(self, reward: dict[str, Any]) -> bool:
@@ -151,21 +171,40 @@ class ReaderAppCfg:
     
     def next_available_slot_for_mode(
         self,
-        mode_name: str,
-        slot_counts: dict[str, int],
+        mode_name:      str,
+        slot_counts:    dict[str, int],
+        chapters_spent: Optional[dict[str, int]] = None,
     ) -> Optional[RewardSlotCfg]:
         """
-        Перший слот активного режиму у якого count < daily_limit.
+        Перший слот активного режиму що ще не вичерпано.
+
+        Слот вважається вичерпаним якщо виконується хоча б одна умова:
+          1. slot_counts[name] >= daily_limit  (нагород зібрано досить)
+          2. max_chapters_per_slot > 0 і
+             chapters_spent[name] >= max_chapters_per_slot
+             (витрачено забагато глав на цей слот — перемикаємось достроково)
+
         Повертає None якщо всі слоти вичерпані (або mode.slots порожній).
         """
         mode = self.get_mode(mode_name)
         slot_map = {s.name: s for s in self.reward_slots}
+        spent = chapters_spent or {}
+
         for slot_name in mode.slots:
             slot = slot_map.get(slot_name)
             if slot is None:
                 continue
-            if slot_counts.get(slot_name, 0) < slot.daily_limit:
-                return slot
+
+            # Ліміт по нагородах
+            if slot_counts.get(slot_name, 0) >= slot.daily_limit:
+                continue
+
+            # Ліміт по главах (якщо заданий)
+            if slot.max_chapters_per_slot > 0:
+                if spent.get(slot_name, 0) >= slot.max_chapters_per_slot:
+                    continue
+
+            return slot
         return None
 
     def find_slot(self, reward: dict[str, Any]) -> Optional[RewardSlotCfg]:

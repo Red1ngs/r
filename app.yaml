@@ -16,16 +16,19 @@ reader:
       daily_limit:      10
       interval_seconds: 5400
       reward_keys:      ["id", "name", "image"]
+      max_chapters_per_slot: 30
 
     - name:             "scroll"
       daily_limit:      5
       interval_seconds: 1800
       reward_keys:      ["scroll_id"]
+      max_chapters_per_slot: 10
 
     - name:             "candy"
       daily_limit:      35
       interval_seconds: 180
       reward_keys:      ["token", "type"]
+      max_chapters_per_slot: 70
 
   reading_modes:
     standard:

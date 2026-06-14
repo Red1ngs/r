@@ -81,6 +81,7 @@ class ReaderInventory(BaseInventory):
         t = today()
         if self.slot_counts_date != t:
             self.data["slot_counts"] = {}
+            self.data["slot_chapters_spent"] = {}
             self.data["slot_counts_date"] = t
         counts: dict[str, int] = self.data.setdefault("slot_counts", {})
         counts[slot_name] = counts.get(slot_name, 0) + 1
@@ -91,6 +92,36 @@ class ReaderInventory(BaseInventory):
         from src.utils.time import today
         self.data["slot_counts"] = {}
         self.data["slot_counts_date"] = today()
+        self.data["slot_chapters_spent"] = {}
+
+    # ── Slot chapters spent ───────────────────────────────────────────────────
+
+    @property
+    def slot_chapters_spent(self) -> dict[str, int]:
+        """
+        Кількість глав витрачених на кожен слот сьогодні.
+        Повертає {} якщо дата застаріла (той самий date-guard що у slot_counts).
+        """
+        from src.utils.time import today
+        if self.slot_counts_date != today():
+            return {}
+        return dict(self.data.get("slot_chapters_spent", {}))
+
+    def add_slot_chapters_spent(self, slot_name: str, chapters: int) -> int:
+        """
+        Додає `chapters` до лічильника витрачених глав для слота.
+        Auto-reset якщо новий день (разом з slot_counts через спільний date-guard).
+        Повертає нове значення.
+        """
+        from src.utils.time import today
+        t = today()
+        if self.slot_counts_date != t:
+            self.data["slot_counts"] = {}
+            self.data["slot_chapters_spent"] = {}
+            self.data["slot_counts_date"] = t
+        spent: dict[str, int] = self.data.setdefault("slot_chapters_spent", {})
+        spent[slot_name] = spent.get(slot_name, 0) + chapters
+        return spent[slot_name]
 
     def __repr__(self) -> str:
         p = self.reading_params
