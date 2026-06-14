@@ -107,8 +107,7 @@ class ReadingMonitor(BaseMonitor):
         self._wakeup_task:    Optional[asyncio.Task[None]]    = None
         self._sleeping:               bool                     = False
         self._slot_limit_reached:     bool                     = False
-        self._last_read_chapters:     int                      = 0
-        self._last_active_slot:       str                      = ""
+
 
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -190,7 +189,7 @@ class ReadingMonitor(BaseMonitor):
         if not mode.slots:
             return mode.fallback_interval_s
 
-        slot_counts     = inv.slot_counts     
+        slot_counts     = inv.slot_counts
         chapters_spent  = inv.slot_chapters_spent
         slot = cfg.next_available_slot_for_mode(mode_name, slot_counts, chapters_spent)
 
@@ -260,7 +259,6 @@ class ReadingMonitor(BaseMonitor):
             return
 
         log = get_account_logger(self._account_id)
-        bot = scheduler.get_bot(self._account_id)
 
         if self._sleeping:
             log.debug("[ReadingMonitor] sleeping — пропускаємо ask")
@@ -307,25 +305,23 @@ class ReadingMonitor(BaseMonitor):
                 await self._schedule_next()
             return
 
-        # Списуємо глави з поточного активного слота.
-        # Якщо нагорода випаде з іншого слота — _on_reward_received перенесе глави туди.
-        chapters_read: int = (result.data or {}).get("read", 0)
-        self._last_read_chapters = chapters_read
-        self._last_active_slot   = ""
+        data = result.data or {}
+        chapters_read: int = data.get("read", 0)
 
-        if chapters_read > 0:
+        # Якщо нагорода є — глави спише _on_reward_received з reward_slot.
+        # Якщо нагороди немає — списуємо тут з active_slot.
+        if chapters_read > 0 and not data.get("reward"):
             bot = scheduler.get_bot(self._account_id)
             if bot is not None:
                 cfg = bot.app_config.reader
                 inv_obj = getattr(bot.inventory, "reader", None)
                 if inv_obj is not None:
-                    slot_counts    = inv_obj.slot_counts
-                    chapters_spent = inv_obj.slot_chapters_spent
                     active_slot = cfg.next_available_slot_for_mode(
-                        mode_name, slot_counts, chapters_spent
+                        mode_name,
+                        inv_obj.slot_counts,
+                        inv_obj.slot_chapters_spent,
                     )
                     if active_slot is not None:
-                        self._last_active_slot = active_slot.name
                         await self._spend_chapters_on_slot(
                             active_slot, inv_obj, chapters_read, scheduler, log
                         )
@@ -441,15 +437,41 @@ class ReadingMonitor(BaseMonitor):
         self._cancel_wakeup()
         
     async def _on_slot_limit_reached(self, payload: dict[str, Any]) -> None:
-        """Всі слоти вичерпано — стоп до daily.claimed."""
+        """Слот вичерпано. Якщо є ще доступні слоти — продовжуємо читання на них."""
         if payload.get("account_id") != self._account_id:
             return
-        get_account_logger(self._account_id).info(
-            f"[ReadingMonitor] slot_limit_reached mode={payload.get('mode')!r} → "
-            f"зупиняємо читання до daily.claimed"
-        )
-        self._slot_limit_reached = True
-        self._cancel_wakeup()
+
+        log = get_account_logger(self._account_id)
+        scheduler = self._scheduler
+
+        # Перевіряємо чи залишились доступні слоти
+        next_slot = None
+        if scheduler is not None:
+            bot = scheduler.get_bot(self._account_id)
+            if bot is not None:
+                cfg       = bot.app_config.reader
+                inv       = getattr(bot.inventory, "reader", None)
+                mode_name = self._active_mode_name()
+                if inv is not None:
+                    next_slot = cfg.next_available_slot_for_mode(
+                        mode_name,
+                        inv.slot_counts,
+                        inv.slot_chapters_spent,
+                    )
+
+        if next_slot is not None:
+            log.info(
+                f"[ReadingMonitor] slot={payload.get('slot')!r} вичерпано → "
+                f"переходимо на slot={next_slot.name!r}"
+            )
+            await self._schedule_next()
+        else:
+            log.info(
+                f"[ReadingMonitor] slot={payload.get('slot')!r} вичерпано, "
+                f"всі слоти закриті → зупиняємо до daily.claimed"
+            )
+            self._slot_limit_reached = True
+            self._cancel_wakeup()
         
     async def _on_reward_received(self, payload: dict[str, Any]) -> None:
         """
@@ -486,22 +508,9 @@ class ReadingMonitor(BaseMonitor):
             f"count={new_count}/{slot.daily_limit}"
         )
 
-        # Якщо нагорода випала з іншого слота ніж той куди списали глави —
-        # переносимо глави: відбираємо від active_slot, додаємо до reward_slot
-        chapters = self._last_read_chapters
-        active_slot_name = self._last_active_slot
-        if chapters > 0 and active_slot_name and active_slot_name != slot.name:
-            cfg = bot.app_config.reader
-            slot_map = {s.name: s for s in cfg.reward_slots}
-            # Відбираємо глави від active_slot
-            active_slot_obj = slot_map.get(active_slot_name)
-            if active_slot_obj is not None:
-                inv.add_slot_chapters_spent(active_slot_name, -chapters)
-                log.info(
-                    f"[ReadingMonitor] перенос глав: "
-                    f"{active_slot_name!r} -{chapters} → {slot.name!r} +{chapters}"
-                )
-            # Додаємо до reward_slot
+        # Списуємо глави з reward_slot
+        chapters = payload.get("chapters_read", 0)
+        if chapters > 0:
             await self._spend_chapters_on_slot(slot, inv, chapters, scheduler, log)
 
         # Bug 2+3: claim any reward with a token BEFORE emitting slot_limit_reached

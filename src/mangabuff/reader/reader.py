@@ -177,7 +177,11 @@ class ReaderProfession(BaseProfession):
             if reward_data:
                 await self._scheduler.emit_event(
                     "reader.reward_received",
-                    {"account_id": bot.account_id, "reward": reward_data},
+                    {
+                        "account_id":   bot.account_id,
+                        "reward":       reward_data,
+                        "chapters_read": len(sequence),
+                    },
                     source=bot.account_id,
                 )
 
