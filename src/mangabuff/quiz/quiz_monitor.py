@@ -11,7 +11,7 @@ quiz/quiz_monitor.py — QuizMonitor.
         • Стартує після daily.claimed (скидає лічильник).
         • Якщо бот перезапустився — відновлює цикл якщо ліміт ще не вичерпано.
         • Зупиняється коли quiz.limit_reached АБО quiz.session_ended
-          і last_quiz_date == today().
+          і last_quiz_date == to_day.
 
     fixed — N правильних відповідей один раз назавжди.
         • Стартує одразу при attach().
@@ -49,6 +49,7 @@ from src.utils.time import today
 
 if TYPE_CHECKING:
     from src.core.runtime.scheduler import EventDrivenScheduler
+    from src.core.core_account import Account
 
 
 class QuizMonitor(BaseMonitor):
@@ -65,8 +66,9 @@ class QuizMonitor(BaseMonitor):
         return "quiz"
 
     def __init__(self) -> None:
-        self._account_id: str                               = ""
+        self._account_id: str                              = ""
         self._scheduler:  Optional["EventDrivenScheduler"] = None
+        self._bot:        Optional["Account"]              = None
         self._cycle_task: Optional[asyncio.Task[None]]     = None
         self._active:     bool                             = True  # False → fixed_done
 
@@ -79,6 +81,7 @@ class QuizMonitor(BaseMonitor):
     ) -> None:
         self._account_id = account_id
         self._scheduler  = scheduler
+        self._bot = scheduler.get_bot(account_id)
 
         scheduler.subscribe("daily.claimed",        self._on_daily_claimed)
         scheduler.subscribe("quiz.limit_reached",   self._on_limit_reached)
@@ -147,7 +150,7 @@ class QuizMonitor(BaseMonitor):
             return
 
         # ── Відкриваємо сесію якщо не активна ────────────────────────────────
-        inv = self._get_inv()
+        inv = self._bot.inventory.quiz if self._bot else None
         if inv is not None and not inv.session_active:
             log.info("[QuizMonitor] → ask quiz do_open")
             result = await scheduler.ask(
@@ -168,7 +171,7 @@ class QuizMonitor(BaseMonitor):
 
         # ── Цикл відповідей ────────────────────────────────────────────────────
         while self._active and self._should_run():
-            inv = self._get_inv()
+            inv = self._bot.inventory.quiz if self._bot else None
             if inv is None or not inv.session_active:
                 break
 
@@ -205,7 +208,7 @@ class QuizMonitor(BaseMonitor):
 
         Логіка ідентична ReadingMonitor._waiting_for_daily():
           - Якщо profession "daily" не зареєстрована → False.
-          - Якщо daily зібрано сьогодні (last_daily_claimed == today()) → False.
+          - Якщо daily зібрано сьогодні (last_daily_claimed == to_day) → False.
           - Інакше → True.
         """
         scheduler = self._scheduler
@@ -219,11 +222,11 @@ class QuizMonitor(BaseMonitor):
         if bot is None:
             return False
 
-        daily_inv = getattr(bot.inventory, "daily", None)
-        if daily_inv is None:
-            return False
+        daily_inv = bot.inventory.daily
+        personal = bot.inventory.personal
+        to_day = personal.to_day
 
-        return daily_inv.last_daily_claimed != today()
+        return daily_inv.last_daily_claimed != to_day
 
     def _should_run(self) -> bool:
         """
@@ -232,8 +235,11 @@ class QuizMonitor(BaseMonitor):
         daily: ліміт не вичерпано сьогодні і daily вже зібрано
         fixed: fixed_done == False
         """
-        inv = self._get_inv()
-        if inv is None:
+        bot = self._bot if self._bot else None
+        inv = bot.inventory.quiz if bot else None
+        personal = bot.inventory.personal if bot else None
+        
+        if inv is None or personal is None:
             return False
 
         if inv.mode == "fixed":
@@ -243,22 +249,13 @@ class QuizMonitor(BaseMonitor):
         if self._waiting_for_daily():
             return False
 
-        if inv.answers_reset_date != today():
+        if inv.answers_reset_date != personal.to_day:
             # Новий день — daily.claimed ще не прийшов, чекаємо
             return False
         return inv.current_counter() < inv.answer_limit
 
-    def _get_inv(self) -> Any:
-        scheduler = self._scheduler
-        if scheduler is None:
-            return None
-        bot = scheduler.get_bot(self._account_id)
-        if bot is None:
-            return None
-        return getattr(bot.inventory, "quiz", None)
-
     def _get_answer_delay(self) -> float:
-        inv = self._get_inv()
+        inv = self._bot.inventory.quiz if self._bot else None
         return float(inv.answer_delay) if inv is not None else 5.0
 
     # ── Event handlers ────────────────────────────────────────────────────────
@@ -268,7 +265,7 @@ class QuizMonitor(BaseMonitor):
         if payload.get("account_id") != self._account_id:
             return
 
-        inv = self._get_inv()
+        inv = self._bot.inventory.quiz if self._bot else None
         if inv is None or inv.mode != "daily":
             return
 
@@ -302,7 +299,7 @@ class QuizMonitor(BaseMonitor):
         if payload.get("account_id") != self._account_id:
             return
 
-        inv = self._get_inv()
+        inv = self._bot.inventory.quiz if self._bot else None
         mode = inv.mode if inv is not None else "?"
 
         get_account_logger(self._account_id).info(

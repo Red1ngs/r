@@ -108,15 +108,18 @@ class DailyMonitor(BaseMonitor):
         self._wakeup_task = None
 
     def _calculate_delay(self) -> float:
-        bot = self._scheduler.get_bot(self._account_id)
+        scheduler = self._scheduler
+        if scheduler is None:
+            return 300.0
+
+        bot = scheduler.get_bot(self._account_id)
         if bot is None:
             return 300.0
 
-        inv = getattr(bot.inventory, "daily", None)
-        if inv is None:
-            return 300.0
+        inv = bot.inventory.daily 
+        personal = bot.inventory.personal 
 
-        to_day = today()
+        to_day = personal.to_day
         all_done = (
             inv.last_daily_claimed == to_day
             and inv.last_calendar_claimed == to_day

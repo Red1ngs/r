@@ -187,10 +187,10 @@ class ReadingMonitor(BaseMonitor):
         bot = self._bot()
         if bot is None:
             return False
-        daily_inv = getattr(bot.inventory, "daily", None)
-        if daily_inv is None:
-            return False
-        return daily_inv.last_daily_claimed != today()
+        daily_inv = bot.inventory.daily
+        personal = bot.inventory.personal
+
+        return daily_inv.last_daily_claimed != personal.to_day
 
     # ── Ask ───────────────────────────────────────────────────────────────────
 

@@ -20,6 +20,7 @@ from typing import (
 )
 
 from src.core.inventory.model import BaseInventory
+from src.utils.time import today
 
 if TYPE_CHECKING:
     from src.mangabuff.manga_load.models import ItemReceivedEvent
@@ -31,7 +32,28 @@ class PersonalInventory(BaseInventory):
     @property
     def is_banned(self) -> bool:
         return bool(self.data.get("is_banned", False))
+    
+    @is_banned.setter
+    def is_banned(self, value: bool) -> None:
+        self.data["is_banned"] = value
+        
+    @property
+    def to_day(self) -> str:
+        """Дата останньої синхронізації з сайтом. Формат: "YYYY-MM-DD"."""
+        value = self.data.get("to_day")
+        if not value:
+            value = today()
+        return value
 
+    @to_day.setter
+    def to_day(self, value: str | None) -> None:
+        if value is None:
+            self.data.pop("to_day", None)
+        elif value.strip() == "":
+            raise ValueError("to_day cannot be an empty string")
+        else:
+            self.data["to_day"] = value
+            
     @property
     def user_name(self) -> str | None:
         """Ім'я користувача на сайті. Зберігається AuthService після авторизації."""

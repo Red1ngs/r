@@ -9,7 +9,7 @@ accounts/__init__.py
 """
 from aiogram import Router
 
-from src.bot.admin.routers.accounts import add, list_, menu, profession, reader_tools, loader_tools
+from src.bot.admin.routers.accounts import add, list_, menu, profession, reader_tools, loader_tools, slots
 
 router = Router(name="accounts")
 router.include_router(list_.router)
@@ -17,4 +17,5 @@ router.include_router(menu.router)
 router.include_router(profession.router)
 router.include_router(reader_tools.router)
 router.include_router(loader_tools.router)
+router.include_router(slots.router)
 router.include_router(add.router)

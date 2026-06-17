@@ -47,8 +47,10 @@ class DailyProfession(BaseProfession):
         scheduler.subscribe("account.unbanned", self._on_account_unbanned)
 
     async def restore_state(self, bot: "Account") -> None:
-        inv: DailyInventory = bot.inventory.daily  # type: ignore[attr-defined]
-        to_day = today()
+        inv: DailyInventory = bot.inventory.daily
+        personal = bot.inventory.personal
+        to_day = personal.to_day
+        
         all_done = (
             inv.last_daily_claimed == to_day
             and inv.last_calendar_claimed == to_day
@@ -83,8 +85,10 @@ class DailyProfession(BaseProfession):
 
     async def _handle_claim(self, ctx: "RequestContext") -> RequestResult:
         bot = ctx.bot
-        inv: DailyInventory = bot.inventory.daily  # type: ignore[attr-defined]
-        to_day = today()
+        inv: DailyInventory = bot.inventory.daily
+        personal = bot.inventory.personal
+        to_day = personal.to_day
+        
         log = get_account_logger(self._account_id)
 
         if not self.check_guard(bot):
@@ -193,8 +197,11 @@ class DailyProfession(BaseProfession):
         })
 
     async def _handle_get_status(self, ctx: "RequestContext") -> RequestResult:
-        inv: DailyInventory = ctx.bot.inventory.daily  # type: ignore[attr-defined]
-        to_day = today()
+        bot = ctx.bot
+        inv: DailyInventory = bot.inventory.daily
+        personal = bot.inventory.personal
+        
+        to_day = personal.to_day
         return RequestResult.approve(data={
             "last_daily_claimed":    inv.last_daily_claimed,
             "last_calendar_claimed": inv.last_calendar_claimed,

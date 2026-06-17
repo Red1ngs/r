@@ -60,9 +60,9 @@ async def cb_force_parse_start(
         return
 
     await state.set_state(ForceParseFSM.wait_input)
-    await state.update_data(acc_id=acc_id)
+    await state.update_data(acc_id=acc_id, _nav_msg_id=call.message.message_id)
 
-    await call.message.answer(  # type: ignore[union-attr]
+    await call.message.edit_text(
         f"🔍 <b>Примусовий парсинг манг</b> для <code>{acc_id}</code>\n\n"
         "Введіть <b>список translit_name через кому</b>:\n\n"
         "<i>Приклад:</i>\n"
@@ -121,7 +121,7 @@ async def cb_mark_read_start(
         return
 
     await state.set_state(MarkReadFSM.wait_input)
-    await state.update_data(acc_id=acc_id)
+    await state.update_data(acc_id=acc_id, _nav_msg_id=call.message.message_id)  # type: ignore[union-attr]
 
     await call.message.answer(  # type: ignore[union-attr]
         f"✅ <b>Позначити глави як прочитані</b> для <code>{acc_id}</code>\n\n"

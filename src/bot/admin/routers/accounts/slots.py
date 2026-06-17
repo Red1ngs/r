@@ -9,7 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from src.bot.admin.services.scheduler_service import SchedulerService
-from ._common import cancel_add_kb
+from ._common import cancel_add_kb, account_text, account_menu_kb
 from .profession_menu import profession_menu_registry
 
 router = Router(name="accounts:slots")
@@ -43,9 +43,11 @@ async def cb_slots(call: CallbackQuery, state: FSMContext, svc: SchedulerService
     params = reader_data.get("reading_params", {})
 
     await state.set_state(EditSlotsFSM.wait_limit)
-    await state.update_data(acc_id=acc_id)
+    # BUG FIX: зберігаємо nav_msg_id щоб редагувати inline-повідомлення, а не спамити новими
+    await state.update_data(acc_id=acc_id, _nav_msg_id=call.message.message_id)  # type: ignore[union-attr]
 
-    await call.message.answer(  # type: ignore[union-attr]
+    # BUG FIX: edit_text замість answer — лишаємось в тому ж inline-повідомленні
+    await call.message.edit_text(  # type: ignore[union-attr]
         f"⚙️ <b>Параметри читання</b> для <code>{acc_id}</code>\n\n"
         f"Поточні налаштування:\n"
         f"  limit        = <b>{params.get('limit', 2)}</b>\n"
@@ -60,34 +62,88 @@ async def cb_slots(call: CallbackQuery, state: FSMContext, svc: SchedulerService
 @router.message(EditSlotsFSM.wait_limit)
 async def fsm_limit_input(message: Message, state: FSMContext, svc: SchedulerService) -> None:
     text = (message.text or "").strip()
+    data = await state.get_data()
+    nav_id = data.get("_nav_msg_id")
+    bot_obj = message.bot
+    chat = message.chat.id
+
     try:
         limit = int(text)
         if limit < 1:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введіть ціле число ≥ 1. Спробуйте ще раз:")
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        if nav_id and bot_obj:
+            try:
+                await bot_obj.edit_message_text(
+                    "❌ Введіть ціле число ≥ 1. Спробуйте ще раз:",
+                    chat_id=chat, message_id=nav_id, reply_markup=cancel_add_kb(),
+                )
+                return
+            except Exception:
+                pass
+        await message.answer("❌ Введіть ціле число ≥ 1. Спробуйте ще раз:", reply_markup=cancel_add_kb())
         return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
     await state.update_data(limit=limit)
     await state.set_state(EditSlotsFSM.wait_include_tags)
-    await message.answer(
+
+    prompt = (
         "Введіть <b>include_tags</b> через кому (або <code>-</code> щоб пропустити):\n\n"
-        "<i>Приклад: <code>shounen, fantasy</code></i>",
-        reply_markup=cancel_add_kb(),
+        "<i>Приклад: <code>shounen, fantasy</code></i>"
     )
+    if nav_id and bot_obj:
+        try:
+            await bot_obj.edit_message_text(
+                prompt, chat_id=chat, message_id=nav_id,
+                reply_markup=cancel_add_kb(), parse_mode="HTML",
+            )
+            return
+        except Exception:
+            pass
+    await message.answer(prompt, reply_markup=cancel_add_kb())
 
 
 @router.message(EditSlotsFSM.wait_include_tags)
 async def fsm_include_tags_input(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
+    data = await state.get_data()
+    nav_id = data.get("_nav_msg_id")
+    bot_obj = message.bot
+    chat = message.chat.id
+
     include_tags = None if text == "-" else [t.strip() for t in text.split(",") if t.strip()]
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
     await state.update_data(include_tags=include_tags)
     await state.set_state(EditSlotsFSM.wait_exclude_tags)
-    await message.answer(
+
+    prompt = (
         "Введіть <b>exclude_tags</b> через кому (або <code>-</code> щоб пропустити):\n\n"
-        "<i>Приклад: <code>ecchi, harem</code></i>",
-        reply_markup=cancel_add_kb(),
+        "<i>Приклад: <code>ecchi, harem</code></i>"
     )
+    if nav_id and bot_obj:
+        try:
+            await bot_obj.edit_message_text(
+                prompt, chat_id=chat, message_id=nav_id,
+                reply_markup=cancel_add_kb(), parse_mode="HTML",
+            )
+            return
+        except Exception:
+            pass
+    await message.answer(prompt, reply_markup=cancel_add_kb())
 
 
 @router.message(EditSlotsFSM.wait_exclude_tags)
@@ -99,7 +155,15 @@ async def fsm_exclude_tags_input(message: Message, state: FSMContext, svc: Sched
     acc_id: str                  = data["acc_id"]
     limit:  int                  = data["limit"]
     include = data.get("include_tags")
+    nav_id = data.get("_nav_msg_id")
+    bot_obj = message.bot
+    chat = message.chat.id
     await state.clear()
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
     ok = await svc.update_reading_params(
         acc_id,
@@ -109,11 +173,27 @@ async def fsm_exclude_tags_input(message: Message, state: FSMContext, svc: Sched
     )
 
     if ok:
-        await message.answer(
+        result_text = (
             f"✅ <b>Параметри читання оновлено</b>\n"
             f"  limit        = <b>{limit}</b>\n"
             f"  include_tags = <b>{include or '—'}</b>\n"
             f"  exclude_tags = <b>{exclude_tags or '—'}</b>"
         )
     else:
-        await message.answer("❌ Не вдалося оновити параметри. Перевірте лог.")
+        result_text = "❌ Не вдалося оновити параметри. Перевірте лог."
+
+    # BUG FIX: після завершення FSM повертаємось до меню акаунта через nav-повідомлення
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="↩️ До меню акаунта", callback_data=f"acc:menu:{acc_id}"),
+    ]])
+
+    if nav_id and bot_obj:
+        try:
+            await bot_obj.edit_message_text(
+                result_text, chat_id=chat, message_id=nav_id,
+                reply_markup=back_kb, parse_mode="HTML",
+            )
+            return
+        except Exception:
+            pass
+    await message.answer(result_text, reply_markup=back_kb)

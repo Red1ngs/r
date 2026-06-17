@@ -65,10 +65,12 @@ class QuizProfession(BaseProfession):
         self._scheduler  = scheduler
 
     async def restore_state(self, bot: "Account") -> None:
-        inv: QuizInventory = bot.inventory.quiz  # type: ignore[attr-defined]
+        inv: QuizInventory = bot.inventory.quiz
         inv.init_from_config(bot.app_config.quiz)
+        
+        personal = bot.inventory.personal
+        to_day = personal.to_day
 
-        to_day = today()
         if inv.mode == "daily" and inv.answers_reset_date != to_day:
             inv.reset_daily_counter(to_day)
             inv.session_active   = False
@@ -168,7 +170,10 @@ class QuizProfession(BaseProfession):
             "no_next"   — сервер вичерпав питання, сесія закрита
         """
         bot = ctx.bot
-        inv: QuizInventory = bot.inventory.quiz  # type: ignore[attr-defined]
+        inv: QuizInventory = bot.inventory.quiz
+        personal = bot.inventory.personal
+        
+        to_day = personal.to_day
         log = get_account_logger(ctx.account_id)
 
         question = inv.current_question
@@ -240,7 +245,7 @@ class QuizProfession(BaseProfession):
                     f"🎯 Ліміт досягнуто "
                     f"({counter}/{inv.answer_limit}, mode={inv.mode}) → закриваємо"
                 )
-                inv.close_session(today())
+                inv.close_session(to_day)
 
                 if self._scheduler is not None:
                     await self._scheduler.emit_event(
@@ -267,7 +272,7 @@ class QuizProfession(BaseProfession):
 
             # Сервер вичерпав питання
             log.info("🏆 Сервер вичерпав питання")
-            inv.close_session(today())
+            inv.close_session(to_day)
             return RequestResult.approve(data={"status": "no_next"})
 
         # ── Невірна відповідь / restart ───────────────────────────────────────
@@ -277,7 +282,7 @@ class QuizProfession(BaseProfession):
                 f"Результат: {inv.correct_count}. "
                 f"mode={inv.mode}. {result.data.get('message', '')}"
             )
-            inv.close_session(today())
+            inv.close_session(to_day)
 
             if self._scheduler is not None:
                 await self._scheduler.emit_event(
@@ -360,11 +365,12 @@ class QuizProfession(BaseProfession):
         Збереження відбувається автоматично воркером після завершення задачі.
         """
         inv: QuizInventory = ctx.bot.inventory.quiz  # type: ignore[attr-defined]
+        personal = ctx.bot.inventory.personal
+        to_day = personal.to_day
 
         if inv.mode != "daily":
             return RequestResult.deny(f"reset_daily не застосовний для mode={inv.mode!r}")
-
-        to_day = today()
+        
         if inv.last_quiz_date == to_day and inv.current_counter() >= inv.answer_limit:
             get_account_logger(ctx.account_id).info(
                 "QuizProfession: reset_daily → ліміт вже вичерпано сьогодні, пропускаємо"
@@ -393,7 +399,7 @@ class QuizProfession(BaseProfession):
         inv.current_question = None
 
         if inv.mode == "daily":
-            inv.reset_daily_counter(today())
+            inv.reset_daily_counter(to_day)
             inv.last_quiz_date = None
         else:
             inv.answers_done = 0
