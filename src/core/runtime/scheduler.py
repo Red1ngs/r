@@ -40,25 +40,21 @@ from src.core.monitoring.account_monitors import AccountMonitors
 
 if TYPE_CHECKING:
     from src.core.runtime.profession import BaseProfession
+    from src.core.runtime.core_service import CoreService
 
-from src.core.account import Account
+from src.core.core_account import Account
 from src.core.inventory.model import DynamicInventories as Inventories
 from src.core.logging.loggers import get_scheduler_logger
 from src.core.runtime.event_bus import EventBus, EventCallback
 from src.core.runtime.request_router import RequestContext, RequestRouter
 from src.core.runtime.conditions import Condition
 from src.core.runtime.profession import BaseProfession, RequestResult
+from src.core.runtime.profession_spec import profession_registry
 from src.core.runtime.proxy_queue import proxy_queue_manager
 from src.core.status import AccountStatus
 
 log = get_scheduler_logger()
 
-# Маппінг: яку profession активувати → які монітори підключити.
-_PROFESSION_MONITORS: dict[str, list[str]] = {
-    "reader": ["reading"],
-    "quiz":   ["quiz"],
-    "daily":  ["daily"],
-}
 
 def _split_evenly(items: list[Any], n: int) -> list[list[Any]]:
     if n <= 0:
@@ -244,7 +240,7 @@ class EventDrivenScheduler:
 
     async def _attach_monitors_for(self, account_id: str, profession_name: str) -> None:
         """Підключає монітори, що відповідають вказаній profession."""
-        monitor_ids = _PROFESSION_MONITORS.get(profession_name, [])
+        monitor_ids = profession_registry.monitors_for(profession_name)
         if not monitor_ids:
             return
         monitors = self._get_or_create_monitors(account_id)
@@ -252,11 +248,11 @@ class EventDrivenScheduler:
 
     async def _detach_monitor_if_unused(self, account_id: str, monitor_id: str) -> None:
         """Відключає монітор, якщо жодна з активних професій його більше не потребує."""
-        owners = [
-            prof for prof, mids in _PROFESSION_MONITORS.items()
-            if monitor_id in mids
-        ]
-        if any(self.has_profession(account_id, p) for p in owners):
+        with self._lock:
+            container = self._containers.get(account_id)
+        active_ids = [p.profession_id for p in container.profession_list()] if container else []
+        used_monitors = profession_registry.all_monitors_for(active_ids)
+        if monitor_id in used_monitors:
             return
         monitors = self._monitors.get(account_id)
         if monitors is None:
@@ -280,8 +276,7 @@ class EventDrivenScheduler:
         guard:       Optional[Condition] = None,
     ) -> None:
         # FIX Bug 8: НЕ додаємо container до self._containers до перевірки
-        # статусу DEAD та успішного setup_professions. Якщо між check і
-        # setup хтось викличе get_bot() — він не отримає незавершений акаунт.
+        # статусу DEAD та успішного setup_professions.
         if bot.status == AccountStatus.DEAD:
             if self._on_dead:
                 self._on_dead(bot)
@@ -294,8 +289,32 @@ class EventDrivenScheduler:
                 raise ValueError(f"Акаунт {account_id!r} вже існує")
             self._containers[account_id] = container
 
+        # Спочатку прив'язуємо CoreService-и (наприклад AuthService).
+        # Вони мають бути готові до connect_account() і до setup professions,
+        # бо on_auth_success з'явиться під час першого authenticate().
+        await self._bind_core_services(bot)
+
         await self._setup_professions(account_id, bot, professions)
         log.info(f"[{account_id}] додано ({len(professions)} professions)")
+
+    @staticmethod
+    async def _bind_core_services(bot: Account) -> None:
+        """
+        Створює та прив'язує CoreService-и до акаунта.
+
+        profession_registry.build_core_services() повертає свіжі екземпляри
+        всіх зареєстрованих CoreService (по одному на акаунт).
+        Кожен отримує посилання на bot через bind().
+        """
+        services = profession_registry.build_core_services()
+        for svc in services:
+            await svc.bind(bot)
+        bot.core_services = services
+        if services:
+            log.debug(
+                f"[{bot.account_id}] bound core services: "
+                f"{[s.service_id for s in services]}"
+            )
 
     async def connect_account(self, account_id: str) -> bool:
         """
@@ -305,6 +324,7 @@ class EventDrivenScheduler:
         """
         with self._lock:
             container = self._containers.get(account_id)
+            
         if container is None:
             log.warning(f"[{account_id}] connect_account: акаунт не знайдено")
             return False
@@ -341,6 +361,15 @@ class EventDrivenScheduler:
         await self._teardown_professions(account_id, professions)
         self._router.unregister_account(account_id)
         await self._detach_all_monitors(account_id)
+
+        # Від'єднуємо CoreService-и
+        for svc in entry.bot.core_services:
+            try:
+                await svc.unbind()
+            except Exception as e:
+                log.warning(f"[{account_id}] CoreService {svc.service_id!r} unbind error: {e}")
+        entry.bot.core_services = []
+
         log.info(f"[{account_id}] видалено")
         return True
 
@@ -443,7 +472,7 @@ class EventDrivenScheduler:
         if profession_obj is not None:
             await self._teardown_professions(account_id, [profession_obj])
 
-        for monitor_id in _PROFESSION_MONITORS.get(profession_id, []):
+        for monitor_id in profession_registry.monitors_for(profession_id):
             await self._detach_monitor_if_unused(account_id, monitor_id)
 
         self._router.unregister(account_id, profession_id)
@@ -688,7 +717,7 @@ class EventDrivenScheduler:
                             f"after guard fail: {e}"
                         )
                     self._router.unregister(account_id, profession.profession_id)
-                    for monitor_id in _PROFESSION_MONITORS.get(profession.profession_id, []):
+                    for monitor_id in profession_registry.monitors_for(profession.profession_id):
                         await self._detach_monitor_if_unused(account_id, monitor_id)
 
     async def _reap_dead_workers(self) -> None:

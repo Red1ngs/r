@@ -1,30 +1,44 @@
+import re
 import logging
-from typing import Optional, Tuple
+from bs4 import BeautifulSoup, Tag
+from typing import Tuple, Optional
 
-from bs4 import BeautifulSoup
-
-def get_csrf_from_html(html: str) -> Tuple[Optional[str], Optional[str]]:
+def parse_main_page(html: str) -> Tuple[Optional[str], str, str]:
     """
-    Витягує CSRF-токен та ім'я користувача зі сторінки HTML.
-    Завжди повертає кортеж (token, user_name). Якщо щось не знайдено, значення буде None.
+    Витягує CSRF-токен, ім'я користувача та user_id зі сторінки HTML.
     """
     soup = BeautifulSoup(html, 'html.parser')
     
-    token: Optional[str] = None
-    user_name: Optional[str] = None
+    token:      Optional[str] = None
+    user_name:  str = ""
+    user_id:    str = ""
     
-    # Шукаємо токен
-    meta_tag = soup.find('meta', attrs={'name': 'csrf-token'})
-    if meta_tag:
+    # 1. CSRF Token
+    meta_tag = soup.select_one('meta[name="csrf-token"]')
+    if isinstance(meta_tag, Tag):
         content = meta_tag.get('content')
-        if content:
-            token = str(content)
+        # Перевіряємо, що content це рядок, а не список чи None
+        if isinstance(content, str):
+            token = content
     else:
-        logging.warning("⚠️ Мета-тег 'csrf-token' не знайдено на сторінці.")
+        logging.warning("⚠️ Мета-тег 'csrf-token' не знайдено.")
     
-    # Шукаємо ім'я
-    user_div = soup.find("div", class_="menu__name")
-    if user_div:
+    # 2. User Name
+    user_div = soup.select_one(".menu__name")
+    if isinstance(user_div, Tag):
         user_name = user_div.get_text(strip=True)
+        
+    # 3. User ID
+    bookmark_link = soup.select_one('a.header-bookmark')
+    if isinstance(bookmark_link, Tag):
+        href = bookmark_link.get('href')
+        # Переконуємося, що href - це рядок, перед тим як пхати його в regex
+        if isinstance(href, str):
+            match = re.search(r'/users/(\d+)', href)
+            if match:
+                user_id = match.group(1)
     
-    return token, user_name
+    if not user_id:
+        logging.warning("⚠️ ID користувача не знайдено.")
+
+    return token, user_name, user_id

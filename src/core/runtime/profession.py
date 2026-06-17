@@ -32,7 +32,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Optional, List, Type
 
 if TYPE_CHECKING:
-    from src.core.account import Account
+    from src.core.core_account import Account
     from src.core.runtime.request_router import RequestContext
     from src.core.runtime.scheduler import EventDrivenScheduler
 

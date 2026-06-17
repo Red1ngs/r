@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from src.core.account import Account
+    from src.core.core_account import Account
     from src.core.runtime.profession import BaseProfession, RequestResult
 
 from src.core.logging.loggers import get_logger

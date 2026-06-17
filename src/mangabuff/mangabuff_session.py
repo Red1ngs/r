@@ -12,7 +12,8 @@ import curl_cffi.requests as _cffi
 from src.core.config.bot import BotConfig
 from src.core.config.app import AppConfig
 from src.core.runtime.proxy_queue import proxy_queue_manager, RateLimitedError
-from src.mangabuff.csrf_token import get_csrf_from_html
+from src.database.repository.session import SessionRepository
+from src.mangabuff.csrf_token import parse_main_page
 from src.mangabuff.daily.parser import get_claimable_day
 from src.utils.log_section import section
 from src.utils.logging import log_request_curl, log_response_curl, log_payload_curl  # noqa: F401
@@ -149,6 +150,17 @@ class RequestHeaders:
 # РІВЕНЬ 2: ТРАНСПОРТ (HTTP, Cookies, Auth, CSRF)
 # ===========================================================================
 
+AuthSuccessCallback = Callable[[str, str], Awaitable[Any]]
+"""
+Викликається BotTransport після кожного успішного check_auth().
+Аргументи — user_name і user_id розпізнані з HTML.
+
+BotTransport нічого не знає про inventory чи Account —
+він лише сигналізує «авторизація підтверджена». Хто підписався
+(AuthService) — зберігає user_name куди потрібно.
+"""
+
+
 class BotTransport:
     """
     Низькорівневий async HTTP-клієнт на curl_cffi.AsyncSession.
@@ -162,10 +174,19 @@ class BotTransport:
     гарантує послідовне виконання запитів per-proxy без 429-колізій.
     """
 
-    def __init__(self, bot_config: BotConfig) -> None:
-        self.bot_config = bot_config
-        self.headers    = RequestHeaders(bot_config)
-        self._client:   Optional[AsyncSession] = None
+    def __init__(
+        self,
+        bot_config:      BotConfig,
+        session_repo:    SessionRepository,
+        account_id:      str,
+        on_auth_success: Optional[AuthSuccessCallback] = None,
+    ) -> None:
+        self.bot_config   = bot_config
+        self.session_repo = session_repo
+        self.account_id   = account_id
+        self.headers      = RequestHeaders(bot_config)
+        self._client:          Optional[AsyncSession]       = None
+        self._on_auth_success: Optional[AuthSuccessCallback] = on_auth_success
 
         # НЕ викликаємо proxy_queue_manager.ensure() тут.
         # BotTransport.__init__ може виконуватись в aiogram-loop (наприклад,
@@ -179,11 +200,18 @@ class BotTransport:
         self._create_client()
 
     def _create_client(self) -> None:
-        """Створює новий AsyncSession, переносячи cookies зі старого."""
+        """Створює новий AsyncSession, переносячи cookies зі старого або з БД."""
         saved_cookies: Dict[str, str] = {}
         if self._client is not None:
+            # Рестарт сесії в межах одного процесу — беремо поточні cookies
             saved_cookies = dict(self._client.cookies)
             self._client  = None
+        else:
+            # Перший старт — намагаємось відновити сесію з БД
+            db_cookies = self.session_repo.load(self.account_id)
+            if db_cookies:
+                saved_cookies = db_cookies
+                log().info(f"  → [{self.account_id}] restored {len(db_cookies)} cookies from DB")
 
         proxy = self.bot_config.network.proxy
         self._client = AsyncSession(
@@ -197,12 +225,14 @@ class BotTransport:
 
     async def authenticate(self, force: bool = False) -> None:
         if not await self.login(force=force):
+            self.session_repo.invalidate(self.account_id)
             await self.close()
             raise PermissionError("Authentication failed")
 
     async def login(self, force: bool = False) -> bool:
         if not self._client:
             return False
+        
         if self.bot_config.client.cookies:
             self._client.cookies.update(self.bot_config.client.cookies)
 
@@ -222,7 +252,7 @@ class BotTransport:
         try:
             r = await self.get("/login", headers=self.headers.get_navigation())
             r.raise_for_status()
-            token, _ = get_csrf_from_html(r.text)
+            token, _, _ = parse_main_page(r.text)
             if not token:
                 return False
             self.headers.csrf_token = token
@@ -259,12 +289,21 @@ class BotTransport:
         try:
             r = await self.get(self.bot_config.client.base_url, headers=self.headers.get_navigation())
             r.raise_for_status()
-            token, user_name = get_csrf_from_html(r.text)
+            token, user_name, user_id = parse_main_page(r.text)
             if token and user_name:
                 self.headers.csrf_token = token
                 if xsrf := self._client.cookies.get("XSRF-TOKEN"):
                     self.headers.xsrf_token = unquote(xsrf)
-                log().info(f"  → ✅ {user_name}")
+                log().info(f"  → ✅ {user_name} ({user_id})")
+
+                # Зберігаємо актуальні cookies у БД після кожного успішного check_auth.
+                self.session_repo.save(self.account_id, dict(self._client.cookies))
+
+                # Сигналізуємо підписнику (AuthService) — він сам вирішить
+                # що робити з user_name. BotTransport більше нічого не знає.
+                if self._on_auth_success is not None:
+                    await self._on_auth_success(user_name, user_id)
+
                 return True
             return False
         except Exception as e:
@@ -319,6 +358,7 @@ class BotTransport:
         if response.status_code == 419:
             log().warning("  → 419 CSRF expired — re-logging in")
             if not await self.login(force=True):
+                self.session_repo.invalidate(self.account_id)
                 raise PermissionError("Session expired and re-login failed")
             if "headers" in kwargs:
                 if self.headers.csrf_token:
@@ -364,8 +404,15 @@ class BotSession(BotTransport):
     Метод всередині просто перевіряє статус і повертає success/fail.
     """
 
-    def __init__(self, bot_config: BotConfig, app_config: AppConfig) -> None:
-        super().__init__(bot_config)
+    def __init__(
+        self,
+        bot_config:      BotConfig,
+        app_config:      AppConfig,
+        session_repo:    SessionRepository,
+        account_id:      str,
+        on_auth_success: Optional[AuthSuccessCallback] = None,
+    ) -> None:
+        super().__init__(bot_config, session_repo, account_id, on_auth_success=on_auth_success)
         self.app_config = app_config
         self.daily  = app_config.daily
         self.reader = app_config.reader

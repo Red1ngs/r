@@ -22,6 +22,15 @@ CREATE TABLE IF NOT EXISTS inventory (
     PRIMARY KEY (account_id, kind)
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+    account_id  TEXT    PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    cookies     TEXT    NOT NULL DEFAULT '{}',
+    browser     TEXT    NOT NULL DEFAULT '{}',
+    is_valid    INTEGER NOT NULL DEFAULT 1,
+    saved_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id  TEXT    NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -81,6 +90,10 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_events_updated AFTER UPDATE ON events BEGIN
     UPDATE events SET updated_at = datetime('now') WHERE id = NEW.id;
 END;
+CREATE TRIGGER IF NOT EXISTS trg_sessions_updated AFTER UPDATE ON sessions BEGIN
+    UPDATE sessions SET updated_at = datetime('now') WHERE account_id = NEW.account_id;
+END;
+
 CREATE TRIGGER IF NOT EXISTS trg_mangas_updated AFTER UPDATE ON mangas BEGIN
     UPDATE mangas SET updated_at = datetime('now') WHERE id = NEW.id;
 END;
@@ -124,6 +137,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # Якщо новій схемі bракує колонки (чиста БД вже має professions через DDL)
     elif "professions" not in cols:
         conn.execute("ALTER TABLE accounts ADD COLUMN professions TEXT NOT NULL DEFAULT '[]'")
+        conn.commit()
+    
+    session_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "browser" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN browser TEXT NOT NULL DEFAULT '{}'")
         conn.commit()
 
 

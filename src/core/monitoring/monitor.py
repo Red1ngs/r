@@ -36,7 +36,7 @@ Lifecycle:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Dict, List, Type
 
 if TYPE_CHECKING:
     from src.core.runtime.scheduler import EventDrivenScheduler

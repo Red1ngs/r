@@ -34,7 +34,7 @@ class EditSlotsFSM(StatesGroup):
 @router.callback_query(F.data.startswith("acc:slots:"))
 async def cb_slots(call: CallbackQuery, state: FSMContext, svc: SchedulerService) -> None:
     acc_id = call.data.split(":", 2)[2]
-    info   = svc.account_info(acc_id)
+    info   = await svc.account_info(acc_id)
     if info is None:
         await call.answer("❌ Акаунт не знайдено", show_alert=True)
         return

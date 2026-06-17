@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Optional
+from dataclasses import asdict, dataclass, fields
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 
@@ -14,6 +14,23 @@ class BaseHeaders:
     accept_language: str = "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7"
     accept_encoding: str = "gzip, deflate, br, zstd"
     dnt: str = "1"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BaseHeaders":
+        """Парсить словник HTTP-заголовків і створює екземпляр класу"""
+        valid_keys = {f.name for f in fields(cls)}
+        
+        # Явно вказуємо тип для init_data, щоб Pylance розумів, 
+        # що ми передаємо рядки в конструктор класу
+        init_data: dict[str, str] = {}
+        
+        for key, value in data.items():
+            normalized_key = key.lower().replace("-", "_")
+            if normalized_key in valid_keys:
+                # Одразу приводимо до str, щоб тип відповідав очікуваному в @dataclass
+                init_data[normalized_key] = str(value) 
+                
+        return cls(**init_data)
 
     def to_dict(self) -> dict[str, str]:
         """Конвертує атрибути класу в HTTP-заголовки"""

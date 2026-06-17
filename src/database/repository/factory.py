@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from src.database.repository.account import AccountRepository
     from src.database.repository.inventory import InventoryRepository
     from src.database.repository.manga import MangaRepository, ChapterRepository
+    from src.database.repository.session import SessionRepository
 
 
 class Repositories:
@@ -22,6 +23,7 @@ class Repositories:
         mangas: MangaRepository
         chapters: ChapterRepository
         inventory: InventoryRepository
+        sessions: SessionRepository
 
     def __repr__(self) -> str:
         parts = " ".join(

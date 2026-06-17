@@ -24,17 +24,9 @@ log.info("=" * 60)
 log.info("Application starting")
 
 # ── Реєстрація ────────────────────────────────────────────────────────────────
-from src.mangabuff.setup import (
-    register_inventories,
-    register_professions,
-    register_monitors,
-    register_recorders,
-)
+from src.mangabuff.setup import bootstrap
 
-register_inventories()
-register_professions()
-register_monitors()
-register_recorders()
+bootstrap()
 
 # ── БД ────────────────────────────────────────────────────────────────────────
 from src.database.setup import init_database
@@ -49,7 +41,7 @@ from src.utils.time import set_timezone
 set_timezone("Europe/Kiev")
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
-from src.core.account import Account
+from src.core.core_account import Account
 from src.core.runtime.scheduler import EventDrivenScheduler
 
 # ── Services ──────────────────────────────────────────────────────────────────

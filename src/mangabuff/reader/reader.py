@@ -1,33 +1,26 @@
 """
-farmer/reader.py — ReaderProfession.
+mangabuff/reader/reader.py — ReaderProfession.
 
 Відповідальність:
     ТІЛЬКИ виконання: отримати ask, взяти глави з БД, відправити на сайт,
-    записати прочитані, емітити події.
+    записати прочитані, оновити inventory, емітити події.
 
-    КОЛИ читати — вирішує ReadingMonitor (не Reader).
-    СТАТИСТИКА    — не зберігається тут; логується через події.
-    СЛОТИ         — видалено; Reader не знає про нагородні слоти.
+    КОЛИ читати     — вирішує ReadingMonitor.
+    ВИБІР СЛОТА     — вирішує ReadingMonitor; передає ім'я через ask-data.
+    ЗБЕРЕЖЕННЯ INV  — ТІЛЬКИ через auto-save у RequestRouter (після approve).
 
-Зовнішні виклики:
-    scheduler.ask(account_id, "reader", "do_read", {
-        "limit":        int,
-        "include_tags": list[str] | None,
-        "exclude_tags": list[str] | None,
-    })
-
-    scheduler.ask(account_id, "reader", "mark_read",  {"targets": [translit_name, ...]})
-    scheduler.ask(account_id, "reader", "get_state",  {})
-    scheduler.ask(account_id, "reader", "set_reading_params", {
-        "limit":        int,
-        "include_tags": list[str] | None,
-        "exclude_tags": list[str] | None,
-    })
+Зовнішні виклики (через scheduler.ask):
+    do_read         — {limit, include_tags, exclude_tags, active_slot}
+    account_reward  — {reward, chapters_read, active_slot}  ← після reward_received
+    claim_candy     — {token, ...}
+    get_state       — {}
+    set_reading_params — {limit, include_tags, exclude_tags}
+    mark_read       — {targets: [translit_name, ...]}
 
 Події що емітуються:
     reader.chapters_exhausted  — {account_id}
     reader.chapters_read       — {account_id, count, mangas}
-    reader.reward_received     — {account_id, reward}
+    reader.reward_received     — {account_id, reward, chapters_read, active_slot}
 """
 from __future__ import annotations
 
@@ -38,23 +31,20 @@ from src.core.runtime.scheduler import EventDrivenScheduler
 from src.mangabuff.reader.inventory import ReaderInventory
 
 if TYPE_CHECKING:
-    from src.core.account import Account
+    from src.core.core_account import Account
     from src.core.runtime.request_router import RequestContext
 
 from src.core.logging.loggers import get_account_logger
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ReaderProfession
-# ─────────────────────────────────────────────────────────────────────────────
-
 class ReaderProfession(BaseProfession):
     """
     Profession «Читач манги».
 
-    Чистий виконавець: отримує ask → читає → емітить події.
-    Не веде статистику, не знає про слоти, не планує наступний запуск.
-    Таймінг цілком делегований ReadingMonitor.
+    Чистий виконавець: ask → дія → оновлення inventory → approve.
+    RequestRouter гарантує auto-save після кожного approve.
+
+    Жодних прямих викликів repo.inventory.save() тут і в моніторах.
     """
 
     def __init__(self) -> None:
@@ -90,6 +80,8 @@ class ReaderProfession(BaseProfession):
     ) -> RequestResult:
         if intent == "do_read":
             return await self._handle_do_read(data, ctx)
+        if intent == "account_reward":
+            return await self._handle_account_reward(data, ctx)
         if intent == "claim_candy":
             return await self._handle_claim_candy(data, ctx)
         if intent == "get_state":
@@ -108,16 +100,17 @@ class ReaderProfession(BaseProfession):
         ctx:  "RequestContext",
     ) -> RequestResult:
         """
-        Запускає один цикл читання з параметрами від ReadingMonitor.
+        Один цикл читання.
 
-        Параметри:
-            limit        : int           — кількість глав за раз
-            include_tags : list[str]     — фільтр за тегами (включити)
-            exclude_tags : list[str]     — фільтр за тегами (виключити)
+        Якщо сервер повернув reward — НЕ списуємо глави тут.
+        Монітор отримає reward_received, зробить ask("account_reward"),
+        і списання відбудеться там — теж всередині RequestRouter з auto-save.
+        Якщо reward немає — списуємо одразу і повертаємо нове значення у result.data.
         """
         limit:        int                 = int(data.get("limit", 2))
         include_tags: Optional[list[str]] = data.get("include_tags") or None
         exclude_tags: Optional[list[str]] = data.get("exclude_tags") or None
+        active_slot:  Optional[str]       = data.get("active_slot") or None
 
         bot = ctx.bot
         log = get_account_logger(bot.account_id)
@@ -147,73 +140,135 @@ class ReaderProfession(BaseProfession):
         ])
 
         if not reward.ok:
-            log.warning("📖 submit_add_history провалився — глави не позначено як прочитані")
+            log.warning("📖 submit_add_history провалився")
             return RequestResult.deny("submit_add_history failed")
 
-        # FIX Bug 9: використовуємо окрему змінну reward_data замість
-        # перезапису параметра data — щоб уникнути shadowing і потенційних
-        # помилок у майбутньому коді після цього рядка.
         reward_data = reward.data or {}
 
-        # FIX Bug 10: mark_chapter_read викликається лише після того, як
-        # перевірено reward.ok вище — тобто сервер підтвердив отримання.
-        # (Перевірка вже є, але тепер явно задокументована як пов'язана з Bug 10.)
         for ch in sequence:
             bot.repo.chapters.mark_chapter_read(bot.account_id, int(ch["chapter_id"]))
 
         reward_str = f" | нагорода: {reward_data}" if reward_data else ""
         log.info(f"📖 Прочитано {len(sequence)} глав: {', '.join(mangas)}{reward_str}")
 
+        # Без reward — списуємо глави прямо тут (auto-save захопить при approve)
+        chapters_spent_new: Optional[int] = None
+        if active_slot and not reward_data:
+            inv: ReaderInventory = bot.inventory.reader
+            chapters_spent_new = inv.add_slot_chapters_spent(active_slot, len(sequence))
+
         if self._scheduler is not None:
             await self._scheduler.emit_event(
                 "reader.chapters_read",
-                {
-                    "account_id": bot.account_id,
-                    "count":      len(sequence),
-                    "mangas":     mangas,
-                },
+                {"account_id": bot.account_id, "count": len(sequence), "mangas": mangas},
                 source=bot.account_id,
             )
             if reward_data:
+                # Монітор підхопить і зробить ask("account_reward") →
+                # списання глав відбудеться там, теж під auto-save
                 await self._scheduler.emit_event(
                     "reader.reward_received",
                     {
-                        "account_id":   bot.account_id,
-                        "reward":       reward_data,
+                        "account_id":    bot.account_id,
+                        "reward":        reward_data,
                         "chapters_read": len(sequence),
+                        "active_slot":   active_slot,
                     },
                     source=bot.account_id,
                 )
 
         return RequestResult.approve(data={
-            "read":   len(sequence),
-            "mangas": mangas,
-            "reward": reward_data,
+            "read":                len(sequence),
+            "mangas":              mangas,
+            "reward":              reward_data,
+            "active_slot":         active_slot,
+            "slot_chapters_spent": chapters_spent_new,  # None якщо reward
         })
+
+    # ── account_reward ────────────────────────────────────────────────────────
+
+    async def _handle_account_reward(
+        self,
+        data: dict[str, Any],
+        ctx:  "RequestContext",
+    ) -> RequestResult:
+        """
+        Обробляє нагороду що прийшла від сайту.
+
+        Викликається з ReadingMonitor._on_reward_received через scheduler.ask —
+        тому виконується всередині RequestRouter і auto-save гарантований.
+
+        Дії:
+          1. Знаходимо слот за reward_data.
+          2. increment_slot_count  — лічильник нагород слота.
+          3. add_slot_chapters_spent — списання глав.
+          4. Якщо у reward є token — робимо claim_candy через сесію.
+
+        Повертає у result.data: {slot, new_count, new_spent, cap}
+        щоб монітор вирішив чи потрібен emit slot_limit_reached.
+        """
+        reward_data:   dict[str, Any]  = data.get("reward", {})
+        chapters_read: int             = int(data.get("chapters_read", 0))
+        active_slot:   Optional[str]   = data.get("active_slot") or None
+
+        bot = ctx.bot
+        log = get_account_logger(bot.account_id)
+        cfg = bot.app_config.reader
+
+        slot = cfg.find_slot(reward_data)
+        if slot is None:
+            log.debug(f"[Reader] account_reward: слот не знайдено для {reward_data}")
+            return RequestResult.approve(data={"slot": None})
+
+        inv: ReaderInventory = bot.inventory.reader
+
+        new_count = inv.increment_slot_count(slot.name)
+        log.info(f"[Reader] slot={slot.name!r} count={new_count}/{slot.daily_limit}")
+
+        new_spent: int = 0
+        if chapters_read > 0:
+            new_spent = inv.add_slot_chapters_spent(slot.name, chapters_read)
+            cap = slot.max_chapters_per_slot
+            cap_str = f"/{cap}" if cap > 0 else ""
+            log.info(f"[Reader] slot={slot.name!r} chapters_spent={new_spent}{cap_str}")
+        else:
+            new_spent = inv.slot_chapters_spent.get(slot.name, 0)
+
+        # Claim candy якщо є токен (через сесію, не через окремий ask)
+        if reward_data.get("token"):
+            candy = await bot.safe_session.claim_candy(reward_data["token"])
+            if not candy.ok:
+                log.warning("[Reader] claim_candy провалився")
+
+        return RequestResult.approve(data={
+            "slot":      slot.name,
+            "new_count": new_count,
+            "new_spent": new_spent,
+            "cap":       slot.max_chapters_per_slot,
+            "daily_limit": slot.daily_limit,
+        })
+
+    # ── claim_candy ───────────────────────────────────────────────────────────
 
     async def _handle_claim_candy(
         self,
         data: dict[str, Any],
         ctx:  "RequestContext",
     ) -> RequestResult:
-        get_account_logger(ctx.account_id).info(f"Claiming candy with data: {data}")
         token: str = data.get("token", "")
         if not token:
             return RequestResult.deny("token обов'язковий")
-
         bot = ctx.bot
         reward = await bot.safe_session.claim_candy(token)
         if not reward.ok:
-            return RequestResult.deny("Не вдалося отримати цукерку")
-
+            return RequestResult.deny("claim_candy провалився")
         return RequestResult.approve(data={"reward": reward.data})
+
     # ── get_state ─────────────────────────────────────────────────────────────
 
     async def _handle_get_state(self, ctx: "RequestContext") -> RequestResult:
-        inv: ReaderInventory = ctx.bot.inventory.reader  
-        return RequestResult.approve(
-            data={"reading_params": inv.reading_params}
-        )
+        inv: ReaderInventory = ctx.bot.inventory.reader
+        return RequestResult.approve(data={"reading_params": inv.reading_params})
 
     # ── set_reading_params ────────────────────────────────────────────────────
 
@@ -222,9 +277,6 @@ class ReaderProfession(BaseProfession):
         data: dict[str, Any],
         ctx:  "RequestContext",
     ) -> RequestResult:
-        """
-        Оновлює ReadingParams що ReadingMonitor передаватиме при наступних ask.
-        """
         from src.mangabuff.reader.reading_monitor import ReadingParams
 
         params = ReadingParams(
@@ -232,11 +284,11 @@ class ReaderProfession(BaseProfession):
             include_tags = data.get("include_tags") or None,
             exclude_tags = data.get("exclude_tags") or None,
         )
-        inv: ReaderInventory = ctx.bot.inventory.reader  # type: ignore[attr-defined]
+        inv: ReaderInventory = ctx.bot.inventory.reader
         inv.data["reading_params"] = params.to_dict()
 
         get_account_logger(ctx.account_id).info(
-            f"ReaderProfession: reading_params оновлено → {params}"
+            f"[Reader] reading_params оновлено → {params}"
         )
         return RequestResult.approve(data={"reading_params": params.to_dict()})
 
@@ -247,19 +299,18 @@ class ReaderProfession(BaseProfession):
         data: dict[str, Any],
         ctx:  "RequestContext",
     ) -> RequestResult:
-        bot = ctx.bot
+        bot     = ctx.bot
         targets: list[str] = data.get("targets", [])
+        log = get_account_logger(ctx.account_id)
 
         if not targets:
             return RequestResult.deny("targets (список translit_name) обов'язковий")
 
         valid: list[str] = []
-        log = get_account_logger(ctx.account_id)
-
         try:
             for name in targets:
                 if bot.repo.mangas.get_by_translit_name(name) is None:
-                    log.warning(f"mark_read: manga {name!r} не знайдено в БД — пропускаємо")
+                    log.warning(f"mark_read: manga {name!r} не знайдено — пропускаємо")
                 else:
                     valid.append(name)
 
@@ -267,8 +318,8 @@ class ReaderProfession(BaseProfession):
                 return RequestResult.approve(data={"marked": 0, "mangas": []})
 
             total = bot.repo.chapters.mark_mangas_read(
-                account_id=ctx.account_id,
-                translit_names=valid,
+                account_id     = ctx.account_id,
+                translit_names = valid,
             )
             log.info(f"mark_read: {total} глав позначено для {valid}")
             return RequestResult.approve(data={"marked": total, "mangas": valid})

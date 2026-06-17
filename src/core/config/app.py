@@ -276,6 +276,7 @@ class StartupCfg:
 
 @dataclass(frozen=True)
 class AppConfig:
+    base_url: str
     reader:  ReaderAppCfg
     daily:   DailyCfg
     quiz:    QuizCfg
@@ -284,6 +285,7 @@ class AppConfig:
     @classmethod
     def from_dict(cls, raw_data: dict[str, Any]) -> "AppConfig":
         return cls(
+            base_url=str(raw_data.get("base_url", "https://mangabuff.ru")),
             reader=ReaderAppCfg.from_dict(raw_data.get("reader", {})),
             daily=DailyCfg.from_dict(raw_data.get("daily", {})),
             quiz=QuizCfg.from_dict(raw_data.get("quiz", {})),

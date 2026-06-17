@@ -32,6 +32,31 @@ class PersonalInventory(BaseInventory):
     def is_banned(self) -> bool:
         return bool(self.data.get("is_banned", False))
 
+    @property
+    def user_name(self) -> str | None:
+        """Ім'я користувача на сайті. Зберігається AuthService після авторизації."""
+        return self.data.get("user_name")
+
+    @user_name.setter
+    def user_name(self, value: str | None) -> None:
+        if value is not None:
+            self.data["user_name"] = value
+        else:
+            self.data.pop("user_name", None)
+            
+    
+    @property
+    def user_id(self) -> str | None:
+        """ID користувача на сайті. Зберігається AuthService після авторизації."""
+        return self.data.get("user_id")
+
+    @user_id.setter
+    def user_id(self, value: str | None) -> None:
+        if value is not None:
+            self.data["user_id"] = value
+        else:
+            self.data.pop("user_id", None)
+
     pending_trades: list[dict[str, Any]] = field(default_factory=list)
 
     def push_trade(self, trade: dict[str, Any]) -> None:
@@ -54,5 +79,6 @@ class PersonalInventory(BaseInventory):
     def __repr__(self) -> str:
         return (
             f"<PersonalInventory "
+            f"user={self.user_name!r} "
             f"banned={self.is_banned}>"
         )

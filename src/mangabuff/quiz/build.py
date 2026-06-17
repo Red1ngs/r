@@ -35,7 +35,7 @@ from src.mangabuff.quiz.inventory import QuizInventory
 from src.utils.time import today
 
 if TYPE_CHECKING:
-    from src.core.account import Account
+    from src.core.core_account import Account
     from src.core.runtime.request_router import RequestContext
     from src.core.runtime.scheduler import EventDrivenScheduler
 

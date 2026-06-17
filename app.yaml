@@ -1,3 +1,4 @@
+base_url: "https://mangabuff.ru"
 reader:
   url_add_history: "/addHistory?r=702"
   update_interval_days: 1

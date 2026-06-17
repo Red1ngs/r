@@ -32,7 +32,7 @@ from src.core.runtime.scheduler import EventDrivenScheduler
 from src.mangabuff.manga_load.parsers import parse_catalog, CATALOG_PAGE_SIZE
 
 if TYPE_CHECKING:
-    from src.core.account import Account
+    from src.core.core_account import Account
     from src.core.runtime.request_router import RequestContext
 
 log = logging.getLogger(__name__)

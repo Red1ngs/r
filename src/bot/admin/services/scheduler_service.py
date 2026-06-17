@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.core.config.app import AppConfig
-from src.core.config.bot import AuthConfig, BaseHeaders, BotConfig, ClientConfig, NetworkConfig
+from src.core.config.bot import AuthConfig, BotConfig, ClientConfig, NetworkConfig
 from src.core.runtime.scheduler import EventDrivenScheduler
-from src.core.account import Account
-from src.core.runtime.profession import BaseProfession, profession_factory
+from src.core.core_account import Account
+from src.core.runtime.profession import BaseProfession
+from src.core.runtime.profession_spec import profession_registry
 from src.database.repository.factory import Repositories
 
 _ENV_FILE = Path(".env")
@@ -79,10 +80,11 @@ def _erase_credentials(account_id: str) -> None:
 
 @dataclass(frozen=True)
 class AccountInfo:
-    account_id:  str
-    email:       str
-    proxy:       str
-    status:      str
+    account_id:   str
+    email:        str
+    proxy:        str
+    status:       str
+    mangabuff:    MangabuffInfo
     queue_size:   int = 0
     professions:  list[str] = field(default_factory=list)
     monitors:     list[str] = field(default_factory=list)
@@ -91,24 +93,18 @@ class AccountInfo:
     @property
     def profession(self) -> Optional[str]:
         return self.professions[0] if self.professions else None
+    
+    
+@dataclass(frozen=True)
+class MangabuffInfo:
+    user_name:    str
+    user_id:      str
 
 
 @dataclass(frozen=True)
 class SchedulerSnapshot:
     total_accounts: int
     accounts:       list[AccountInfo]
-
-
-_DEFAULT_BROWSER = BaseHeaders(
-    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-               "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    sec_ch_ua='"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
-    sec_ch_ua_platform='"Windows"',
-    sec_ch_ua_mobile="?0",
-    accept_language="uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-    accept_encoding="gzip, deflate, br, zstd",
-    dnt="1",
-)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,20 +140,29 @@ class SchedulerService:
         if bot is None or status is None:
             return None
 
-        runtime_profs = scheduler.profession_names(acc_id)
+        profs = scheduler.profession_names(acc_id)
+        auth = bot.bot_config.client.auth 
 
         active_monitors = []
         am = scheduler._monitors.get(acc_id)
         if am is not None:
             active_monitors = am.active_ids()
-
+            
+        user_name = bot.inventory.personal.user_name or "—"
+        user_id = bot.inventory.personal.user_id or "—"
+        buff_info = MangabuffInfo(
+            user_name=user_name,
+            user_id=user_id
+        )
+        
         return AccountInfo(
             account_id   = acc_id,
-            email        = bot.bot_config.client.auth.email if bot.bot_config.client.auth else "—",
+            email        = auth.email if auth else "—",
             proxy        = bot.bot_config.network.proxy or "",
             status       = status.name,
+            mangabuff    = buff_info,
             queue_size   = 0,
-            professions  = runtime_profs,
+            professions  = profs,
             monitors     = active_monitors,
             is_connected = bot.is_connected,
         )
@@ -205,28 +210,34 @@ class SchedulerService:
         if not stored_pw:
             return False, f"Пароль для {account_id!r} не знайдено в .env"
 
-        bot_config = BotConfig(
-            client=ClientConfig(
-                base_url="https://mangabuff.ru",
-                auth=AuthConfig(email=email, password=stored_pw),
-            ),
-            browser=_DEFAULT_BROWSER,
-            network=NetworkConfig(proxy=stored_proxy or None, timeout=15),
-        )
+        auth = AuthConfig(email=email, password=stored_pw)
+        network = NetworkConfig(proxy=stored_proxy or None, timeout=15)
 
-        bot = Account(account_id, bot_config, self._app_config, self._repo)
 
-        db_acc   = self._repo.accounts.get(account_id)
+        bot = Account(account_id, auth, network, self._app_config, self._repo)
+
+        db_acc     = self._repo.accounts.get(account_id)
         prof_names = db_acc.professions if db_acc else []
         professions: list[BaseProfession] = []
         for name in prof_names:
             try:
-                professions.append(profession_factory.build(name))
+                # build() повертає profession + всі її deps
+                professions.extend(profession_registry.build(name))
             except Exception as e:
                 from src.core.logging.loggers import get_logger
                 get_logger("admin.scheduler_service").warning(
                     f"[{account_id}] Cannot restore profession {name!r}: {e}"
                 )
+
+        # Дедублікуємо: якщо дві профессії мають спільний dep —
+        # він все одно додається один раз (перший wins).
+        seen_ids: set[str] = set()
+        unique_professions: list[BaseProfession] = []
+        for p in professions:
+            if p.profession_id not in seen_ids:
+                seen_ids.add(p.profession_id)
+                unique_professions.append(p)
+        professions = unique_professions
 
         try:
             await self._scheduler.add_account(account_id, bot, professions=professions)
@@ -261,15 +272,20 @@ class SchedulerService:
             return True, ""
 
         try:
-            profession = profession_factory.build(profession_name)
+            # build() повертає [dep1, dep2, ..., profession] — додаємо всі
+            to_add = profession_registry.build(profession_name)
         except Exception as e:
             return False, f"Помилка збірки profession {profession_name!r}: {e}"
 
-        try:
-            await self._scheduler.add_profession_to_account(account_id, profession)
-        except Exception as e:
-            return False, f"Не вдалося додати профессію в ядро: {e}"
+        for profession in to_add:
+            if scheduler.has_profession(account_id, profession.profession_id):
+                continue  # dep вже є — пропускаємо
+            try:
+                await self._scheduler.add_profession_to_account(account_id, profession)
+            except Exception as e:
+                return False, f"Не вдалося додати {profession.profession_id!r}: {e}"
 
+        # В БД зберігаємо тільки сам вибраний profession_name, не deps
         self._repo.accounts.add_profession(account_id, profession_name, priority=priority)
         return True, ""
 
@@ -301,11 +317,13 @@ class SchedulerService:
         for name in current - set(target):
             await scheduler.remove_profession_from_account(account_id, name)
 
-        for idx, name in enumerate(target):
+        for name in target:
             if not scheduler.has_profession(account_id, name):
                 try:
-                    profession = profession_factory.build(name)
-                    await scheduler.add_profession_to_account(account_id, profession)
+                    to_add = profession_registry.build(name)
+                    for profession in to_add:
+                        if not scheduler.has_profession(account_id, profession.profession_id):
+                            await scheduler.add_profession_to_account(account_id, profession)
                 except Exception as e:
                     return False, f"Помилка profession {name!r}: {e}"
 

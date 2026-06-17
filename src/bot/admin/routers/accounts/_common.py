@@ -5,12 +5,12 @@ accounts/_common.py
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Any
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, LinkPreviewOptions
 
 from src.bot.admin.services.scheduler_service import AccountInfo
-from src.core.runtime.profession import profession_factory
+from src.core.runtime.profession_spec import profession_registry
 from src.bot.admin.routers.accounts.profession_menu import profession_menu_registry
 
 # ── Статуси ───────────────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ def account_text(info: AccountInfo) -> str:
 
     # ── Рядки профессій
     if info.professions:
-        prof_parts = []
+        prof_parts: list[str] = []  # Додали анотацію : list[str]
         for i, name in enumerate(info.professions):
             badge = _PRIORITY_BADGE[i] if i < len(_PRIORITY_BADGE) else "•"
             prof_parts.append(f"{badge} {name}")
@@ -73,9 +73,10 @@ def account_text(info: AccountInfo) -> str:
 
     # ── Сесія
     session_line = "🟢 сесія активна" if info.is_connected else "🔴 сесія відсутня"
+    account_link = f'<a href="https://mangabuff.ru/users/{info.mangabuff.user_id}">{info.mangabuff.user_name}</a>'
 
     return (
-        f"{status_emoji} <b>{info.account_id}</b>  ·  {status_text}{proxy_line}\n"
+        f"{status_emoji} <b>{info.account_id}</b>  ·  {status_text}{proxy_line}  ·  {account_link}\n"
         f"📧 <code>{info.email}</code>\n"
         f"{session_line}\n"
         f"\n"
@@ -170,7 +171,7 @@ def professions_manage_kb(
     acc_id: str,
     active: list[str],
 ) -> InlineKeyboardMarkup:
-    all_names = profession_factory.names()
+    all_names = profession_registry.known_ids()
     rows: list[list[InlineKeyboardButton]] = []
 
     if active:
@@ -224,26 +225,41 @@ def cancel_add_kb() -> InlineKeyboardMarkup:
 
 # ── Nav-editor ────────────────────────────────────────────────────────────────
 
-def make_editor(message: Message, data: dict, already_deleted: bool = False):
-    nav_id  = data.get("_nav_msg_id")
+def make_editor(message: Message, data: dict[str, Any], already_deleted: bool = False):
+    # Вказуємо тип словника як dict[str, Any]
+    # Вказуємо тип nav_id явно як Optional[int]
+    nav_id: Optional[int] = data.get("_nav_msg_id") 
     bot_obj = message.bot
-    chat    = message.chat.id
+    chat = message.chat.id
 
     async def _edit(text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
+        lp_options = LinkPreviewOptions(is_disabled=True)
+
         if not already_deleted:
             try:
                 await message.delete()
             except Exception:
                 pass
+                
         if nav_id and bot_obj:
             try:
                 await bot_obj.edit_message_text(
-                    text, chat_id=chat, message_id=nav_id,
-                    reply_markup=kb, parse_mode="HTML",
+                    text=text, 
+                    chat_id=chat, 
+                    message_id=nav_id, # Тепер Pylance знає, що це int | None
+                    reply_markup=kb, 
+                    parse_mode="HTML",
+                    link_preview_options=lp_options
                 )
                 return
             except Exception:
                 pass
-        await message.answer(text, reply_markup=kb)
+        
+        await message.answer(
+            text=text, 
+            reply_markup=kb, 
+            parse_mode="HTML",
+            link_preview_options=lp_options
+        )
 
     return _edit

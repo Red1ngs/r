@@ -23,7 +23,7 @@ from src.core.runtime.scheduler import EventDrivenScheduler
 from src.mangabuff.manga_load.parsers import parse_chapters, parse_manga_data_id, parse_manga_views
 
 if TYPE_CHECKING:
-    from src.core.account import Account
+    from src.core.core_account import Account
     from src.core.runtime.request_router import RequestContext
 
 from src.core.logging.loggers import get_account_logger

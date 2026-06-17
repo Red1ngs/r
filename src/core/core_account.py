@@ -1,5 +1,5 @@
 """
-account.py — модель акаунта + сесія.
+core_account.py — модель акаунта + сесія.
 
 Account не знає про Scheduler, Profession чи EventBus.
 
@@ -11,9 +11,10 @@ Account не знає про Scheduler, Profession чи EventBus.
 """
 from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
+from browserforge.headers import HeaderGenerator
 
 from src.core.config.app import AppConfig
-from src.core.config.bot import BotConfig
+from src.core.config.bot import AuthConfig, BaseHeaders, BotConfig, ClientConfig, NetworkConfig, NetworkConfig
 from src.core.inventory.model import DynamicInventories as Inventories
 from src.core.stats import stats_factory, DynamicStats as Stats
 from src.database.repository.factory import Repositories
@@ -21,26 +22,52 @@ from src.core.status import AccountStatus
 from src.core.logging.loggers import get_account_logger
 
 if TYPE_CHECKING:
-    from src.mangabuff.session import BotSession
+    from src.mangabuff.mangabuff_session import BotSession
+    from src.core.runtime.core_service import CoreService
 
+
+def generate_unique_browser() -> BaseHeaders:
+    """Генерує консистентний відбиток за допомогою browserforge."""
+    headers = HeaderGenerator(
+        os=('windows', 'macos'),
+        browser=('chrome', 'edge')
+    ).generate()
+
+    return BaseHeaders(
+        user_agent=headers.get("User-Agent", ""),
+        sec_ch_ua=headers.get("sec-ch-ua", ""),
+        sec_ch_ua_platform=headers.get("sec-ch-ua-platform", '"Windows"'),
+        sec_ch_ua_mobile=headers.get("sec-ch-ua-mobile", "?0"),
+        accept_language=headers.get("Accept-Language", "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7"),
+        accept_encoding=headers.get("Accept-Encoding", "gzip, deflate, br, zstd"),
+        dnt=headers.get("DNT", "1"),
+    )
+    
 
 class Account:
     def __init__(
         self,
         account_id: str,
-        bot_config:  BotConfig,
-        app_config:  AppConfig,
-        repo:        Repositories,
+        auth:       AuthConfig,
+        network:    NetworkConfig,
+        app_config: AppConfig,
+        repo:       Repositories,
     ):
-        self.account_id  = account_id
-        self.status      = AccountStatus.IDLE
-        self.error:      Optional[str] = None
-        self.bot_config  = bot_config
-        self.app_config  = app_config
-        self.repo        = repo
-        self.inventories: Inventories = self.repo.inventory.load(self.account_id)
-        self.recorder:    Stats       = stats_factory.build()
-        self._session:    Optional["BotSession"] = None
+        self.account_id:   str           = account_id
+        self.status:       AccountStatus = AccountStatus.IDLE
+        self.error:        Optional[str] = None
+        self.app_config:   AppConfig     = app_config
+        self.repo:         Repositories  = repo
+        self.inventories:  Inventories   = self.repo.inventory.load(self.account_id)
+        self.recorder:     Stats         = stats_factory.build()
+
+        # CoreService-и що автоматично прив'язані до цього акаунта.
+        # Заповнюється scheduler при add_account() через bind_core_services().
+        self.core_services: list["CoreService"] = []
+
+        self._network:     NetworkConfig = network
+        self._auth:        AuthConfig    = auth
+        self._session:     Optional["BotSession"] = None
         self._log = get_account_logger(account_id)
 
     @property
@@ -79,13 +106,49 @@ class Account:
     @property
     def is_connected(self) -> bool:
         return self._session is not None
+    
+    @property
+    def bot_config(self) -> BotConfig:
+        return BotConfig(
+            client=ClientConfig(
+                base_url=self.app_config.base_url,
+                auth=self._auth,
+            ),
+            browser=self._browser,
+            network=self._network,
+        )
+        
+    @property
+    def _browser(self) -> BaseHeaders:
+        if saved_browser := self.repo.sessions.load_browser(self.account_id):
+            browser = BaseHeaders.from_dict(saved_browser)
+        else:
+            browser = generate_unique_browser() 
+            self.repo.sessions.save_browser(self.account_id, browser.to_dict())
+        return browser
 
     async def connect(self) -> bool:
         try:
-            from src.mangabuff.session import BotSession
+            from src.mangabuff.mangabuff_session import BotSession, AuthSuccessCallback
+            from src.mangabuff.personal.auth_service import AuthService
             from src.utils.logging import set_http_logger
 
-            session = BotSession(self.bot_config, self.app_config)
+            # Шукаємо AuthService серед core_services що вже прив'язані
+            # до цього акаунта (bind_core_services() викликається scheduler
+            # при add_account(), до connect_account()).
+            on_auth_success: Optional[AuthSuccessCallback] = None
+            for svc in self.core_services:
+                if isinstance(svc, AuthService):
+                    on_auth_success = svc.on_auth_success
+                    break
+
+            session = BotSession(
+                self.bot_config,
+                self.app_config,
+                self.repo.sessions,
+                self.account_id,
+                on_auth_success=on_auth_success,
+            )
 
             if self.bot_config.network.proxy:
                 if not await session.check_proxy():
@@ -97,11 +160,7 @@ class Account:
             self.status   = AccountStatus.IDLE
             self.error    = None
 
-            # FIX: прив'язуємо HTTP-логер до акаунта одразу після connect().
-            # set_http_logger() використовує ContextVar — логи session.py
-            # тепер потраплять у logs/accounts/{account_id}.log.
             set_http_logger(get_account_logger(self.account_id))
-
             self._log.info("✅ Підключено")
             return True
         except PermissionError:
