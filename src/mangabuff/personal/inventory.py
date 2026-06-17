@@ -41,8 +41,8 @@ class PersonalInventory(BaseInventory):
     def to_day(self) -> str:
         """Дата останньої синхронізації з сайтом. Формат: "YYYY-MM-DD"."""
         value = self.data.get("to_day")
-        if not value:
-            value = today()
+        if value := today() != value:
+            self.data["to_day"] = value
         return value
 
     @to_day.setter

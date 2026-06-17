@@ -76,7 +76,8 @@ def account_text(info: AccountInfo) -> str:
     account_link = f'<a href="https://mangabuff.ru/users/{info.mangabuff.user_id}">{info.mangabuff.user_name}</a>'
 
     return (
-        f"{status_emoji} <b>{info.account_id}</b>  ·  {status_text}{proxy_line}  ·  {account_link}\n"
+        f"{status_emoji} <b>{info.account_id}</b>  ·  {status_text}  ·  {account_link}\n"
+        f"{proxy_line}\n"
         f"📧 <code>{info.email}</code>\n"
         f"{session_line}\n"
         f"\n"

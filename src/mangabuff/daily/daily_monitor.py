@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.monitoring.monitor import BaseMonitor
-from src.utils.time import today
+from src.utils.time import now
 
 if TYPE_CHECKING:
     from src.core.runtime.scheduler import EventDrivenScheduler
@@ -117,9 +117,8 @@ class DailyMonitor(BaseMonitor):
             return 300.0
 
         inv = bot.inventory.daily 
-        personal = bot.inventory.personal 
+        to_day = bot.inventory.personal.to_day
 
-        to_day = personal.to_day
         all_done = (
             inv.last_daily_claimed == to_day
             and inv.last_calendar_claimed == to_day
