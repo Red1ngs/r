@@ -256,7 +256,7 @@ class BotTransport:
             if not token:
                 return False
             self.headers.csrf_token = token
-            if xsrf := self._client.cookies.get("XSRF-TOKEN"):
+            if xsrf := self._client.cookies.get("XSRF-TOKEN", domain=self.bot_config.client.host):
                 self.headers.xsrf_token = unquote(xsrf)
             return True
         except Exception as e:
@@ -292,7 +292,7 @@ class BotTransport:
             token, user_name, user_id = parse_main_page(r.text)
             if token and user_name:
                 self.headers.csrf_token = token
-                if xsrf := self._client.cookies.get("XSRF-TOKEN"):
+                if xsrf := self._client.cookies.get("XSRF-TOKEN", domain=self.bot_config.client.host):
                     self.headers.xsrf_token = unquote(xsrf)
                 log().info(f"  → ✅ {user_name} ({user_id})")
 
@@ -327,20 +327,11 @@ class BotTransport:
             return url
         return f"{self.bot_config.client.base_url.rstrip('/')}/{url.lstrip('/')}"
 
-    async def _request(self, method: HttpMethodStr, url: str, external: bool = False, **kwargs: Any) -> Response:
+    async def _request(self, method: HttpMethodStr, url: str, **kwargs: Any) -> Response:
         assert self._client
-        full_url = url if external else self._url(url)
+        full_url = self._url(url)
 
-        if external:
-            kwargs.setdefault("headers", self.bot_config.browser.to_dict())
-            kwargs.setdefault("proxies", None)
-            log_payload_curl(method, full_url, params=kwargs.get("params"), data=kwargs.get("data"), json_body=kwargs.get("json"))
-            t    = log_request_curl(method, full_url, kwargs.get("headers", {}))
-            resp = await self._client.request(method, full_url, **kwargs)
-            log_response_curl(resp.status_code, full_url, resp.content, resp.headers.get("content-type", ""), t)
-            return resp
-
-        if xsrf := self._client.cookies.get("XSRF-TOKEN"):
+        if xsrf := self._client.cookies.get("XSRF-TOKEN", domain=self.bot_config.client.host):
             self.headers.xsrf_token = unquote(xsrf)
 
         # Крок 1: payload ДО запиту
@@ -382,13 +373,13 @@ class BotTransport:
             
         return response
 
-    async def get(self, url: str, external: bool = False, **kwargs: Any) -> Response:
+    async def get(self, url: str, **kwargs: Any) -> Response:
         kwargs.setdefault("headers", self.headers.get_navigation())
-        return await self._request("GET", url, external=external, **kwargs)
+        return await self._request("GET", url, **kwargs)
 
-    async def post(self, url: str, external: bool = False, **kwargs: Any) -> Response:
+    async def post(self, url: str, **kwargs: Any) -> Response:
         kwargs.setdefault("headers", self.headers.get_ajax(is_post=True))
-        return await self._request("POST", url, external=external, **kwargs)
+        return await self._request("POST", url, **kwargs)
 
 
 # ===========================================================================
@@ -423,11 +414,12 @@ class BotSession(BotTransport):
         if not self.bot_config.network.proxy:
             return True
         try:
-            r = await self.get("https://api.ipify.org", external=True, timeout=10)
-            r.raise_for_status()
-            proxy_ip = r.text.strip()
+            proxy = self.bot_config.network.proxy
+            # Обидва запити йдуть через окремі чисті сесії — кукі основного клієнта не торкаємось
+            async with _cffi.AsyncSession(proxies={"https": proxy, "http": proxy}) as proxy_session:
+                proxy_r = await proxy_session.get("https://api.ipify.org", timeout=10)
+            proxy_ip = proxy_r.text.strip()
 
-            # fix #2: AsyncSession закривається через async with — усуває витік ресурсів
             async with _cffi.AsyncSession() as session:
                 real_r = await session.get("https://api.ipify.org", timeout=10)
             real_ip = real_r.text.strip()
@@ -480,7 +472,6 @@ class BotSession(BotTransport):
 
     # ── Reader ────────────────────────────────────────────────────────────────
 
-    # fix #8: dict[str, Any] замість голого dict — точніша типізація
     @http_call
     async def submit_add_history(self, items: list[dict[str, Any]]) -> HttpResult[dict[str, Any]]:
         body = {
@@ -511,7 +502,6 @@ class BotSession(BotTransport):
         r.raise_for_status()
         return http_success(r.text)
 
-    # fix #1: доданий @http_call — метод тепер захищений від власних несподіваних винятків
     @http_call
     async def fetch_manga_chapters(self, translit_name: str, manga_data_id: int) -> HttpResult[str]:
         page = await self.fetch_manga_page(translit_name)

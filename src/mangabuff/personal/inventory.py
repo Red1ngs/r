@@ -36,21 +36,26 @@ class PersonalInventory(BaseInventory):
     @is_banned.setter
     def is_banned(self, value: bool) -> None:
         self.data["is_banned"] = value
-        
+
     @property
     def to_day(self) -> str:
         """Дата останньої синхронізації з сайтом. Формат: "YYYY-MM-DD"."""
+        current_date = today()
         value = self.data.get("to_day")
-        if value := today() != value:
+
+        # Перевіряємо, чи є значення рядком і чи воно актуальне
+        if not isinstance(value, str) or value != current_date:
+            value = current_date
             self.data["to_day"] = value
+        
         return value
 
     @to_day.setter
     def to_day(self, value: str | None) -> None:
         if value is None:
             self.data.pop("to_day", None)
-        elif value.strip() == "":
-            raise ValueError("to_day cannot be an empty string")
+        elif not isinstance(value, str) or value.strip() == "":
+            raise ValueError("to_day must be a non-empty string or None")
         else:
             self.data["to_day"] = value
             
