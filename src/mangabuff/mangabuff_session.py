@@ -292,7 +292,7 @@ class BotTransport:
             r.raise_for_status()
             data = parse_main_page(r.text)
             token = data.pop("csrf_token")
-            if data and token:
+            if data.get("user_id") and token:
                 self.headers.csrf_token = token
                 if xsrf := self._client.cookies.get("XSRF-TOKEN", domain=self.bot_config.client.host):
                     self.headers.xsrf_token = unquote(xsrf)
@@ -365,6 +365,28 @@ class BotTransport:
                 label = f"{method} {url} (retry after 419)",
             )
             log_response_curl(response.status_code, full_url, response.content, response.headers.get("content-type", ""), t)
+
+        if response.status_code == 401:
+            log().warning("  → 401 Unauthenticated — re-logging in")
+            if not await self.login(force=True):
+                self.session_repo.invalidate(self.account_id)
+                raise PermissionError("Session expired and re-login failed")
+            if "headers" in kwargs:
+                if self.headers.csrf_token:
+                    kwargs["headers"]["X-CSRF-TOKEN"] = self.headers.csrf_token
+                if self.headers.xsrf_token:
+                    kwargs["headers"]["X-XSRF-TOKEN"] = self.headers.xsrf_token
+            log_payload_curl(method, full_url, params=kwargs.get("params"), data=kwargs.get("data"), json_body=kwargs.get("json"))
+            t        = log_request_curl(method, full_url, kwargs.get("headers", {}))
+            response = await proxy_queue_manager.enqueue_coro(
+                proxy = self.bot_config.network.proxy,
+                coro  = self._client.request(method, full_url, **kwargs),  # type: ignore[union-attr]
+                label = f"{method} {url} (retry after 401)",
+            )
+            log_response_curl(response.status_code, full_url, response.content, response.headers.get("content-type", ""), t)
+            if response.status_code == 401:
+                self.session_repo.invalidate(self.account_id)
+                raise PermissionError("Session expired and re-login failed")
 
         if response.status_code == 429:
             raise RateLimitedError(float(response.headers.get("Retry-After", 15.0)))
@@ -559,6 +581,15 @@ class BotSession(BotTransport):
         r = await self.get("/mine", timeout=15)
         if r.status_code == 200:
             data = parse_mining_page(r.text)
+            missing = [k for k, v in data.items() if v is None]
+            if missing:
+                auth_data = parse_main_page(r.text)
+                if not auth_data.get("user_id"):
+                    log().warning("  → mine: unauthenticated page detected")
+                    self.session_repo.invalidate(self.account_id)
+                    return http_fail(FailReason.AUTH)
+                log().warning(f"  → mine: missing required mining fields: {', '.join(missing)}")
+                return http_fail(FailReason.BAD_DATA)
             return http_success(data)
         log().warning(f"  → mine_hit: {r.status_code}")
         return http_fail(FailReason.SERVER)

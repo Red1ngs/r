@@ -81,8 +81,6 @@ class PersonalInventory(BaseInventory):
     def user_id(self, value: str | None) -> None:
         if value is not None:
             self.data["user_id"] = value
-        else:
-            self.data.pop("user_id", None)
 
     pending_trades: list[dict[str, Any]] = field(default_factory=list)
 
