@@ -1,0 +1,286 @@
+"""
+mining/mining_monitor.py — MiningMonitor.
+"""
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional, cast
+
+from src.core.monitoring.monitor import BaseMonitor
+from src.core.logging.loggers import get_account_logger
+
+if TYPE_CHECKING:
+    from src.core.runtime.scheduler import EventDrivenScheduler
+    from src.core.core_account import Account
+    
+    
+# ─────────────────────────────────────────────────────────────────────────────
+# MiningParams
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class MiningParams:
+    exchange: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "MiningParams":
+        return cls(
+            exchange = bool(d.get("exchange", True))
+        )
+
+
+class MiningMonitor(BaseMonitor):
+    """
+    Монітор Шахти. Веде повний цикл mine_hit для одного акаунта.
+
+    Не містить IO — тільки планування ask().
+    Стан (hits_count, )
+    читається з MiningInventory при кожному циклі.
+    """
+
+    @property
+    def monitor_id(self) -> str:
+        return "mining"
+
+    def __init__(self) -> None:
+        self._account_id:         str                              = ""
+        self._scheduler:          Optional["EventDrivenScheduler"] = None
+        self._bot:                Optional[Account]                = None
+        self._wakeup_task:        Optional[asyncio.Task[None]]     = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    async def attach(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
+        self._account_id = account_id
+        self._scheduler  = scheduler
+        self._bot        = scheduler.get_bot(account_id)
+        
+        scheduler.subscribe("daily.claimed", self._on_daily_claimed)
+        scheduler.subscribe("mining.mining_complete", self._on_mining_complete)
+
+        await self._start_mining()
+
+    async def detach(self, scheduler: "EventDrivenScheduler", account_id: str) -> None:
+        self._cancel_wakeup()
+        self._scheduler = None
+
+    # ── Scheduling ────────────────────────────────────────────────────────────
+
+    async def _schedule_next(self, delay: Optional[float] = None) -> None:
+        self._cancel_wakeup()
+        if self._scheduler is None:
+            return
+        
+        if delay is None:
+            delay = await self._interval()
+            if delay < 0:
+                return
+
+        async def _fire() -> None:
+            try:
+                await asyncio.sleep(delay)
+                await self._send_ask()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                get_account_logger(self._account_id).error(
+                    f"[ReadingMonitor] помилка у фоновому циклі: {exc}", exc_info=True
+                )
+
+        self._wakeup_task = asyncio.ensure_future(_fire())
+
+    def _cancel_wakeup(self) -> None:
+        if self._wakeup_task and not self._wakeup_task.done():
+            self._wakeup_task.cancel()
+        self._wakeup_task = None
+
+    async def _interval(self) -> float:
+        bot = self._bot
+        
+        if bot is None:
+            raise ValueError("Account не доступний")
+        
+        cfg  = bot.app_config.mining
+        
+        if not await self._mining_complete():
+            return cfg.delay
+
+        return -1.0
+
+    # ── Daily guard ───────────────────────────────────────────────────────────
+
+    def _waiting_for_daily(self) -> bool:
+        bot = self._bot
+
+        if self._scheduler is None:
+            raise ValueError("Scheduler не доступний")
+        
+        if bot is None:
+            raise ValueError("Account не доступний")
+        
+        if not self._scheduler.has_profession(self._account_id, "daily"):
+            return False
+        
+        daily_inv = bot.inventory.daily
+        personal = bot.inventory.personal
+
+        return daily_inv.last_daily_claimed != personal.to_day
+
+    # ── Ask ───────────────────────────────────────────────────────────────────
+    
+    async def _start_mining(self) -> None:
+        bot = self._bot
+        log = get_account_logger(self._account_id)
+        
+        scheduler = self._scheduler
+        if scheduler is None:
+            return
+        
+        if bot is None:
+            raise ValueError("Account не доступний")
+        
+        inv  = bot.inventory.mining
+        
+        result = await scheduler.ask(
+            account_id    = self._account_id,
+            profession_id = "mining",
+            intent        = "start_mining",
+            caller        = "mining_monitor",
+        )
+        
+        if not result.approved:
+            log.warning(f"[MiningMonitor] mining_hit відхилено: {result.reason}")
+            return
+        
+        data = result.data
+        
+        inv.hits_left = cast(int, data["hits_left"])
+        inv.max_hits = cast(int, data["max_hits"])
+        inv.ore = cast(int, data["ore"])
+
+    async def _send_ask(self) -> None:
+        """
+        Надсилає ask("reader", "do_read").
+        Після відповіді — якщо не було reward — перевіряє ліміт по главах
+        з result.data (inventory вже збережено RequestRouter).
+        """
+        scheduler = self._scheduler
+        if scheduler is None:
+            return
+
+        log = get_account_logger(self._account_id)
+        
+        if await self._mining_complete():
+            log.info("[MiningMonitor] Шахта видобута — чекаємо daily.claimed")
+            return
+        
+        if self._waiting_for_daily():
+            log.info("[MiningMonitor] daily ще не зібрано → чекаємо daily.claimed")
+            return
+
+        params      = self._mining_params()
+
+        log.info(
+            f"[MiningMonitor] → ask mining_hit "
+            f"exchange={params.exchange!r}"
+        )
+        
+        result = await scheduler.ask(
+            account_id    = self._account_id,
+            profession_id = "mining",
+            intent        = "mining_hit",
+            caller        = "mining_monitor",
+        )
+
+        if not result.approved:
+            log.warning(f"[MiningMonitor] mining_hit відхилено: {result.reason}")
+            if not await self._mining_complete():
+                await self._schedule_next()
+            return
+
+        if not await self._mining_complete():
+            await self._schedule_next()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _mining_params(self) -> MiningParams:
+        bot = self._bot
+
+        if bot is None:
+            return MiningParams()
+        
+        inv = bot.inventory.reader
+        raw = inv.data.get("mining_params")
+        return MiningParams.from_dict(raw) if raw else MiningParams()
+
+    async def _mining_complete(self) -> bool:
+        bot = self._bot
+
+        if self._scheduler is None:
+            raise ValueError("Scheduler не доступний")
+        
+        if bot is None:
+            raise ValueError("Account не доступний")
+        
+        inv = bot.inventory.mining
+        if inv.mining_complete:
+            return True
+
+        hits_left = inv.hits_left
+        if hits_left is None:
+            return False
+        
+        hits_left = int(hits_left)
+        
+        if hits_left > 0:
+            inv.mining_complete = False
+            return False
+        elif hits_left == 0:
+            inv.mining_complete = True
+            await self._scheduler.emit_event(
+                "mining.mining_complete",
+                {"account_id": self._account_id},
+                source=self._account_id,
+            )
+            return True
+        else:
+            raise ValueError(f"hits_left не може бути {hits_left}")
+
+    # ── Event handlers ────────────────────────────────────────────────────────
+
+    async def _on_daily_claimed(self, payload: dict[str, Any]) -> None:
+        log = get_account_logger(self._account_id)
+        if payload.get("account_id") != self._account_id:
+            return    
+        
+        delay = max(await self._interval(), 0.0)
+        log.info(f"[MiningMonitor] daily.claimed → наступний ask через {delay:.0f}s")
+        await self._schedule_next(delay=delay)
+        
+    async def _on_mining_complete(self, payload: dict[str, Any]) -> None:
+        log = get_account_logger(self._account_id)
+        if payload.get("account_id") != self._account_id:
+            return
+        
+        bot = self._bot
+        
+        scheduler = self._scheduler
+        if scheduler is None:
+            return
+        
+        if bot is None:
+            raise ValueError("Account не доступний")
+        
+        inv  = bot.inventory.mining
+        
+        # Шахта видобута
+        log.info(
+            f"[MiningMonitor] було успішно видобуто руди: {inv.max_hits}"
+            f"→ emit mining.mining_complete"
+        )

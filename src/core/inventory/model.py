@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from src.mangabuff.alliance.inventory import AllianceInventory
     from src.mangabuff.daily.inventory import DailyInventory
     from src.mangabuff.quiz.inventory import QuizInventory
+    from src.mangabuff.mining.inventory import MiningInventory
     from src.mangabuff.manga_load.inventory import CatalogLoaderInventory
 
 
@@ -58,6 +59,7 @@ class DynamicInventories:
         loader:   "LoaderInventory"
         daily:    "DailyInventory"
         quiz:     "QuizInventory"
+        mining:     "MiningInventory"
         catalog_loader: "CatalogLoaderInventory"
 
     def __repr__(self) -> str:

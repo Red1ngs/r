@@ -18,7 +18,7 @@ from aiogram.types import BotCommand
 
 from src.bot.admin.config import AdminBotConfig
 from src.bot.admin.middlewares import AuthMiddleware, ServiceMiddleware
-from src.bot.admin.services.scheduler_service import SchedulerService
+from src.bot.services.scheduler_service import SchedulerService
 from src.bot.admin.routers import accounts, help, logs, stats
 
 COMMANDS = [

@@ -187,7 +187,7 @@ class MangaLoaderProfession(BaseProfession):
         pass
 
     def check_guard(self, bot: "Account") -> bool:
-        return not bool(bot.inventory.personal.data.get("is_banned"))
+        return not bool(bot.inventory.personal.is_banned)
 
     async def handle_request(
         self,

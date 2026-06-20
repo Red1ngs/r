@@ -9,7 +9,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
 from src.bot.admin.config import AdminBotConfig
-from src.bot.admin.services.scheduler_service import SchedulerService
+from src.bot.services.scheduler_service import SchedulerService
 
 
 class AuthMiddleware(BaseMiddleware):

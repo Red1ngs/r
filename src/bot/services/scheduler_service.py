@@ -5,10 +5,11 @@ bot/admin/services/scheduler_service.py
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 
 from src.core.config.app import AppConfig
 from src.core.config.bot import AuthConfig, BotConfig, ClientConfig, NetworkConfig
@@ -17,6 +18,11 @@ from src.core.core_account import Account
 from src.core.runtime.profession import BaseProfession
 from src.core.runtime.profession_spec import profession_registry
 from src.database.repository.factory import Repositories
+from src.core.logging.loggers import get_logger
+
+log = get_logger("admin.scheduler_service")
+
+T = TypeVar("T")
 
 _ENV_FILE = Path(".env")
 
@@ -86,8 +92,8 @@ class AccountInfo:
     status:       str
     mangabuff:    MangabuffInfo
     queue_size:   int = 0
-    professions:  list[str] = field(default_factory=list)
-    monitors:     list[str] = field(default_factory=list)
+    professions:  list[str] = field(default_factory=list[str])
+    monitors:     list[str] = field(default_factory=list[str])
     is_connected: bool = False
 
     @property
@@ -120,9 +126,54 @@ class SchedulerService:
     def _scheduler(self) -> EventDrivenScheduler:
         return EventDrivenScheduler.get_instance()
 
+    # ── Безпечний міст між потоками/loop'ами ────────────────────────────────
+
+    async def _run_on_home_loop(self, factory: Callable[[], "Awaitable[T]"]) -> T:
+        """
+        Гарантує, що корутина, яка торкається Account / BotSession
+        (а отже — curl_cffi.AsyncSession, прив'язаної до КОНКРЕТНОГО event
+        loop'у з моменту створення), завжди виконується саме в тому loop'і,
+        де живе scheduler ("домашній" loop, зафіксований у
+        EventDrivenScheduler.initialize()).
+
+        Без цього мосту викликач з admin-bot потоку (AdminBotRunner._run() —
+        окремий threading.Thread зі своїм asyncio.new_event_loop()) виконував
+        би scheduler.xxx() прямим await'ом у СВОЄМУ loop'і. Якщо саме звідти
+        піде перший реальний HTTP-запит (наприклад, при hot-add профессії),
+        curl_cffi впаде з RuntimeError "Future attached to a different loop",
+        бо AsyncSession створено в іншому, головному loop'і.
+
+        factory — функція БЕЗ аргументів, що повертає СВІЖИЙ awaitable.
+        Не передавай вже створену корутину напряму: вона може знадобитись
+        двічі (локальний await vs run_coroutine_threadsafe), а корутину
+        можна запустити лише один раз.
+
+        Приклад використання:
+            return await self._run_on_home_loop(
+                lambda: self._scheduler.connect_account(account_id)
+            )
+        """
+        home_loop = self._scheduler.home_loop
+        current_loop = asyncio.get_running_loop()
+
+        if home_loop is None or current_loop is home_loop:
+            # Ми вже там, де і має бути (типовий випадок — StartupManager,
+            # або scheduler ще не запущений і home_loop невідомий: тоді
+            # просто виконуємо як є, бо переносити нікуди).
+            return await factory()
+
+        # Викликано з чужого loop'у (admin-bot потік, тести тощо) —
+        # плануємо корутину в домашньому loop'і й чекаємо результат тут,
+        # НЕ блокуючи поточний loop синхронним .result().
+        concurrent_future = asyncio.run_coroutine_threadsafe(factory(), home_loop)
+        return await asyncio.wrap_future(concurrent_future)
+
     # ── Читання стану ─────────────────────────────────────────────────────────
 
     async def snapshot(self) -> SchedulerSnapshot:
+        return await self._run_on_home_loop(lambda: self._snapshot_impl())
+
+    async def _snapshot_impl(self) -> SchedulerSnapshot:
         scheduler = self._scheduler
         accounts = [
             info
@@ -132,7 +183,9 @@ class SchedulerService:
         return SchedulerSnapshot(total_accounts=len(accounts), accounts=accounts)
 
     async def account_info(self, account_id: str) -> Optional[AccountInfo]:
-        return await self._build_info(account_id, self._scheduler)
+        return await self._run_on_home_loop(
+            lambda: self._build_info(account_id, self._scheduler)
+        )
 
     async def _build_info(self, acc_id: str, scheduler: EventDrivenScheduler) -> Optional[AccountInfo]:
         bot    = scheduler.get_bot(acc_id)
@@ -168,21 +221,35 @@ class SchedulerService:
         )
 
     async def account_ids(self) -> list[str]:
+        return await self._run_on_home_loop(lambda: self._account_ids_impl())
+
+    async def _account_ids_impl(self) -> list[str]:
         return self._scheduler.account_ids()
 
     async def get_bot(self, account_id: str):
         """Повертає Account або None. Використовується StartupManager."""
+        return await self._run_on_home_loop(lambda: self._get_bot_impl(account_id))
+
+    async def _get_bot_impl(self, account_id: str):
         return self._scheduler.get_bot(account_id)
 
     async def connect_account(self, account_id: str) -> bool:
         """
         Встановлює сесію і підключає монітори.
         Делегує в scheduler.connect_account() — єдине місце де це відбувається.
+        Завжди виконується в домашньому loop'і scheduler'а (див. _run_on_home_loop).
         """
-        return await self._scheduler.connect_account(account_id)
+        return await self._run_on_home_loop(
+            lambda: self._scheduler.connect_account(account_id)
+        )
 
     async def disconnect_account(self, account_id: str) -> bool:
         """Закриває сесію акаунта без зупинки профессій."""
+        return await self._run_on_home_loop(
+            lambda: self._disconnect_account_impl(account_id)
+        )
+
+    async def _disconnect_account_impl(self, account_id: str) -> bool:
         bot = self._scheduler.get_bot(account_id)
         if bot is None:
             return False
@@ -191,6 +258,53 @@ class SchedulerService:
 
     # ── Створення акаунта ─────────────────────────────────────────────────────
 
+    def _build_professions(self, account_id: str) -> list[BaseProfession]:
+        """Будує список профессій акаунта з БД. Дедублікує deps."""
+        db_acc = self._repo.accounts.get(account_id)
+        names  = db_acc.professions if db_acc else []
+        seen: set[str] = set()
+        result: list[BaseProfession] = []
+        for name in names:
+            try:
+                for p in profession_registry.build(name):
+                    if p.profession_id not in seen:
+                        seen.add(p.profession_id)
+                        result.append(p)
+            except Exception as e:
+                log.warning(f"[{account_id}] Cannot build profession {name!r}: {e}")
+        return result
+
+    async def _register(self, account_id: str, email: str) -> tuple[bool, str]:
+        """
+        Єдине місце створення акаунта: перевірка → bot → scheduler.add_account().
+        Крок 1 з 3; connect і setup — відповідальність викликача.
+        Виконується в домашньому loop'і scheduler'а.
+        """
+        return await self._run_on_home_loop(lambda: self._register_impl(account_id, email))
+
+    async def _register_impl(self, account_id: str, email: str) -> tuple[bool, str]:
+        if self._scheduler.has_account(account_id):
+            return False, f"Акаунт {account_id!r} вже існує"
+
+        stored_pw, stored_proxy = _load_credentials(account_id)
+        if not stored_pw:
+            return False, f"Пароль для {account_id!r} не знайдено в .env"
+
+        auth    = AuthConfig(email=email, password=stored_pw)
+        network = NetworkConfig(proxy=stored_proxy or None, timeout=15)
+        bot     = Account(account_id, auth, network, self._app_config, self._repo)
+
+        try:
+            await self._scheduler.add_account(account_id, bot)
+        except ValueError as e:
+            return False, str(e)
+
+        return True, ""
+
+    async def register_account(self, account_id: str, email: str) -> tuple[bool, str]:
+        """Реєстрація без connect. StartupManager далі робить кроки 2-3."""
+        return await self._register(account_id, email)
+
     async def add_account(
         self,
         account_id: str,
@@ -198,61 +312,28 @@ class SchedulerService:
         password:   str = "",
         proxy:      str = "",
     ) -> tuple[bool, str]:
-        scheduler = self._scheduler
-        if scheduler.has_account(account_id):
-            return False, f"Акаунт {account_id!r} вже існує"
-
+        """Hot-add: зберігає credentials якщо передані, потім всі три кроки."""
         if password:
             _save_credentials(account_id, password, proxy)
             self._repo.accounts.upsert(account_id, email, professions=None)
 
-        stored_pw, stored_proxy = _load_credentials(account_id)
-        if not stored_pw:
-            return False, f"Пароль для {account_id!r} не знайдено в .env"
-
-        auth = AuthConfig(email=email, password=stored_pw)
-        network = NetworkConfig(proxy=stored_proxy or None, timeout=15)
-
-
-        bot = Account(account_id, auth, network, self._app_config, self._repo)
-
-        db_acc     = self._repo.accounts.get(account_id)
-        prof_names = db_acc.professions if db_acc else []
-        professions: list[BaseProfession] = []
-        for name in prof_names:
-            try:
-                # build() повертає profession + всі її deps
-                professions.extend(profession_registry.build(name))
-            except Exception as e:
-                from src.core.logging.loggers import get_logger
-                get_logger("admin.scheduler_service").warning(
-                    f"[{account_id}] Cannot restore profession {name!r}: {e}"
-                )
-
-        # Дедублікуємо: якщо дві профессії мають спільний dep —
-        # він все одно додається один раз (перший wins).
-        seen_ids: set[str] = set()
-        unique_professions: list[BaseProfession] = []
-        for p in professions:
-            if p.profession_id not in seen_ids:
-                seen_ids.add(p.profession_id)
-                unique_professions.append(p)
-        professions = unique_professions
-
-        try:
-            await self._scheduler.add_account(account_id, bot, professions=professions)
-        except ValueError as e:
-            return False, str(e)
-
-        # Встановлюємо сесію одразу після реєстрації.
-        # Без цього будь-яка profession що спробує safe_session до наступного
-        # StartupManager.run() (якого при hot-add немає) — отримає RuntimeError.
-        ok = await self._scheduler.connect_account(account_id)
+        ok, err = await self._register(account_id, email)
         if not ok:
-            err = bot.error or "connect() повернув False"
-            await self._scheduler.remove_account(account_id)
-            return False, f"Акаунт зареєстровано, але сесія не встановлена: {err}"
+            return False, err
 
+        return await self._run_on_home_loop(
+            lambda: self._add_account_finish_impl(account_id)
+        )
+
+    async def _add_account_finish_impl(self, account_id: str) -> tuple[bool, str]:
+        scheduler = self._scheduler
+        bot = scheduler.get_bot(account_id)
+
+        if not await scheduler.connect_account(account_id):
+            await scheduler.remove_account(account_id)
+            return False, f"Сесія не встановлена: {(bot and bot.error) or 'connect() повернув False'}"
+
+        await scheduler.setup_professions(account_id, self._build_professions(account_id))
         return True, ""
 
     # ── Управління professions ────────────────────────────────────────────────
@@ -263,6 +344,17 @@ class SchedulerService:
         profession_name: str,
         *,
         priority: int = -1,
+    ) -> tuple[bool, str]:
+        ok, err = await self._run_on_home_loop(
+            lambda: self._add_profession_impl(account_id, profession_name)
+        )
+        if ok:
+            # В БД зберігаємо тільки сам вибраний profession_name, не deps
+            self._repo.accounts.add_profession(account_id, profession_name, priority=priority)
+        return ok, err
+
+    async def _add_profession_impl(
+        self, account_id: str, profession_name: str
     ) -> tuple[bool, str]:
         scheduler = self._scheduler
         if not scheduler.has_account(account_id):
@@ -281,12 +373,10 @@ class SchedulerService:
             if scheduler.has_profession(account_id, profession.profession_id):
                 continue  # dep вже є — пропускаємо
             try:
-                await self._scheduler.add_profession_to_account(account_id, profession)
+                await scheduler.add_profession_to_account(account_id, profession)
             except Exception as e:
                 return False, f"Не вдалося додати {profession.profession_id!r}: {e}"
 
-        # В БД зберігаємо тільки сам вибраний profession_name, не deps
-        self._repo.accounts.add_profession(account_id, profession_name, priority=priority)
         return True, ""
 
     async def remove_profession(
@@ -294,18 +384,38 @@ class SchedulerService:
         account_id:      str,
         profession_name: str,
     ) -> tuple[bool, str]:
+        ok, err = await self._run_on_home_loop(
+            lambda: self._remove_profession_impl(account_id, profession_name)
+        )
+        if ok:
+            self._repo.accounts.remove_profession(account_id, profession_name)
+        return ok, err
+
+    async def _remove_profession_impl(
+        self, account_id: str, profession_name: str
+    ) -> tuple[bool, str]:
         scheduler = self._scheduler
         if not scheduler.has_account(account_id):
             return False, f"Акаунт {account_id!r} не знайдено"
 
         await scheduler.remove_profession_from_account(account_id, profession_name)
-        self._repo.accounts.remove_profession(account_id, profession_name)
         return True, ""
 
     async def set_professions(
         self,
         account_id:  str,
         profession_names: list[str],
+    ) -> tuple[bool, str]:
+        ok, err = await self._run_on_home_loop(
+            lambda: self._set_professions_impl(account_id, profession_names)
+        )
+        if ok:
+            target = list(dict.fromkeys(profession_names))
+            self._repo.accounts.set_professions(account_id, target)
+        return ok, err
+
+    async def _set_professions_impl(
+        self, account_id: str, profession_names: list[str]
     ) -> tuple[bool, str]:
         scheduler = self._scheduler
         if not scheduler.has_account(account_id):
@@ -327,13 +437,12 @@ class SchedulerService:
                 except Exception as e:
                     return False, f"Помилка profession {name!r}: {e}"
 
-        self._repo.accounts.set_professions(account_id, target)
         return True, ""
 
     # ── Видалення акаунта ─────────────────────────────────────────────────────
 
     async def remove(self, account_id: str) -> bool:
-        ok = await self._scheduler.remove_account(account_id)
+        ok = await self._run_on_home_loop(lambda: self._scheduler.remove_account(account_id))
         if ok:
             _erase_credentials(account_id)
         return ok
@@ -345,12 +454,12 @@ class SchedulerService:
         account_id: str,
         targets: list[str],
     ) -> tuple[bool, str, dict[str, Any]]:
-        res = await self._scheduler.ask(
+        res = await self._run_on_home_loop(lambda: self._scheduler.ask(
             account_id,
             profession_id="manga_loader",
             intent="force_parse",
             data={"translits": targets},
-        )
+        ))
         if res.approved:
             data = res.data or {}
             return True, "", {
@@ -364,12 +473,12 @@ class SchedulerService:
         account_id: str,
         targets: list[str],
     ) -> tuple[bool, str, dict[str, Any]]:
-        res = await self._scheduler.ask(
+        res = await self._run_on_home_loop(lambda: self._scheduler.ask(
             account_id,
             profession_id="reader",
             intent="mark_read",
             data={"targets": targets},
-        )
+        ))
         if res.approved:
             return True, "", res.data or {}
         return False, res.reason or "невідома помилка", {}
@@ -381,7 +490,7 @@ class SchedulerService:
         include_tags: Optional[list[str]]  = None,
         exclude_tags: Optional[list[str]]  = None,
     ) -> bool:
-        res = await self._scheduler.ask(
+        res = await self._run_on_home_loop(lambda: self._scheduler.ask(
             account_id,
             profession_id="reader",
             intent="set_reading_params",
@@ -390,32 +499,35 @@ class SchedulerService:
                 "include_tags": include_tags,
                 "exclude_tags": exclude_tags,
             },
-        )
+        ))
         if res.approved:
             return True
         return False
 
     async def reset_catalog_page(self, account_id: str) -> tuple[bool, str]:
-        res = await self._scheduler.ask(
+        res = await self._run_on_home_loop(lambda: self._scheduler.ask(
             account_id,
             profession_id="catalog_loader",
             intent="reset_catalog_page",
             data={},
-        )
+        ))
         if res.approved:
             return True, ""
         return False, res.reason or "невідома помилка"
 
     async def get_reader_state(self, account_id: str) -> tuple[bool, dict[str, Any]]:
-        res = await self._scheduler.ask(
+        res = await self._run_on_home_loop(lambda: self._scheduler.ask(
             account_id,
             profession_id="reader",
             intent="get_state",
             data={},
-        )
+        ))
         if res.approved:
             return True, res.data or {}
         return False, {}
 
-    async def pause(self, account_id: str)  -> bool: return await self._scheduler.pause_account(account_id)
-    async def resume(self, account_id: str) -> bool: return await self._scheduler.resume_account(account_id)
+    async def pause(self, account_id: str)  -> bool:
+        return await self._run_on_home_loop(lambda: self._scheduler.pause_account(account_id))
+
+    async def resume(self, account_id: str) -> bool:
+        return await self._run_on_home_loop(lambda: self._scheduler.resume_account(account_id))

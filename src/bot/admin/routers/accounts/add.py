@@ -15,7 +15,7 @@ from aiogram.types import (
     Message,
 )
 
-from src.bot.admin.services.scheduler_service import SchedulerService
+from src.bot.services.scheduler_service import SchedulerService
 from ._common import cancel_add_kb, make_editor
 
 router = Router(name="accounts:add")

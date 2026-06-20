@@ -44,7 +44,7 @@ T = TypeVar("T")
 
 log = logging.getLogger("core.proxy_queue")
 
-REQUEST_DELAY: float = 2.0
+REQUEST_DELAY: float = 3.0
 RETRY_AFTER_DEFAULT: float = 15.0
 MAX_RETRIES: int = 5
 _NO_PROXY_KEY = "__no_proxy__"

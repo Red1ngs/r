@@ -25,7 +25,7 @@ mangabuff/personal/auth_service.py — AuthService (CoreService).
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from src.core.runtime.core_service import CoreService
 from src.core.logging.loggers import get_logger
@@ -78,7 +78,7 @@ class AuthService(CoreService):
 
     # ── AuthSuccessCallback ───────────────────────────────────────────────────
 
-    async def on_auth_success(self, user_name: str, user_id: str) -> None:
+    async def on_auth_success(self, data: dict[str, Any]) -> None:
         """
         Викликається BotTransport після кожного успішного check_auth().
 
@@ -86,19 +86,24 @@ class AuthService(CoreService):
         Персистенція тут явна (не через RequestRouter) бо on_auth_success
         викликається поза lifecycle handle_request.
         """
+        user_name: str | None = data.get("user_name")
+        user_id: str | None = data.get("user_id")
+        is_banned: bool = data.get("is_banned", False)
+        
         if self._account is None:
             # bind() ще не викликався. Таке можливо якщо on_auth_success
             # спрацьовує під час самого connect() раніше ніж bind завершився.
             # Безпечно ігнорувати — user_name буде збережений при наступному
             # логіні після того як bind() вже викличеться.
             log.debug(
-                f"on_auth_success({user_name!r}, {user_id!r}): not yet bound to account, skipping"
+                f"on_auth_success({user_name!r}, {user_id!r}, {is_banned!r}): not yet bound to account, skipping"
             )
             return
 
         bot = self._account
         bot.inventory.personal.user_name = user_name
         bot.inventory.personal.user_id = user_id
+        bot.inventory.personal.is_banned = is_banned
         log.info(f"[{bot.account_id}] identity saved: {user_name!r} (ID: {user_id!r})")
 
         try:

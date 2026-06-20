@@ -123,6 +123,10 @@ class EventDrivenScheduler:
                 raise RuntimeError("EventDrivenScheduler вже ініціалізований.")
             inst = cls.__new__(cls)
             inst._init(on_dead)
+            # initialize() — async, отже зараз гарантовано є running loop.
+            # Саме цей loop стає "домашнім" для всіх Account/BotSession,
+            # створених через цей scheduler.
+            inst._home_loop = asyncio.get_running_loop()
             cls._instance = inst
             return inst
 
@@ -156,6 +160,18 @@ class EventDrivenScheduler:
         self._async_loop:  Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
         self._loading_lock: Optional[asyncio.Lock] = None
+
+        # "Домашній" loop — той, у якому виконався initialize().
+        # Усі Account/BotSession (а отже curl_cffi.AsyncSession) живуть і
+        # використовуються тільки тут. Будь-який код, що звертається до
+        # scheduler'а з іншого потоку/loop'у (admin-bot, тести), повинен
+        # переноситись сюди через SchedulerService._run_on_home_loop(),
+        # інакше curl_cffi впаде з "Future attached to a different loop".
+        self._home_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    @property
+    def home_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        return self._home_loop
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -270,32 +286,31 @@ class EventDrivenScheduler:
 
     async def add_account(
         self,
-        account_id:  str,
-        bot:         Account,
-        professions: list["BaseProfession"],
-        guard:       Optional[Condition] = None,
+        account_id: str,
+        bot:        Account,
+        guard:      Optional[Condition] = None,
     ) -> None:
-        # FIX Bug 8: НЕ додаємо container до self._containers до перевірки
-        # статусу DEAD та успішного setup_professions.
+        """
+        Крок 1 з 3: відновлення акаунта з пам'яті.
+
+        Реєструє контейнер і прив'язує CoreService-и (AuthService тощо).
+        CoreService-и потрібні ДО connect() — вони реагують на on_auth_success
+        під час першого authenticate().
+
+        НЕ робить connect(), НЕ setup профессій.
+        """
         if bot.status == AccountStatus.DEAD:
             if self._on_dead:
                 self._on_dead(bot)
             return
 
-        container = AccountContainer(bot=bot, guard=guard)
-
         with self._lock:
             if account_id in self._containers:
                 raise ValueError(f"Акаунт {account_id!r} вже існує")
-            self._containers[account_id] = container
+            self._containers[account_id] = AccountContainer(bot=bot, guard=guard)
 
-        # Спочатку прив'язуємо CoreService-и (наприклад AuthService).
-        # Вони мають бути готові до connect_account() і до setup professions,
-        # бо on_auth_success з'явиться під час першого authenticate().
         await self._bind_core_services(bot)
-
-        await self._setup_professions(account_id, bot, professions)
-        log.info(f"[{account_id}] додано ({len(professions)} professions)")
+        log.info(f"[{account_id}] зареєстровано")
 
     @staticmethod
     async def _bind_core_services(bot: Account) -> None:
@@ -318,32 +333,47 @@ class EventDrivenScheduler:
 
     async def connect_account(self, account_id: str) -> bool:
         """
-        Встановлює сесію і підключає монітори.
+        Крок 2 з 3: встановлює сесію.
 
-        Повертає True при успіху.
+        Тільки bot.connect(). Профессії і монітори — окремий крок (setup_professions).
         """
         with self._lock:
             container = self._containers.get(account_id)
-            
+
         if container is None:
             log.warning(f"[{account_id}] connect_account: акаунт не знайдено")
             return False
 
         if container.bot.is_connected:
             log.debug(f"[{account_id}] connect_account: вже підключено")
-            await self._attach_all_monitors(account_id, container)
             return True
 
-        # FIX BUG-1: результат connect() тепер зберігається в ok
         ok = await container.bot.connect()
-
         if not ok:
             log.error(f"[{account_id}] connect_account: connect() провалився — {container.bot.error}")
-            return False
+        return ok
 
+    async def setup_professions(
+        self,
+        account_id:  str,
+        professions: list["BaseProfession"],
+    ) -> None:
+        """
+        Крок 3 з 3: setup профессій і attach моніторів.
+
+        Викликається після успішного connect_account().
+        Сесія вже є — profession.setup() і restore_state() безпечні.
+        """
+        with self._lock:
+            container = self._containers.get(account_id)
+
+        if container is None:
+            log.warning(f"[{account_id}] setup_professions: акаунт не знайдено")
+            return
+
+        await self._setup_professions(account_id, container.bot, professions)
         await self._attach_all_monitors(account_id, container)
-        log.info(f"[{account_id}] connect_account: підключено, монітори активні")
-        return True
+        log.info(f"[{account_id}] setup_professions: {len(professions)} professions, монітори активні")
 
     async def _attach_all_monitors(self, account_id: str, container: "AccountContainer") -> None:
         """Чіпляє монітори для всіх активних profession контейнера."""
@@ -494,7 +524,7 @@ class EventDrivenScheduler:
             container = self._containers.get(account_id)
         return container.bot if container else None
 
-    def get_entry(self, account_id: str) -> Optional[AccountContainer]:
+    def get_container(self, account_id: str) -> Optional[AccountContainer]:
         with self._lock:
             return self._containers.get(account_id)
 
@@ -620,7 +650,7 @@ class EventDrivenScheduler:
             profession_id = profession_id,
             intent        = intent,
             caller        = caller,
-            bot           = bot,
+            _bot           = bot,
             timeout       = timeout,
         )
         return await self._router.route(ctx, data or {})

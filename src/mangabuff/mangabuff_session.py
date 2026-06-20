@@ -13,7 +13,7 @@ from src.core.config.bot import BotConfig
 from src.core.config.app import AppConfig
 from src.core.runtime.proxy_queue import proxy_queue_manager, RateLimitedError
 from src.database.repository.session import SessionRepository
-from src.mangabuff.csrf_token import parse_main_page
+from src.mangabuff.parser import parse_main_page, parse_mining_page
 from src.mangabuff.daily.parser import get_claimable_day
 from src.utils.log_section import section
 from src.utils.logging import log_request_curl, log_response_curl, log_payload_curl  # noqa: F401
@@ -150,7 +150,7 @@ class RequestHeaders:
 # РІВЕНЬ 2: ТРАНСПОРТ (HTTP, Cookies, Auth, CSRF)
 # ===========================================================================
 
-AuthSuccessCallback = Callable[[str, str], Awaitable[Any]]
+AuthSuccessCallback = Callable[[dict[str, Any]], Awaitable[Any]]
 """
 Викликається BotTransport після кожного успішного check_auth().
 Аргументи — user_name і user_id розпізнані з HTML.
@@ -252,7 +252,8 @@ class BotTransport:
         try:
             r = await self.get("/login", headers=self.headers.get_navigation())
             r.raise_for_status()
-            token, _, _ = parse_main_page(r.text)
+            data = parse_main_page(r.text, only_token=True)
+            token = data.pop("csrf_token")
             if not token:
                 return False
             self.headers.csrf_token = token
@@ -289,12 +290,12 @@ class BotTransport:
         try:
             r = await self.get(self.bot_config.client.base_url, headers=self.headers.get_navigation())
             r.raise_for_status()
-            token, user_name, user_id = parse_main_page(r.text)
-            if token and user_name:
+            data = parse_main_page(r.text)
+            token = data.pop("csrf_token")
+            if data and token:
                 self.headers.csrf_token = token
                 if xsrf := self._client.cookies.get("XSRF-TOKEN", domain=self.bot_config.client.host):
                     self.headers.xsrf_token = unquote(xsrf)
-                log().info(f"  → ✅ {user_name} ({user_id})")
 
                 # Зберігаємо актуальні cookies у БД після кожного успішного check_auth.
                 self.session_repo.save(self.account_id, dict(self._client.cookies))
@@ -302,7 +303,7 @@ class BotTransport:
                 # Сигналізуємо підписнику (AuthService) — він сам вирішить
                 # що робити з user_name. BotTransport більше нічого не знає.
                 if self._on_auth_success is not None:
-                    await self._on_auth_success(user_name, user_id)
+                    await self._on_auth_success(data)
 
                 return True
             return False
@@ -549,4 +550,23 @@ class BotSession(BotTransport):
         if r.status_code == 200:
             return http_success(self._json(r))
         log().warning(f"  → quiz_answer: {r.status_code}")
+        return http_fail(FailReason.SERVER)
+    
+    # ── Mining ──────────────────────────────────────────────────────────────────
+    
+    @http_call
+    async def mine(self) -> HttpResult[dict[str, Optional[int]]]:
+        r = await self.get("/mine", timeout=15)
+        if r.status_code == 200:
+            data = parse_mining_page(r.text)
+            return http_success(data)
+        log().warning(f"  → mine_hit: {r.status_code}")
+        return http_fail(FailReason.SERVER)
+
+    @http_call
+    async def mine_hit(self) -> HttpResult[dict[str, int]]:
+        r = await self.post("/mine/hit", timeout=15)
+        if r.status_code == 200:
+            return http_success(self._json(r))
+        log().warning(f"  → mine_hit: {r.status_code}")
         return http_fail(FailReason.SERVER)

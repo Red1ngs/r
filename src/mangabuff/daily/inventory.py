@@ -46,7 +46,7 @@ class DailyInventory(BaseInventory):
         return self.data.get("last_daily_claimed")
 
     @last_daily_claimed.setter
-    def last_daily_claimed(self, value: str) -> None:
+    def last_daily_claimed(self, value: str | None) -> None:
         self.data["last_daily_claimed"] = value
 
     @property
@@ -55,7 +55,7 @@ class DailyInventory(BaseInventory):
         return self.data.get("last_calendar_claimed")
 
     @last_calendar_claimed.setter
-    def last_calendar_claimed(self, value: str) -> None:
+    def last_calendar_claimed(self, value: str | None) -> None:
         self.data["last_calendar_claimed"] = value
 
     def __repr__(self) -> str:

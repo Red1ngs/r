@@ -88,7 +88,11 @@ class QuizMonitor(BaseMonitor):
         scheduler.subscribe("quiz.session_ended",   self._on_session_ended)
 
         # Відновлення після перезапуску
-        self._start_cycle(delay=0.0)
+        if self._bot:
+            delay = self._bot.inventory.quiz.answer_delay
+        else:
+            delay = 1.0
+        self._start_cycle(delay=delay)
 
     async def detach(
         self,

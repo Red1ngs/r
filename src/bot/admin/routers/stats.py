@@ -17,7 +17,7 @@ from aiogram.types import (
 )
 
 from src.bot.admin.nav import nav_answer
-from src.bot.admin.services.scheduler_service import AccountInfo, SchedulerService
+from src.bot.services.scheduler_service import AccountInfo, SchedulerService
 
 router = Router(name="stats")
 

@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from src.bot.admin.services.scheduler_service import SchedulerService
+from src.bot.services.scheduler_service import SchedulerService
 from ._common import cancel_add_kb, account_text, account_menu_kb
 from .profession_menu import profession_menu_registry
 

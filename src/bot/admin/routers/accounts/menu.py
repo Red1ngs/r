@@ -10,7 +10,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
-from src.bot.admin.services.scheduler_service import SchedulerService
+from src.bot.services.scheduler_service import SchedulerService
 from ._common import account_text, account_menu_kb, confirm_remove_kb
 
 router = Router(name="accounts:menu")

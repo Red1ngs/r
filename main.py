@@ -45,49 +45,38 @@ from src.core.core_account import Account
 from src.core.runtime.scheduler import EventDrivenScheduler
 
 # ── Services ──────────────────────────────────────────────────────────────────
-from src.bot.admin.services.scheduler_service import SchedulerService
+from src.bot.services.scheduler_service import SchedulerService
 from src.database.repository.account import AccountRepository
 from src.core.runtime.startup_manager import StartupManager, StartupConfig
 
 
 async def restore_accounts(
     service:     SchedulerService,
-    scheduler:   EventDrivenScheduler,
-    repository:  AccountRepository,
     startup_cfg: StartupConfig,
+    repository:  AccountRepository,
 ) -> None:
     """
-    Крок 1: реєструє всі акаунти в scheduler через add_account()
-            (профессії встановлюються, але connect() ще НЕ викликано).
-    Крок 2: StartupManager послідовно викликає bot.connect() з паузами —
-            лише після цього монітори отримують живу сесію і починають працювати.
-
-    Саме відсутність цього порядку викликала:
-        RuntimeError: [My_bot] Сесія не встановлена...
+    Крок 1 — register_account() для всіх акаунтів з БД (без connect, без профессій).
+    Крок 2 — StartupManager послідовно: connect_account() → setup_professions().
     """
     registered: list[str] = []
 
     for row in repository.get_all_accounts():
-        ok, err = await service.add_account(row.id, row.email)
+        ok, err = await service.register_account(row.id, row.email)
         if not ok:
             log.warning(f"[restore] '{row.id}' пропущено: {err}")
             continue
-
-        if row.professions:
-            log.info(f"[restore] '{row.id}' → professions={row.professions}")
-        else:
+        if not row.professions:
             log.warning(f"[restore] '{row.id}' без profession — моніторів не буде")
-
         registered.append(row.id)
 
     if not registered:
         log.info("[restore] Немає акаунтів для відновлення")
         return
 
-    sm = StartupManager(scheduler=scheduler, cfg=startup_cfg)
+    sm = StartupManager(service=service, cfg=startup_cfg)
     for aid in registered:
         sm.add(aid)
-
     await sm.run()
 
     if sm.failed_accounts:
@@ -118,7 +107,7 @@ async def main() -> None:
         admin_cfg = AdminBotConfig.from_env()
         svc = SchedulerService(repositories, app_cfg)
 
-        await restore_accounts(svc, scheduler, repositories.accounts, startup_cfg)
+        await restore_accounts(svc, startup_cfg, repositories.accounts)
 
         admin_bot = AdminBotRunner(admin_cfg, svc)
         admin_bot.start()

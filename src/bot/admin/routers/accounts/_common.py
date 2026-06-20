@@ -9,7 +9,7 @@ from typing import Optional, Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, LinkPreviewOptions
 
-from src.bot.admin.services.scheduler_service import AccountInfo
+from src.bot.services.scheduler_service import AccountInfo
 from src.core.runtime.profession_spec import profession_registry
 from src.bot.admin.routers.accounts.profession_menu import profession_menu_registry
 
@@ -69,7 +69,7 @@ def account_text(info: AccountInfo) -> str:
         monitors_line = "  <i>немає</i>"
 
     # ── Проксі
-    proxy_line = f"\n🔗 <code>{info.proxy}</code>" if info.proxy else ""
+    proxy_line = f"🔗 <code>{info.proxy}</code>" if info.proxy else ""
 
     # ── Сесія
     session_line = "🟢 сесія активна" if info.is_connected else "🔴 сесія відсутня"

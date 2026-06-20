@@ -1,14 +1,11 @@
 """
-startup_manager.py — послідовний запуск акаунтів.
+startup_manager.py — послідовний запуск акаунтів при старті.
 
-Проблема:
-    scheduler.add_account() реєструє акаунт і піднімає профессії,
-    але НЕ чіпляє монітори (це зроблено навмисно).
-    StartupManager послідовно викликає scheduler.connect_account(),
-    який робить bot.connect() і лише після успіху підключає монітори.
+Порядок для кожного акаунта:
+    1. connect_account()   — встановлює сесію
+    2. setup_professions() — setup + attach monitors (потребує живої сесії)
 
-    Без паузи між акаунтами — паралельний флуд login-запитів.
-    З паузою — плавний старт без банів/throttle.
+Пауза між акаунтами запобігає паралельному флуду login-запитів.
 """
 from __future__ import annotations
 
@@ -18,17 +15,16 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.core.runtime.scheduler import EventDrivenScheduler
+    from src.bot.services.scheduler_service import SchedulerService
 
 log = logging.getLogger("src.runtime.startup_manager")
 
 
 @dataclass
 class StartupConfig:
-    """Параметри плавного запуску. Зчитуються з app.yaml → секція startup:"""
-    connect_delay:   float = 5.0   # пауза між connect() двох сусідніх акаунтів (сек)
-    connect_timeout: float = 30.0  # таймаут одного connect()
-    skip_failed:     bool  = True  # пропустити збійний акаунт і продовжити старт
+    connect_delay:   float = 5.0
+    connect_timeout: float = 30.0
+    skip_failed:     bool  = True
 
     @classmethod
     def from_app_config(cls, cfg) -> "StartupConfig":
@@ -44,30 +40,20 @@ class StartupConfig:
 
 class StartupManager:
     """
-    Послідовний connect для кожного акаунта з паузою між ними.
+    Послідовний connect + setup профессій для кожного акаунта з паузою.
 
-    scheduler.connect_account() — async, виконується через await.
-    запускається в ThreadPoolExecutor щоб не блокувати event loop.
-
-    Використання в main.py:
-        sm = StartupManager(
-            scheduler=scheduler,
-            cfg=StartupConfig.from_app_config(app_cfg),
-        )
-        for account_id in registered:
-            sm.add(account_id)
+    Використання:
+        sm = StartupManager(service, cfg)
+        for aid in registered:
+            sm.add(aid)
         await sm.run()
     """
 
-    def __init__(
-        self,
-        scheduler: "EventDrivenScheduler",
-        cfg: StartupConfig | None = None,
-    ) -> None:
-        self._scheduler = scheduler
-        self._cfg       = cfg or StartupConfig()
-        self._queue:  list[str]            = []
-        self._ok:     list[str]            = []
+    def __init__(self, service: "SchedulerService", cfg: StartupConfig | None = None) -> None:
+        self._service = service
+        self._cfg     = cfg or StartupConfig()
+        self._queue:  list[str]             = []
+        self._ok:     list[str]             = []
         self._failed: list[tuple[str, str]] = []
 
     def add(self, account_id: str) -> None:
@@ -86,34 +72,16 @@ class StartupManager:
         total = len(self._queue)
         log.info(
             f"[StartupManager] Плавний запуск {total} акаунтів "
-            f"(затримка між акаунтами: {self._cfg.connect_delay}s)"
+            f"(затримка: {self._cfg.connect_delay}s)"
         )
 
         for idx, account_id in enumerate(self._queue):
             if idx > 0:
                 await asyncio.sleep(self._cfg.connect_delay)
 
-            log.info(f"[StartupManager] [{idx + 1}/{total}] connect '{account_id}' …")
+            log.info(f"[StartupManager] [{idx + 1}/{total}] '{account_id}' …")
             try:
-                ok = await self._scheduler.connect_account(account_id)
-                if ok:
-                    self._ok.append(account_id)
-                    log.info(f"[StartupManager] ✓ '{account_id}' підключено")
-                else:
-                    bot = self._scheduler.get_bot(account_id)
-                    err = getattr(bot, "error", "connect() повернув False") if bot else "акаунт не знайдено"
-                    self._failed.append((account_id, str(err)))
-                    log.error(f"[StartupManager] ✗ '{account_id}': {err}")
-                    if not self._cfg.skip_failed:
-                        raise RuntimeError(str(err))
-
-            except asyncio.TimeoutError:
-                err = f"timeout ({self._cfg.connect_timeout}s)"
-                self._failed.append((account_id, err))
-                log.error(f"[StartupManager] ✗ '{account_id}': {err}")
-                if not self._cfg.skip_failed:
-                    raise
-
+                await self._start_one(account_id)
             except Exception as exc:
                 self._failed.append((account_id, str(exc)))
                 log.error(f"[StartupManager] ✗ '{account_id}': {exc}")
@@ -124,3 +92,21 @@ class StartupManager:
             f"[StartupManager] READY — підключено: {len(self._ok)}/{total}"
             + (f", невдало: {[a for a, _ in self._failed]}" if self._failed else "")
         )
+
+    async def _start_one(self, account_id: str) -> None:
+        scheduler = self._service._scheduler
+
+        ok = await scheduler.connect_account(account_id)
+        if not ok:
+            bot = scheduler.get_bot(account_id)
+            err = (bot.error if bot else None) or "connect() повернув False"
+            self._failed.append((account_id, err))
+            log.error(f"[StartupManager] ✗ '{account_id}': {err}")
+            if not self._cfg.skip_failed:
+                raise RuntimeError(err)
+            return
+
+        professions = self._service._build_professions(account_id)
+        await scheduler.setup_professions(account_id, professions)
+        self._ok.append(account_id)
+        log.info(f"[StartupManager] ✓ '{account_id}' готово")

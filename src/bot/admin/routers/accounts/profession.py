@@ -6,7 +6,7 @@ from __future__ import annotations
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
-from src.bot.admin.services.scheduler_service import SchedulerService
+from src.bot.services.scheduler_service import SchedulerService
 from ._common import account_text, account_menu_kb, professions_manage_kb
 
 router = Router(name="accounts:profession")

@@ -248,7 +248,17 @@ class DailyCfg:
             claim_text=str(d.get("claim_text", "Забрать")),
             day_attr=str(d.get("day_attr", "data-day")),
         )
+               
 
+@dataclass(frozen=True)
+class MiningCfg:
+    delay: float
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "MiningCfg":
+        return cls(
+            delay=float(d.get("delay", 2.1))
+        )
 
 @dataclass(frozen=True)
 class StartupCfg:
@@ -280,6 +290,7 @@ class AppConfig:
     reader:  ReaderAppCfg
     daily:   DailyCfg
     quiz:    QuizCfg
+    mining:    MiningCfg
     startup: StartupCfg
 
     @classmethod
@@ -289,6 +300,7 @@ class AppConfig:
             reader=ReaderAppCfg.from_dict(raw_data.get("reader", {})),
             daily=DailyCfg.from_dict(raw_data.get("daily", {})),
             quiz=QuizCfg.from_dict(raw_data.get("quiz", {})),
+            mining=MiningCfg.from_dict(raw_data.get("mining", {})),
             startup=StartupCfg.from_dict(raw_data.get("startup", {})),
         )
 

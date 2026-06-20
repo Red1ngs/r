@@ -13,7 +13,7 @@ from typing import Optional
 
 from src.bot.admin.bot import create_admin_bot
 from src.bot.admin.config import AdminBotConfig
-from src.bot.admin.services.scheduler_service import SchedulerService
+from src.bot.services.scheduler_service import SchedulerService
 
 from src.core.logging.loggers import get_logger
 log = get_logger("admin.runner")

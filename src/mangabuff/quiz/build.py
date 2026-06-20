@@ -28,11 +28,11 @@ Events що емітуються:
 """
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
 from src.mangabuff.quiz.inventory import QuizInventory
-from src.utils.time import today
 
 if TYPE_CHECKING:
     from src.core.core_account import Account
@@ -53,6 +53,7 @@ class QuizProfession(BaseProfession):
     def __init__(self) -> None:
         self._account_id: str                              = ""
         self._scheduler:  Optional["EventDrivenScheduler"] = None
+        self._bot:        Optional[Account]                = None
 
     @property
     def profession_id(self) -> str:
@@ -92,7 +93,7 @@ class QuizProfession(BaseProfession):
         self._scheduler = None
 
     def check_guard(self, bot: "Account") -> bool:
-        return not bool(bot.inventory.personal.data.get("is_banned"))
+        return not bool(bot.inventory.personal.is_banned)
 
     # ── handle_request ────────────────────────────────────────────────────────
 
@@ -120,41 +121,52 @@ class QuizProfession(BaseProfession):
 
     async def _handle_do_open(self, ctx: "RequestContext") -> RequestResult:
         """Відкриває нову quiz-сесію. Зберігає перше питання в inventory."""
-        bot = ctx.bot
-        inv: QuizInventory = bot.inventory.quiz  # type: ignore[attr-defined]
-        log = get_account_logger(ctx.account_id)
+        log = get_account_logger(self._account_id)
+        try:
+            # 1. Валідація системних об'єктів
+            if self._scheduler is None:
+                raise ValueError("Scheduler не доступний")
+            
+            bot = self._scheduler.get_bot(ctx.account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+            
+            inv: QuizInventory = bot.inventory.quiz
+            log = get_account_logger(ctx.account_id)
 
-        if inv.session_active:
-            log.debug("do_open: сесія вже активна, пропускаємо")
-            return RequestResult.approve(data={"status": "already_open"})
+            if inv.session_active:
+                log.debug("do_open: сесія вже активна, пропускаємо")
+                return RequestResult.approve(data={"status": "already_open"})
 
-        log.info("📝 Quiz: відкриваємо сесію…")
-        question = await bot.safe_session.quiz_start()
+            log.info("📝 Quiz: відкриваємо сесію…")
+            question = await bot.safe_session.quiz_start()
 
-        data = question.data
-        if data is None:
-            log.warning("⚠️ /quiz/start не відповів")
-            return RequestResult.deny("quiz_start returned None")
+            data = question.data
+            if data is None:
+                log.warning("⚠️ /quiz/start не відповів")
+                raise ValueError("quiz_start returned None")
 
-        inv.open_session(data)
+            inv.open_session(data)
 
-        log.info(
-            f"✅ Сесія відкрита | "
-            f"q_id={data.get('id')} | "
-            f"{data.get('question', '')[:60]}"
-        )
+            log.info(
+                f"✅ Сесія відкрита | "
+                f"q_id={data.get('id')} | "
+                f"{data.get('question', '')[:60]}"
+            )
 
-        if self._scheduler is not None:
             await self._scheduler.emit_event(
                 "quiz.session_opened",
                 {"account_id": ctx.account_id, "question_id": question.data.get("id")},
                 source=ctx.account_id,
             )
 
-        return RequestResult.approve(data={
-            "question_id": data.get("id"),
-            "question":    data.get("question", ""),
-        })
+            return RequestResult.approve(data={
+                "question_id": data.get("id"),
+                "question":    data.get("question", ""),
+            })
+        except Exception as exc:
+            log.exception("do_open: критична помилка")
+            return RequestResult.deny(f"Помилка ініціалізації квіза: {exc}")
 
     # ── do_answer ─────────────────────────────────────────────────────────────
 
@@ -169,46 +181,53 @@ class QuizProfession(BaseProfession):
             "restart"   — невірна відповідь, сесія закрита
             "no_next"   — сервер вичерпав питання, сесія закрита
         """
-        bot = ctx.bot
-        inv: QuizInventory = bot.inventory.quiz
-        personal = bot.inventory.personal
-        
-        to_day = personal.to_day
-        log = get_account_logger(ctx.account_id)
+        log = get_account_logger(self._account_id)
+        try:
+            # 1. Валідація системних об'єктів
+            if self._scheduler is None:
+                raise ValueError("Scheduler не доступний")
+            
+            bot = self._scheduler.get_bot(ctx.account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+            
+            inv: QuizInventory = bot.inventory.quiz
+            personal = bot.inventory.personal
+            
+            to_day = personal.to_day
 
-        question = inv.current_question
-        if question is None:
-            log.warning("⚠️ do_answer: питання в inventory відсутнє")
-            return RequestResult.deny("no current question")
+            question = inv.current_question
+            if question is None:
+                log.warning("⚠️ do_answer: питання в inventory відсутнє")
+                raise ValueError("no current question")
 
-        answer_text: str = question.get("correct_text", question["answers"][0])
-
-        log.info(
-            f"❓ [Q#{question.get('id')}] "
-            f"{question.get('question', '')[:60]} → «{answer_text}»"
-        )
-
-        result = await bot.safe_session.quiz_answer(answer_text)
-
-        if result.data is None:
-            log.warning("⚠️ /quiz/answer не відповів")
-            return RequestResult.deny("quiz_answer returned None")
-
-        status = result.data.get("status")
-
-        # ── Правильна відповідь ────────────────────────────────────────────────
-        if status in ("success", "milestone"):
-            inv.correct_count = result.data.get("correct_count", inv.correct_count + 1)
-            counter = inv.increment_counter()
+            answer_text: str = question.get("correct_text", question["answers"][0])
 
             log.info(
-                f"✅ Вірно! "
-                f"correct={inv.correct_count} | "
-                f"counter={counter}/{inv.answer_limit} "
-                f"(mode={inv.mode})"
+                f"❓ [Q#{question.get('id')}] "
+                f"{question.get('question', '')[:60]} → «{answer_text}»"
             )
 
-            if self._scheduler is not None:
+            result = await bot.safe_session.quiz_answer(answer_text)
+
+            if result.data is None:
+                log.warning("⚠️ /quiz/answer не відповів")
+                raise ValueError("quiz_answer returned None")
+
+            status = result.data.get("status")
+
+            # ── Правильна відповідь ────────────────────────────────────────────────
+            if status in ("success", "milestone"):
+                inv.correct_count = result.data.get("correct_count", inv.correct_count + 1)
+                counter = inv.increment_counter()
+
+                log.info(
+                    f"✅ Вірно! "
+                    f"correct={inv.correct_count} | "
+                    f"counter={counter}/{inv.answer_limit} "
+                    f"(mode={inv.mode})"
+                )
+
                 await self._scheduler.emit_event(
                     "quiz.answered_correct",
                     {
@@ -221,13 +240,12 @@ class QuizProfession(BaseProfession):
                     source=ctx.account_id,
                 )
 
-            if status == "milestone":
-                log.info(
-                    f"🏅 Milestone! "
-                    f"milestone={result.data.get('milestone')} "
-                    f"message={result.data.get('message', '')!r}"
-                )
-                if self._scheduler is not None:
+                if status == "milestone":
+                    log.info(
+                        f"🏅 Milestone! "
+                        f"milestone={result.data.get('milestone')} "
+                        f"message={result.data.get('message', '')!r}"
+                    )
                     await self._scheduler.emit_event(
                         "quiz.milestone",
                         {
@@ -239,15 +257,14 @@ class QuizProfession(BaseProfession):
                         source=ctx.account_id,
                     )
 
-            # ── Ліміт досягнуто ───────────────────────────────────────────────
-            if counter >= inv.answer_limit:
-                log.info(
-                    f"🎯 Ліміт досягнуто "
-                    f"({counter}/{inv.answer_limit}, mode={inv.mode}) → закриваємо"
-                )
-                inv.close_session(to_day)
+                # ── Ліміт досягнуто ───────────────────────────────────────────────
+                if counter >= inv.answer_limit:
+                    log.info(
+                        f"🎯 Ліміт досягнуто "
+                        f"({counter}/{inv.answer_limit}, mode={inv.mode}) → закриваємо"
+                    )
+                    inv.close_session(to_day)
 
-                if self._scheduler is not None:
                     await self._scheduler.emit_event(
                         "quiz.limit_reached",
                         {
@@ -259,32 +276,31 @@ class QuizProfession(BaseProfession):
                         source=ctx.account_id,
                     )
 
-                return RequestResult.approve(data={"status": "limit"})
+                    return RequestResult.approve(data={"status": "limit"})
 
-            # ── Наступне питання ──────────────────────────────────────────────
-            next_question = result.data.get("question")
-            if next_question:
-                inv.current_question = next_question
-                log.info(f"➡️  Наступне питання id={next_question.get('id')}")
-                return RequestResult.approve(data={
-                    "status": "milestone" if status == "milestone" else "correct",
-                })
+                # ── Наступне питання ──────────────────────────────────────────────
+                next_question = result.data.get("question")
+                if next_question:
+                    inv.current_question = next_question
+                    log.info(f"➡️  Наступне питання id={next_question.get('id')}")
+                    return RequestResult.approve(data={
+                        "status": "milestone" if status == "milestone" else "correct",
+                    })
 
-            # Сервер вичерпав питання
-            log.info("🏆 Сервер вичерпав питання")
-            inv.close_session(to_day)
-            return RequestResult.approve(data={"status": "no_next"})
+                # Сервер вичерпав питання
+                log.info("🏆 Сервер вичерпав питання")
+                inv.close_session(to_day)
+                return RequestResult.approve(data={"status": "no_next"})
 
-        # ── Невірна відповідь / restart ───────────────────────────────────────
-        if status == "restart":
-            log.info(
-                f"❌ Невірна відповідь. "
-                f"Результат: {inv.correct_count}. "
-                f"mode={inv.mode}. {result.data.get('message', '')}"
-            )
-            inv.close_session(to_day)
+            # ── Невірна відповідь / restart ───────────────────────────────────────
+            if status == "restart":
+                log.info(
+                    f"❌ Невірна відповідь. "
+                    f"Результат: {inv.correct_count}. "
+                    f"mode={inv.mode}. {result.data.get('message', '')}"
+                )
+                inv.close_session(to_day)
 
-            if self._scheduler is not None:
                 await self._scheduler.emit_event(
                     "quiz.session_ended",
                     {
@@ -296,64 +312,91 @@ class QuizProfession(BaseProfession):
                     source=ctx.account_id,
                 )
 
-            return RequestResult.approve(data={"status": "restart"})
+                return RequestResult.approve(data={"status": "restart"})
 
-        log.warning(f"⚠️ Невідомий status: {status!r}")
-        return RequestResult.deny(f"unknown quiz status: {status!r}")
+            log.warning(f"⚠️ Невідомий status: {status!r}")
+            raise Exception(f"unknown quiz status: {status!r}")
+        except Exception as exc:
+            log.exception("do_answer: критична помилка")
+            return RequestResult.deny(f"Помилка питання квіза: {exc}")  
 
     # ── get_status ────────────────────────────────────────────────────────────
 
     async def _handle_get_status(self, ctx: "RequestContext") -> RequestResult:
-        inv: QuizInventory = ctx.bot.inventory.quiz  # type: ignore[attr-defined]
-        q = inv.current_question
-        return RequestResult.approve(data={
-            "mode":             inv.mode,
-            "answer_limit":     inv.answer_limit,
-            "answer_delay":     inv.answer_delay,
-            "session_active":   inv.session_active,
-            "counter":          inv.current_counter(),
-            "correct_count":    inv.correct_count,
-            "last_quiz_date":   inv.last_quiz_date,
-            "fixed_done":       inv.fixed_done,
-            "current_question": q.get("question") if q else None,
-        })
+        log = get_account_logger(self._account_id)
+        try:
+            if self._scheduler is None:
+                    raise ValueError("Scheduler не доступний")
+                
+            bot = self._scheduler.get_bot(ctx.account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+            
+            inv: QuizInventory = bot.inventory.quiz
+            q = inv.current_question
+            return RequestResult.approve(data={
+                "mode":             inv.mode,
+                "answer_limit":     inv.answer_limit,
+                "answer_delay":     inv.answer_delay,
+                "session_active":   inv.session_active,
+                "counter":          inv.current_counter(),
+                "correct_count":    inv.correct_count,
+                "last_quiz_date":   inv.last_quiz_date,
+                "fixed_done":       inv.fixed_done,
+                "current_question": q.get("question") if q else None,
+            })
+        except Exception as exc:
+            log.exception("get_status: критична помилка")
+            return RequestResult.deny(f"Помилка отримання статуса квіза: {exc}")
 
     # ── set_config ────────────────────────────────────────────────────────────
 
     async def _handle_set_config(
         self, data: dict[str, Any], ctx: "RequestContext"
     ) -> RequestResult:
-        inv: QuizInventory = ctx.bot.inventory.quiz  # type: ignore[attr-defined]
-        changed: dict[str, Any] = {}
+        log = get_account_logger(self._account_id)
+        try:
+            if self._scheduler is None:
+                    raise ValueError("Scheduler не доступний")
+                
+            bot = self._scheduler.get_bot(ctx.account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+            
+            inv: QuizInventory = bot.inventory.quiz 
+            changed: dict[str, Any] = {}
 
-        if "mode" in data:
-            mode = data["mode"]
-            if mode not in ("daily", "fixed"):
-                return RequestResult.deny("mode має бути 'daily' або 'fixed'")
-            inv.mode = mode
-            changed["mode"] = mode
+            if "mode" in data:
+                mode = data["mode"]
+                if mode not in ("daily", "fixed"):
+                    raise ValueError("mode має бути 'daily' або 'fixed'")
+                inv.mode = mode
+                changed["mode"] = mode
 
-        if "answer_limit" in data:
-            limit = data["answer_limit"]
-            if not isinstance(limit, int) or limit < 1:
-                return RequestResult.deny("answer_limit має бути цілим числом >= 1")
-            inv.answer_limit = limit
-            changed["answer_limit"] = limit
+            if "answer_limit" in data:
+                limit = data["answer_limit"]
+                if not isinstance(limit, int) or limit < 1:
+                    raise ValueError("answer_limit має бути цілим числом >= 1")
+                inv.answer_limit = limit
+                changed["answer_limit"] = limit
 
-        if "answer_delay" in data:
-            delay = data["answer_delay"]
-            if not isinstance(delay, (int, float)) or delay < 0:
-                return RequestResult.deny("answer_delay має бути числом >= 0")
-            inv.answer_delay = float(delay)
-            changed["answer_delay"] = float(delay)
+            if "answer_delay" in data:
+                delay = data["answer_delay"]
+                if not isinstance(delay, (int, float)) or delay < 0:
+                    raise ValueError("answer_delay має бути числом >= 0")
+                inv.answer_delay = float(delay)
+                changed["answer_delay"] = float(delay)
 
-        if not changed:
-            return RequestResult.deny(
-                "нічого не змінено — передайте mode, answer_limit або answer_delay"
-            )
+            if not changed:
+                return RequestResult.deny(
+                    "нічого не змінено — передайте mode, answer_limit або answer_delay"
+                )
 
-        get_account_logger(ctx.account_id).info(f"Quiz: конфіг оновлено → {changed}")
-        return RequestResult.approve(data={"changed": changed})
+            get_account_logger(ctx.account_id).info(f"Quiz: конфіг оновлено → {changed}")
+            return RequestResult.approve(data={"changed": changed})
+        except Exception as exc:
+            log.exception("set_config: критична помилка")
+            return RequestResult.deny(f"Помилка налаштування конфігурації: {exc}")
 
     # ── reset_daily ───────────────────────────────────────────────────────────
 
@@ -364,28 +407,40 @@ class QuizProfession(BaseProfession):
         Викликається QuizMonitor через ask() — монітор НЕ мутує inventory напряму.
         Збереження відбувається автоматично воркером після завершення задачі.
         """
-        inv: QuizInventory = ctx.bot.inventory.quiz  # type: ignore[attr-defined]
-        personal = ctx.bot.inventory.personal
-        to_day = personal.to_day
+        log = get_account_logger(self._account_id)
+        try:
+            if self._scheduler is None:
+                    raise ValueError("Scheduler не доступний")
+                
+            bot = self._scheduler.get_bot(ctx.account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+            
+            inv: QuizInventory = bot.inventory.quiz
+            personal = bot.inventory.personal
+            to_day = personal.to_day
 
-        if inv.mode != "daily":
-            return RequestResult.deny(f"reset_daily не застосовний для mode={inv.mode!r}")
-        
-        if inv.last_quiz_date == to_day and inv.current_counter() >= inv.answer_limit:
+            if inv.mode != "daily":
+                return RequestResult.deny(f"reset_daily не застосовний для mode={inv.mode!r}")
+            
+            if inv.last_quiz_date == to_day and inv.current_counter() >= inv.answer_limit:
+                get_account_logger(ctx.account_id).info(
+                    "QuizProfession: reset_daily → ліміт вже вичерпано сьогодні, пропускаємо"
+                )
+                return RequestResult.deny("daily limit already reached today")
+
+            inv.reset_daily_counter(to_day)
+            inv.session_active   = False
+            inv.current_question = None
+            inv.last_quiz_date   = None  # знімаємо блок _should_run у QuizMonitor
+
             get_account_logger(ctx.account_id).info(
-                "QuizProfession: reset_daily → ліміт вже вичерпано сьогодні, пропускаємо"
+                "QuizProfession: reset_daily → лічильник скинуто"
             )
-            return RequestResult.deny("daily limit already reached today")
-
-        inv.reset_daily_counter(to_day)
-        inv.session_active   = False
-        inv.current_question = None
-        inv.last_quiz_date   = None  # знімаємо блок _should_run у QuizMonitor
-
-        get_account_logger(ctx.account_id).info(
-            "QuizProfession: reset_daily → лічильник скинуто"
-        )
-        return RequestResult.approve(data={"status": "reset"})
+            return RequestResult.approve(data={"status": "reset"})
+        except Exception as exc:
+            log.exception("reset_daily: критична помилка")
+            return RequestResult.deny(f"Помилка нового дня: {exc}")
 
     # ── force_restart ─────────────────────────────────────────────────────────
 
@@ -394,25 +449,37 @@ class QuizProfession(BaseProfession):
         Скидає стан inventory. QuizMonitor сам підхопить через _should_run()
         і запустить новий цикл при наступній перевірці або на daily.claimed.
         """
-        inv: QuizInventory = ctx.bot.inventory.quiz  # type: ignore[attr-defined]
-        inv.session_active   = False
-        inv.current_question = None
+        log = get_account_logger(self._account_id)
+        try:
+            if self._scheduler is None:
+                    raise ValueError("Scheduler не доступний")
+                
+            bot = self._scheduler.get_bot(ctx.account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+            
+            inv: QuizInventory = bot.inventory.quiz
+            personal = bot.inventory.personal
+            inv.session_active   = False
+            inv.current_question = None
 
-        if inv.mode == "daily":
-            inv.reset_daily_counter(to_day)
-            inv.last_quiz_date = None
-        else:
-            inv.answers_done = 0
-            inv.fixed_done   = False
+            if inv.mode == "daily":
+                inv.reset_daily_counter(personal.to_day)
+                inv.last_quiz_date = None
+            else:
+                inv.answers_done = 0
+                inv.fixed_done   = False
 
-        get_account_logger(ctx.account_id).info("QuizProfession: force_restart")
+            get_account_logger(ctx.account_id).info("QuizProfession: force_restart")
 
-        # Повідомляємо монітор щоб стартував негайно
-        if self._scheduler is not None:
+            # Повідомляємо монітор щоб стартував негайно
             await self._scheduler.emit_event(
                 "quiz.force_restarted",
                 {"account_id": ctx.account_id},
                 source=ctx.account_id,
             )
 
-        return RequestResult.approve(data={"status": "restarting"})
+            return RequestResult.approve(data={"status": "restarting"})
+        except Exception as exc:
+            log.exception("force_restart: критична помилка")
+            return RequestResult.deny(f"Помилка запуску нового циклу: {exc}")

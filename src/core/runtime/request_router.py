@@ -20,7 +20,7 @@ class RequestContext:
     profession_id: str
     intent:        str
     caller:        str
-    bot:           "Account"
+    _bot:           "Account"
     timeout:       float = 30.0
     created_at:    float = field(default_factory=time.time)
 
@@ -68,7 +68,7 @@ class RequestRouter:
         # Profession не повинна викликати repo.inventory.save() напряму.
         if result.approved:
             try:
-                ctx.bot.repo.inventory.save(ctx.account_id, ctx.bot.inventory)
+                ctx._bot.repo.inventory.save(ctx.account_id, ctx._bot.inventory) # type: ignore
             except Exception as e:
                 log.warning(f"[Router] auto-save inventory failed for {ctx.account_id!r}: {e}")
 
