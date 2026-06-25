@@ -273,27 +273,19 @@ class EventDrivenScheduler:
             except Exception as e:
                 log.warning(f"proxy_queue shutdown error: {e}")
 
-            # FIX Bug 5: disconnect() має виконуватись всередині scheduler loop,
-            # бо BotSession (curl_cffi.AsyncSession) була створена в ньому.
-            # Закривати сесію з чужого loop'у — resource leak / помилки.
+            # Оскільки BotSession та підключення сокетів ініціалізуються на домашньому (головному) loop,
+            # закривати їх потрібно саме в ньому, а не в фоновому self._async_loop.
             with self._lock:
                 entries = dict(self._containers)
 
             if entries:
-                # Створюємо локальну корутину-обгортку для gather
-                async def _disconnect_all():
+                log.info("Disconnecting all accounts on home loop...")
+                try:
+                    # Виконуємо безпосередньо на поточному (home) loop
                     await asyncio.gather(
                         *(entry.bot.disconnect() for entry in entries.values()),
                         return_exceptions=True,
                     )
-
-                # Тепер передаємо саме виклик функції _disconnect_all()
-                disconnect_future = asyncio.run_coroutine_threadsafe(
-                    _disconnect_all(), 
-                    self._async_loop
-                )
-                try:
-                    disconnect_future.result(timeout=15.0)
                 except Exception as e:
                     log.warning(f"disconnect error during stop: {e}")
 

@@ -256,7 +256,6 @@ class QuizMonitor(BaseMonitor):
             # Новий день — daily.claimed ще не прийшов, чекаємо
             return False
         
-        inv.answers_today = 0
         return inv.current_counter() < inv.answer_limit
 
     def _get_answer_delay(self) -> float:
