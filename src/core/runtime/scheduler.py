@@ -1,49 +1,19 @@
 """
 scheduler.py — EventDrivenScheduler. Єдиний Scheduler в системі.
-
-Виправлення відносно попередньої версії:
-  BUG-1: connect_account() — `ok` ніколи не присвоювалась, NameError при провалі.
-  BUG-2: stop() — після зупинки loop викликав _run_async(disconnect()) на мертвому loop,
-          корутина ніколи не виконувалась. Замінено на asyncio.run() в новому loop.
-  BUG-3: resume_account() — run_coroutine_threadsafe().result() в async-контексті
-          дедлочило (блокувало той самий потік що веде loop). Замінено на await.
-  BUG-4: _attach_all_monitors() — async метод викликав _run_async(_attach_monitors_for(...))
-          тобто await self._run_async(self._run_async(coro)) — подвійне обгортання
-          у fire-and-forget, монітори прикріплювались без очікування. Виправлено:
-          _attach_monitors_for тепер async і викликається через await.
-  BUG-5: _reap_dead_workers() — _detach_all_monitors() викликався без await (sync
-          обгортки вже немає), а також _run_async(disconnect()) — аналогічно BUG-2.
-  BUG-6: _setup_single_profession() — self._attach_monitors_for(...) без await і
-          без _run_async — результат coroutine ніколи не awaited.
-  BUG-7: proxy_queue.py enqueue() — asyncio.get_event_loop() deprecated у Python 3.10+,
-          замінено на asyncio.get_running_loop().
-
-  ДУБЛЮВАННЯ-1: emit_event / emit_event_async — два публічних async методи що роблять
-          ледь різні речі (один через _run_async fire-and-forget, інший напряму).
-          Перший ніколи не поверне кількість підписників, другий — надлишковий alias.
-          Залишено лише emit_event як справжній await.
-  ДУБЛЮВАННЯ-2: _attach_monitors_for / _detach_monitor_if_unused / _detach_all_monitors —
-          були sync-обгортками що всередині запускали run_coroutine_threadsafe.
-          Всі три переведені в async, sync-обгортки прибрано.
-  ДУБЛЮВАННЯ-3: StartupManager.run() мав хибний коментар «connect_account() синхронний → executor»
-          (виконував await без executor). Коментар видалено.
 """
 from __future__ import annotations
 
 import asyncio
 import threading
-from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
-from src.core.monitoring.monitor import BaseMonitor
 from src.core.monitoring.account_monitors import AccountMonitors
 
 if TYPE_CHECKING:
     from src.core.runtime.profession import BaseProfession
-    from src.core.runtime.core_service import CoreService
+    from src.core.inventory.model import DynamicInventories
 
 from src.core.core_account import Account
-from src.core.inventory.model import DynamicInventories as Inventories
 from src.core.logging.loggers import get_scheduler_logger
 from src.core.runtime.event_bus import EventBus, EventCallback
 from src.core.runtime.request_router import RequestContext, RequestRouter
@@ -63,43 +33,139 @@ def _split_evenly(items: list[Any], n: int) -> list[list[Any]]:
     return [items[i: i + size] for i in range(0, len(items), size)]
 
 
-@dataclass
 class AccountContainer:
     """
-    Контейнер стану одного акаунта в Scheduler.
+    Self-contained менеджер стану та здібностей одного акаунта.
+    Керує життєвим циклом професій та їхніх моніторів як єдиним цілим.
     """
-    bot: Account
-    guard: Optional[Condition] = None
+    def __init__(
+        self, 
+        bot: "Account", 
+        guard: Optional["Condition"] = None
+    ):
+        self.bot = bot
+        self.guard = guard
+        self.monitors = AccountMonitors(bot.account_id)
+        self.professions: dict[str, "BaseProfession"] = {}
 
-    professions: dict[str, BaseProfession] = field(
-        default_factory=dict
-    )
-
-    monitors: dict[str, BaseMonitor] = field(
-        default_factory=dict
-    )
-
-    def check_account_guard(self, inv: Inventories) -> bool:
+    def check_account_guard(self, inv: "DynamicInventories") -> bool:
         return self.guard is None or self.guard(inv)
-
-    def add_profession(self, profession: "BaseProfession") -> None:
-        self.professions[profession.profession_id] = profession
-
-    def remove_profession(self, profession: "BaseProfession") -> None:
-        self.professions.pop(profession.profession_id, None)
-
-    def remove_profession_by_id(self, profession_id: str) -> None:
-        self.professions.pop(profession_id, None)
-
-    def get_profession(self, profession_id: str) -> Optional["BaseProfession"]:
-        return self.professions.get(profession_id)
-
-    def has_profession(self, profession_id: str) -> bool:
-        return profession_id in self.professions
 
     def profession_list(self) -> list["BaseProfession"]:
         return list(self.professions.values())
 
+    def has_profession(self, profession_id: str) -> bool:
+        return profession_id in self.professions
+
+    def get_profession(self, profession_id: str) -> Optional["BaseProfession"]:
+        return self.professions.get(profession_id)
+
+    # ── Розумне керування життєвим циклом ────────────────────────────────────
+
+    async def attach_profession(
+        self,
+        scheduler: "EventDrivenScheduler",
+        profession: "BaseProfession",
+        router: "RequestRouter"
+    ) -> bool:
+        
+        """
+        Комплексно додає професію: setup -> restore_state -> attach_monitors.
+        """
+        account_id = self.bot.account_id
+        pid = profession.profession_id
+
+        if pid in self.professions:
+            log.warning(f"[{account_id}] profession {pid!r} вже зареєстрована")
+            return True
+
+        try:
+            # 1. Ініціалізація професії
+            await profession.setup(scheduler, account_id)
+            router.register(account_id, profession)
+            await profession.restore_state(self.bot)
+            
+            # 2. Зберігаємо у стан
+            self.professions[pid] = profession
+
+            # 3. Автоматично підтягуємо монітори зі специфікації
+            if self.bot.is_connected:
+                monitor_ids = profession_registry.monitors_for(pid)
+                await self.monitors.attach_all(scheduler, monitor_ids)
+
+            log.info(f"[{account_id}] {pid!r} ready (monitors attached)")
+            return True
+
+        except Exception as e:
+            log.error(f"[{account_id}] setup {pid!r} failed: {e}", exc_info=True)
+            # Rollback у разі помилки
+            router.unregister(account_id, pid)
+            self.professions.pop(pid, None)
+            return False
+
+    async def detach_profession(
+        self,
+        scheduler: "EventDrivenScheduler", 
+        profession_id: str, 
+        event_bus: "EventBus", 
+        router: "RequestRouter"
+    ) -> None:
+        
+        """
+        Комплексно видаляє професію: teardown -> router unregister -> detach_unused_monitors.
+        """
+        account_id = self.bot.account_id
+        profession = self.professions.pop(profession_id, None)
+        
+        if not profession:
+            return
+
+        # 1. Зупиняємо саму професію
+        try:
+            event_bus.unsubscribe_owner(profession)
+            await profession.teardown(scheduler, account_id)
+        except Exception as e:
+            log.error(f"[{account_id}] teardown {profession_id!r} error: {e}")
+
+        router.unregister(account_id, profession_id)
+
+        # 2. Розумно зачищаємо монітори (тільки ті, що більше нікому не потрібні)
+        await self.sync_monitors(scheduler, event_bus)
+        log.info(f"[{account_id}] profession {profession_id!r} removed")
+
+    async def sync_monitors(self, scheduler: "EventDrivenScheduler", bus: "EventBus") -> None:
+        """
+        Синхронізує активні монітори з поточним набором професій.
+        Видаляє зайві, підключає відсутні (якщо потрібно).
+        """
+        if not self.bot.is_connected or self.bot.status == AccountStatus.SUSPENDED:
+            return
+
+        active_prof_ids = list(self.professions.keys())
+        needed_monitors = set(profession_registry.all_monitors_for(active_prof_ids))
+        current_monitors = set(self.monitors.active_ids())
+
+        # Що треба видалити:
+        to_remove = current_monitors - needed_monitors
+        if to_remove:
+            await self.monitors.detach_many(scheduler, bus, list(to_remove))
+
+        # Що треба додати (на випадок resume або lazy connect):
+        to_add = needed_monitors - current_monitors
+        if to_add:
+            await self.monitors.attach_all(scheduler, list(to_add))
+
+    async def teardown_all(
+        self, 
+        scheduler: "EventDrivenScheduler",
+        bus: "EventBus", 
+        route: "RequestRouter"
+    ) -> None:
+        """Повне вимкнення всього контейнера (при видаленні або паузі)."""
+        await self.monitors.detach_all(scheduler, bus)
+        # Створюємо копію ключів, бо detach_profession модифікує словник
+        for pid in list(self.professions.keys()):
+            await self.detach_profession(scheduler, pid, bus, route)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EventDrivenScheduler
@@ -153,7 +219,6 @@ class EventDrivenScheduler:
 
         self._containers:  dict[str, AccountContainer] = {}
         self._lock        = threading.Lock()
-        self._monitors:    dict[str, AccountMonitors] = {}
 
         self._event_bus    = EventBus()
         self._router       = RequestRouter()
@@ -244,44 +309,6 @@ class EventDrivenScheduler:
         self._loading_lock = asyncio.Lock()
         self._async_loop.run_forever()
 
-    # ── Monitors management (internal, async) ─────────────────────────────────
-
-    def _get_or_create_monitors(self, account_id: str) -> AccountMonitors:
-        if account_id not in self._monitors:
-            self._monitors[account_id] = AccountMonitors(account_id)
-        return self._monitors[account_id]
-
-    # FIX BUG-4 / ДУБЛЮВАННЯ-2: всі три методи тепер async — ніяких sync-обгорток
-    # з run_coroutine_threadsafe всередині async-контексту.
-
-    async def _attach_monitors_for(self, account_id: str, profession_name: str) -> None:
-        """Підключає монітори, що відповідають вказаній profession."""
-        monitor_ids = profession_registry.monitors_for(profession_name)
-        if not monitor_ids:
-            return
-        monitors = self._get_or_create_monitors(account_id)
-        await monitors.attach_all(self, monitor_ids)
-
-    async def _detach_monitor_if_unused(self, account_id: str, monitor_id: str) -> None:
-        """Відключає монітор, якщо жодна з активних професій його більше не потребує."""
-        with self._lock:
-            container = self._containers.get(account_id)
-        active_ids = [p.profession_id for p in container.profession_list()] if container else []
-        used_monitors = profession_registry.all_monitors_for(active_ids)
-        if monitor_id in used_monitors:
-            return
-        monitors = self._monitors.get(account_id)
-        if monitors is None:
-            return
-        await monitors.detach(self, monitor_id)
-
-    async def _detach_all_monitors(self, account_id: str) -> None:
-        """Відключає всі монітори акаунта (при видаленні або паузі)."""
-        monitors = self._monitors.pop(account_id, None)
-        if monitors is None:
-            return
-        await monitors.detach_all(self)
-
     # ── Account management ────────────────────────────────────────────────────
 
     async def add_account(
@@ -303,7 +330,7 @@ class EventDrivenScheduler:
             if self._on_dead:
                 self._on_dead(bot)
             return
-
+        
         with self._lock:
             if account_id in self._containers:
                 raise ValueError(f"Акаунт {account_id!r} вже існує")
@@ -358,47 +385,39 @@ class EventDrivenScheduler:
         account_id:  str,
         professions: list["BaseProfession"],
     ) -> None:
-        """
-        Крок 3 з 3: setup профессій і attach моніторів.
-
-        Викликається після успішного connect_account().
-        Сесія вже є — profession.setup() і restore_state() безпечні.
-        """
         with self._lock:
             container = self._containers.get(account_id)
 
-        if container is None:
-            log.warning(f"[{account_id}] setup_professions: акаунт не знайдено")
+        if not container:
             return
 
-        await self._setup_professions(account_id, container.bot, professions)
-        await self._attach_all_monitors(account_id, container)
-        log.info(f"[{account_id}] setup_professions: {len(professions)} professions, монітори активні")
+        for profession in professions:
+            await container.attach_profession(self, profession, self._router)
 
-    async def _attach_all_monitors(self, account_id: str, container: "AccountContainer") -> None:
-        """Чіпляє монітори для всіх активних profession контейнера."""
-        for profession in container.profession_list():
-            # FIX BUG-4: прямий await, без _run_async fire-and-forget
-            await self._attach_monitors_for(account_id, profession.profession_id)
+    async def add_profession_to_account(self, account_id: str, profession: "BaseProfession") -> None:
+        with self._lock:
+            container = self._containers.get(account_id)
+            if not container:
+                raise ValueError(f"Акаунт {account_id!r} не знайдено")
+        
+        await container.attach_profession(self, profession, self._router)
 
     async def remove_account(self, account_id: str) -> bool:
         with self._lock:
-            entry = self._containers.pop(account_id, None)
-        if entry is None:
+            container = self._containers.pop(account_id, None)
+        if container is None:
             return False
 
-        professions = entry.profession_list()
-        await self._teardown_professions(account_id, professions)
+        # Контейнер сам відпише професії, зачистить роутер і вимкне монітори
+        await container.teardown_all(self, self._event_bus, self._router)
         self._router.unregister_account(account_id)
-        await self._detach_all_monitors(account_id)
 
-        # Від'єднуємо CoreService-и
-        for svc in entry.bot.core_services:
+        for svc in container.bot.core_services:
             try:
                 await svc.unbind()
             except Exception as e:
                 log.warning(f"[{account_id}] CoreService {svc.service_id!r} unbind error: {e}")
-        entry.bot.core_services = []
+        container.bot.core_services = []
 
         log.info(f"[{account_id}] видалено")
         return True
@@ -409,7 +428,7 @@ class EventDrivenScheduler:
         if container is None or container.bot.status == AccountStatus.SUSPENDED:
             return False
 
-        await self._detach_all_monitors(account_id)
+        await container.monitors.detach_all(self, self._event_bus)
         container.bot.status = AccountStatus.SUSPENDED
         await container.bot.disconnect()
         log.info(f"[{account_id}] призупинено")
@@ -424,89 +443,27 @@ class EventDrivenScheduler:
         container.bot.status = AccountStatus.IDLE
 
         if not container.bot.is_connected:
-            # FIX BUG-3: прямий await замість run_coroutine_threadsafe().result()
-            # що блокувало async-потік (дедлок).
             ok = await container.bot.connect()
             if not ok:
-                log.error(f"[{account_id}] resume: connect() провалився")
                 return False
 
         if container.bot.status == AccountStatus.DEAD:
-            log.error(f"[{account_id}] resume: акаунт мертвий після connect()")
             return False
 
-        professions = container.profession_list()
-        await self._restore_professions(
-            account_id, container.bot, professions, container
-        )
-
+        # Контейнер сам перевірить, які монітори потрібні активним професіям
+        await container.sync_monitors(self, self._event_bus)
         log.info(f"[{account_id}] відновлено")
         return True
 
     # ── Dynamic Profession Management ─────────────────────────────────────────
 
-    async def add_profession_to_account(
-        self,
-        account_id: str,
-        profession: "BaseProfession",
-    ) -> None:
-        with self._lock:
-            container = self._containers.get(account_id)
-            if container is None:
-                raise ValueError(f"Акаунт {account_id!r} не знайдено")
-            if container.has_profession(profession.profession_id):
-                log.warning(
-                    f"[{account_id}] profession {profession.profession_id!r} вже зареєстрована"
-                )
-                return
-            container.add_profession(profession)
-
-        await self._setup_single_profession(
-            account_id, container.bot, profession, container
-        )
-
-    async def _setup_single_profession(
-        self,
-        account_id: str,
-        bot:        Account,
-        profession: "BaseProfession",
-        container:  AccountContainer,
-    ) -> None:
-        try:
-            await profession.setup(self, account_id)
-            self._router.register(account_id, profession)
-            await profession.restore_state(bot)
-            # Монітори підключаємо тільки якщо сесія вже встановлена.
-            # Якщо ні — connect_account() підключить їх через _attach_all_monitors()
-            # коли сесія буде готова (hot-add: connect одразу після add_account;
-            # cold-start: StartupManager.run() → connect_account()).
-            if bot.is_connected:
-                await self._attach_monitors_for(account_id, profession.profession_id)
-            log.info(f"[{account_id}] dynamic setup {profession.profession_id!r} complete")
-        except Exception as e:
-            with self._lock:
-                container.professions.pop(profession.profession_id, None)
-            log.error(
-                f"[{account_id}] dynamic setup {profession.profession_id!r} failed: {e}",
-                exc_info=True,
-            )
-
     async def remove_profession_from_account(self, account_id: str, profession_id: str) -> None:
-        profession_obj: Optional["BaseProfession"] = None
         with self._lock:
             container = self._containers.get(account_id)
-            if container is not None:
-                profession_obj = container.get_profession(profession_id)
-                container.remove_profession_by_id(profession_id)
+            if not container:
+                return
 
-        if profession_obj is not None:
-            await self._teardown_professions(account_id, [profession_obj])
-
-        for monitor_id in profession_registry.monitors_for(profession_id):
-            await self._detach_monitor_if_unused(account_id, monitor_id)
-
-        self._router.unregister(account_id, profession_id)
-        log.info(f"[{account_id}] profession {profession_id!r} dynamically removed")
+        await container.detach_profession(self, profession_id, self._event_bus, self._router)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -654,129 +611,3 @@ class EventDrivenScheduler:
             timeout       = timeout,
         )
         return await self._router.route(ctx, data or {})
-
-    # ── Profession lifecycle (async) ──────────────────────────────────────────
-
-    async def _setup_professions(
-        self,
-        account_id:  str,
-        bot:         Account,
-        professions: list["BaseProfession"],
-    ) -> None:
-        with self._lock:
-            container = self._containers.get(account_id)
-        if container is None:
-            return
-
-        for profession in professions:
-            try:
-                await profession.setup(self, account_id)
-                self._router.register(account_id, profession)
-                await profession.restore_state(bot)
-                container.add_profession(profession)
-                log.info(f"[{account_id}] {profession.profession_id!r} ready")
-            except Exception as e:
-                log.error(
-                    f"[{account_id}] setup {profession.profession_id!r} failed: {e}",
-                    exc_info=True,
-                )
-
-    async def _restore_professions(
-        self,
-        account_id:  str,
-        bot:         Account,
-        professions: list["BaseProfession"],
-        container:   AccountContainer,
-    ) -> None:
-        for profession in professions:
-            try:
-                self._router.register(account_id, profession)
-                await profession.restore_state(bot)
-                container.add_profession(profession)
-                await self._attach_monitors_for(account_id, profession.profession_id)
-                log.info(f"[{account_id}] {profession.profession_id!r} resumed")
-            except Exception as e:
-                log.error(
-                    f"[{account_id}] resume {profession.profession_id!r}: {e}",
-                    exc_info=True,
-                )
-
-    async def _teardown_professions(
-        self,
-        account_id:  str,
-        professions: list["BaseProfession"],
-    ) -> None:
-        for profession in professions:
-            try:
-                self._event_bus.unsubscribe_owner(profession)
-                await profession.teardown(self, account_id)
-            except Exception as e:
-                log.error(f"[{account_id}] teardown {profession.profession_id!r}: {e}")
-
-    # ── Guard loops ───────────────────────────────────────────────────────────
-
-    async def _check_guards(self) -> None:
-        with self._lock:
-            containers = dict(self._containers)
-
-        for account_id, entry in containers.items():
-            bot = entry.bot
-            inv = bot.inventory
-
-            if not entry.check_account_guard(inv):
-                log.warning(f"[{account_id}] account guard failed → kill")
-                await self._kill_account(account_id, entry)
-                continue
-
-            for profession in entry.profession_list():
-                if not profession.check_guard(bot):
-                    # FIX Bug 6: повний teardown — unsubscribe EventBus,
-                    # виклик profession.teardown(), unregister з router,
-                    # відключення моніторів що більше не потрібні.
-                    entry.remove_profession(profession)
-                    log.info(
-                        f"[{account_id}] {profession.profession_id!r} guard failed "
-                        f"→ profession removed"
-                    )
-                    self._event_bus.unsubscribe_owner(profession)
-                    try:
-                        await profession.teardown(self, account_id)
-                    except Exception as e:
-                        log.error(
-                            f"[{account_id}] teardown {profession.profession_id!r} "
-                            f"after guard fail: {e}"
-                        )
-                    self._router.unregister(account_id, profession.profession_id)
-                    for monitor_id in profession_registry.monitors_for(profession.profession_id):
-                        await self._detach_monitor_if_unused(account_id, monitor_id)
-
-    async def _reap_dead_workers(self) -> None:
-        with self._lock:
-            containers = dict(self._containers)
-
-        for account_id, entry in containers.items():
-            if entry.bot.status != AccountStatus.DEAD:
-                continue
-            log.warning(f"[{account_id}] dead → cleanup")
-            # FIX Bug 5: прямий await, а не _run_async (ми вже в async-контексті)
-            await entry.bot.disconnect()
-            with self._lock:
-                self._containers.pop(account_id, None)
-            self._router.unregister_account(account_id)
-            # FIX Bug 7: detach monitors ДО виклику on_dead,
-            # щоб callback бачив коректний стан (без живих моніторів).
-            await self._detach_all_monitors(account_id)
-            if self._on_dead:
-                self._on_dead(entry.bot)
-
-    async def _kill_account(self, account_id: str, container: AccountContainer) -> None:
-        container.bot.mark_dead("account guard failed")
-        container.bot.repo.inventory.save(account_id, container.bot.inventory)
-        await container.bot.disconnect()
-
-        with self._lock:
-            self._containers.pop(account_id, None)
-        self._router.unregister_account(account_id)
-        await self._detach_all_monitors(account_id)
-        if self._on_dead:
-            self._on_dead(container.bot)

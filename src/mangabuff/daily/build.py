@@ -95,7 +95,9 @@ class DailyProfession(BaseProfession):
             
             inv: DailyInventory = bot.inventory.daily
             personal = bot.inventory.personal
-            
+            daily_cfg = bot.app_config.daily
+            personal_cfg = bot.app_config.personal
+        
             to_day = personal.to_day
             
             if not self.check_guard(bot):
@@ -122,7 +124,7 @@ class DailyProfession(BaseProfession):
                 log.info("🎁 День стріку невідомий → отримуємо календарний статус")
                 try:
                     # Виконуємо асинхронний запит у сесії
-                    result = await bot.safe_session.fetch_daily_streak()
+                    result = await bot.safe_session.fetch_daily_streak(daily_cfg)
                     day = result.data
                     if day is None:
                         log.info("🎁 Календарний бонус зараз недоступний")
@@ -146,7 +148,7 @@ class DailyProfession(BaseProfession):
             if needs_daily:
                 log.info("🎁 Збираємо звичайний бонус…")
                 try:
-                    result = await bot.safe_session.claim_daily()
+                    result = await bot.safe_session.claim_daily(daily_cfg, personal_cfg)
                     data = result.data or {}
                     self._stats.daily_results = data
                     if result.ok:
@@ -163,7 +165,7 @@ class DailyProfession(BaseProfession):
                 day = inv.day
                 log.info(f"🎁 Збираємо календарний бонус (день {day})…")
                 try:
-                    result = await bot.safe_session.claim_calendar(day)
+                    result = await bot.safe_session.claim_calendar(day, daily_cfg)
                     data = result.data or {}
                     self._stats.calendar_results = data
                     if result.ok:

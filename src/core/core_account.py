@@ -20,9 +20,10 @@ from src.core.stats import stats_factory, DynamicStats as Stats
 from src.database.repository.factory import Repositories
 from src.core.status import AccountStatus
 from src.core.logging.loggers import get_account_logger
+from src.core.runtime.event_bus import EventBus
 
 if TYPE_CHECKING:
-    from src.mangabuff.mangabuff_session import BotSession
+    from src.mangabuff.session import BotSession
     from src.core.runtime.core_service import CoreService
 
 
@@ -60,6 +61,11 @@ class Account:
         self.repo:         Repositories  = repo
         self.inventories:  Inventories   = self.repo.inventory.load(self.account_id)
         self.recorder:     Stats         = stats_factory.build()
+
+        # Персональна шина подій акаунта. CoreService (SocketService тощо)
+        # ретранслюють сюди зовнішні події (socket, webhook...), Profession
+        # підписується через scheduler.subscribe() — не знаючи джерела події.
+        self.event_bus:    EventBus      = EventBus()
 
         # CoreService-и що автоматично прив'язані до цього акаунта.
         # Заповнюється scheduler при add_account() через bind_core_services().
@@ -109,27 +115,26 @@ class Account:
     
     @property
     def bot_config(self) -> BotConfig:
+        def _browser() -> BaseHeaders:
+            if saved_browser := self.repo.sessions.load_browser(self.account_id):
+                browser = BaseHeaders.from_dict(saved_browser)
+            else:
+                browser = generate_unique_browser() 
+                self.repo.sessions.save_browser(self.account_id, browser.to_dict())
+            return browser
+        
         return BotConfig(
             client=ClientConfig(
                 base_url=self.app_config.base_url,
                 auth=self._auth,
             ),
-            browser=self._browser,
+            browser=_browser(),
             network=self._network,
         )
         
-    @property
-    def _browser(self) -> BaseHeaders:
-        if saved_browser := self.repo.sessions.load_browser(self.account_id):
-            browser = BaseHeaders.from_dict(saved_browser)
-        else:
-            browser = generate_unique_browser() 
-            self.repo.sessions.save_browser(self.account_id, browser.to_dict())
-        return browser
-
     async def connect(self) -> bool:
         try:
-            from src.mangabuff.mangabuff_session import BotSession, AuthSuccessCallback
+            from src.mangabuff.session import BotSession, AuthSuccessCallback
             from src.mangabuff.personal.auth_service import AuthService
             from src.utils.logging import set_http_logger
 
@@ -151,14 +156,23 @@ class Account:
             )
 
             if self.bot_config.network.proxy:
-                if not await session.check_proxy():
+                if not await session.http.check_proxy():
                     await session.close()
                     return self._fail("Проксі недоступне або не працює")
 
-            await session.authenticate()
+            await session.auth.authenticate()
             self._session = session
             self.status   = AccountStatus.IDLE
             self.error    = None
+
+            # CoreService, яким потрібен доступ до сесії (наприклад SocketService
+            # підписується на socket-події) — отримують сигнал тут, коли
+            # self._session вже встановлено. bind() викликався раніше
+            # (при add_account(), коли сесії ще не було) лише для прив'язки bot.
+            for svc in self.core_services:
+                on_session_ready = getattr(svc, "on_session_ready", None)
+                if on_session_ready is not None:
+                    await on_session_ready(self)
 
             set_http_logger(get_account_logger(self.account_id))
             self._log.info("✅ Підключено")
@@ -170,6 +184,13 @@ class Account:
 
     async def disconnect(self) -> None:
         if self._session:
+            # Даємо CoreService шанс прибрати свої socket-listeners
+            # ДО того як session.close() знищить сам socket.
+            for svc in self.core_services:
+                on_session_closing = getattr(svc, "on_session_closing", None)
+                if on_session_closing is not None:
+                    await on_session_closing(self)
+
             await self._session.close()
             self._session = None
             self._log.info("🔌 Відключено")

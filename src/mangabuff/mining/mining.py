@@ -74,11 +74,11 @@ class MiningProfession(BaseProfession):
             if bot is None:
                 raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
             
-            inv: MiningInventory = bot.inventory.mining
+            cfg = bot.app_config.mining
             
             # 2. Виконання запиту
             log.info("📝 Mining: надсилаємо запит на початок копання…")
-            result = await bot.safe_session.mine()
+            result = await bot.safe_session.mine(self._account_id,cfg)
 
             if not result.ok:
                 log.warning(f"⚠️ /mine провалився: {result.reason}")
@@ -115,7 +115,8 @@ class MiningProfession(BaseProfession):
                 raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
             
             # 2. Виконання запиту
-            result = await bot.safe_session.mine_hit()
+            cfg = bot.app_config.mining
+            result = await bot.safe_session.mine_hit(cfg)
 
             if not result.ok:
                 log.warning(f"⚠️ /mining провалився: {result.reason}")

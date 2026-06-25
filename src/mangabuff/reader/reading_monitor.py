@@ -32,7 +32,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.monitoring.monitor import BaseMonitor
 from src.core.logging.loggers import get_account_logger
-from src.utils.time import today
 
 if TYPE_CHECKING:
     from src.core.runtime.scheduler import EventDrivenScheduler
@@ -136,6 +135,7 @@ class ReadingMonitor(BaseMonitor):
             return 5400.0
         cfg  = bot.app_config.reader
         inv  = bot.inventory.reader
+        
         mode_name = inv.active_mode or cfg.default_mode
         mode = cfg.get_mode(mode_name)
 
@@ -376,6 +376,17 @@ class ReadingMonitor(BaseMonitor):
             },
             caller = "reading_monitor",
         )
+        
+        if result.data.get("token", False):
+            await scheduler.ask(
+                account_id    = self._account_id,
+                profession_id = "reader",
+                intent        = "claim_candy",
+                data          = {
+                    "token":    result.data["token"],
+                },
+                caller = "reading_monitor",
+            )
 
         if not result.approved:
             log.warning(f"[ReadingMonitor] account_reward відхилено: {result.reason}")

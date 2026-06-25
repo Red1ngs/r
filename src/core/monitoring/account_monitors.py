@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Optional
 
 from src.core.monitoring.monitor import BaseMonitor, monitor_registry
 from src.core.logging.loggers import get_logger
+from src.core.runtime.event_bus import EventBus
 
 if TYPE_CHECKING:
     from src.core.runtime.scheduler import EventDrivenScheduler
@@ -81,6 +82,7 @@ class AccountMonitors:
         self,
         scheduler:  "EventDrivenScheduler",
         monitor_id: str,
+        bus: "EventBus"
     ) -> bool:
         """
         Відключає монітор. Ідемпотентний.
@@ -94,7 +96,7 @@ class AccountMonitors:
 
         try:
             # Знімаємо всі EventBus підписки цього монітора
-            scheduler._event_bus.unsubscribe_owner(monitor)
+            bus.unsubscribe_owner(monitor)
             await monitor.detach(scheduler, self._account_id)
             log.info(
                 f"[{self._account_id}] монітор {monitor_id!r} відключено"
@@ -115,17 +117,30 @@ class AccountMonitors:
         """Підключає кілька моніторів послідовно."""
         for mid in monitor_ids:
             await self.attach(scheduler, mid)
+            
+    async def detach_many(
+        self, 
+        scheduler: "EventDrivenScheduler", 
+        bus: "EventBus",
+        monitor_ids: list[str],
+    ) -> None:
+        """Відключає кілька моніторів послідовно."""
+        for mid in monitor_ids:
+            await self.detach(scheduler, mid, bus)
 
-    async def detach_all(self, scheduler: "EventDrivenScheduler") -> None:
+    async def detach_all(self, scheduler: "EventDrivenScheduler", bus: "EventBus") -> None:
         """Відключає всі активні монітори."""
         for mid in list(self._monitors.keys()):
-            await self.detach(scheduler, mid)
+            await self.detach(scheduler, mid, bus)
 
     # ── Introspection ─────────────────────────────────────────────────────────
 
     def get(self, monitor_id: str) -> Optional[BaseMonitor]:
         return self._monitors.get(monitor_id)
-
+    
+    def monitors_ids(self) -> list[str]:
+        return list(self._monitors)
+    
     def active_ids(self) -> list[str]:
         return list(self._monitors.keys())
 

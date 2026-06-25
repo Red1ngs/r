@@ -45,7 +45,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.monitoring.monitor import BaseMonitor
 from src.core.logging.loggers import get_account_logger
-from src.utils.time import today
 
 if TYPE_CHECKING:
     from src.core.runtime.scheduler import EventDrivenScheduler
@@ -256,6 +255,8 @@ class QuizMonitor(BaseMonitor):
         if inv.answers_reset_date != personal.to_day:
             # Новий день — daily.claimed ще не прийшов, чекаємо
             return False
+        
+        inv.answers_today = 0
         return inv.current_counter() < inv.answer_limit
 
     def _get_answer_delay(self) -> float:

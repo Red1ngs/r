@@ -90,7 +90,7 @@ class MiningMonitor(BaseMonitor):
                 pass
             except Exception as exc:
                 get_account_logger(self._account_id).error(
-                    f"[ReadingMonitor] помилка у фоновому циклі: {exc}", exc_info=True
+                    f"[MiningMonitor] помилка у фоновому циклі: {exc}", exc_info=True
                 )
 
         self._wakeup_task = asyncio.ensure_future(_fire())
@@ -163,12 +163,18 @@ class MiningMonitor(BaseMonitor):
         inv.hits_left = cast(int, data["hits_left"])
         inv.max_hits = cast(int, data["max_hits"])
         inv.ore = cast(int, data["ore"])
+        inv.mining_complete = (inv.hits_left == 0) 
+        await self._schedule_next()
 
     async def _send_ask(self) -> None:
         """
-        Надсилає ask("reader", "do_read").
-        Після відповіді — якщо не було reward — перевіряє ліміт по главах
-        з result.data (inventory вже збережено RequestRouter).
+        Надсилає ask("mining", "mining_hit") для здійснення чергового удару в шахті.
+        
+        Після отримання відповіді:
+          - Якщо запит схвалено, перевіряє залишок ударів. Якщо ліміт не вичерпано,
+            планує наступний удар через _schedule_next().
+          - Якщо шахту повністю розроблено або виникла помилка, зупиняє цикл 
+            до настання події daily.claimed.
         """
         scheduler = self._scheduler
         if scheduler is None:
@@ -184,7 +190,7 @@ class MiningMonitor(BaseMonitor):
             log.info("[MiningMonitor] daily ще не зібрано → чекаємо daily.claimed")
             return
 
-        params      = self._mining_params()
+        params = self._mining_params()
 
         log.info(
             f"[MiningMonitor] → ask mining_hit "
@@ -215,8 +221,8 @@ class MiningMonitor(BaseMonitor):
         if bot is None:
             return MiningParams()
         
-        inv = bot.inventory.reader
-        raw = inv.data.get("mining_params")
+        inv = bot.inventory.mining
+        raw = inv.mining_params
         return MiningParams.from_dict(raw) if raw else MiningParams()
 
     async def _mining_complete(self) -> bool:
@@ -229,12 +235,11 @@ class MiningMonitor(BaseMonitor):
             raise ValueError("Account не доступний")
         
         inv = bot.inventory.mining
-        if inv.mining_complete:
-            return True
-
+        
         hits_left = inv.hits_left
+        # Якщо hits_left ще не завантажено (None), орієнтуємося на збережений стан
         if hits_left is None:
-            return False
+            return inv.mining_complete
         
         hits_left = int(hits_left)
         
@@ -242,12 +247,13 @@ class MiningMonitor(BaseMonitor):
             inv.mining_complete = False
             return False
         elif hits_left == 0:
-            inv.mining_complete = True
-            await self._scheduler.emit_event(
-                "mining.mining_complete",
-                {"account_id": self._account_id},
-                source=self._account_id,
-            )
+            if not inv.mining_complete:
+                inv.mining_complete = True
+                await self._scheduler.emit_event(
+                    "mining.mining_complete",
+                    {"account_id": self._account_id},
+                    source=self._account_id,
+                )
             return True
         else:
             raise ValueError(f"hits_left не може бути {hits_left}")

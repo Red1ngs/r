@@ -11,6 +11,7 @@ dependencies = [
     "curl-cffi>=0.15.0",
     "dotenv>=0.9.9",
     "httpx[http2,https2]>=0.28.1",
+    "python-socketio[client]>=5.16.3",
     "pytz>=2026.2",
     "pyyaml>=6.0.3",
     "socksio>=1.0.0",

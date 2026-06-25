@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from src.core.inventory.model import BaseInventory
 
@@ -65,5 +65,13 @@ class MiningInventory(BaseInventory):
     @mining_complete.setter
     def mining_complete(self, value: bool) -> None:
         self.data["mining_complete"] = value
+        
+    @property
+    def mining_params(self) -> dict[str, Any]:
+        return self.data.get("mining_params", {})
+    
+    @mining_params.setter
+    def mining_params(self, value: dict[str, Any]) -> None:
+        self.data["mining_params"] = value
         
     

@@ -28,7 +28,6 @@ Events що емітуються:
 """
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
@@ -139,7 +138,8 @@ class QuizProfession(BaseProfession):
                 return RequestResult.approve(data={"status": "already_open"})
 
             log.info("📝 Quiz: відкриваємо сесію…")
-            question = await bot.safe_session.quiz_start()
+            cfg = bot.app_config.quiz
+            question = await bot.safe_session.quiz_start(cfg)
 
             data = question.data
             if data is None:
@@ -208,7 +208,8 @@ class QuizProfession(BaseProfession):
                 f"{question.get('question', '')[:60]} → «{answer_text}»"
             )
 
-            result = await bot.safe_session.quiz_answer(answer_text)
+            cfg = bot.app_config.quiz
+            result = await bot.safe_session.quiz_answer(answer_text, cfg)
 
             if result.data is None:
                 log.warning("⚠️ /quiz/answer не відповів")

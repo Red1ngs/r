@@ -48,8 +48,9 @@ class ReaderProfession(BaseProfession):
     """
 
     def __init__(self) -> None:
-        self._account_id: str                               = ""
+        self._account_id: str                              = ""
         self._scheduler:  Optional["EventDrivenScheduler"] = None
+        self._last_manga_read: str                         = ""
 
     @property
     def profession_id(self) -> str:
@@ -140,10 +141,14 @@ class ReaderProfession(BaseProfession):
 
             log.info(f"📖 Знайдено непрочитані глави ({len(sequence)}): {', '.join(mangas)}")
 
-            reward = await bot.safe_session.submit_add_history([
+            items = [
                 {"manga_id": ch["manga_id"], "chapter_id": ch["chapter_id"]}
                 for ch in sequence
-            ])
+            ]
+            last_manga = mangas[-1]
+            self._last_manga_read = last_manga
+            reader_cfg = bot.app_config.reader
+            reward = await bot.safe_session.submit_add_history(items, last_manga, reader_cfg)
 
             if not reward.ok:
                 log.warning("📖 submit_add_history провалився")
@@ -249,10 +254,15 @@ class ReaderProfession(BaseProfession):
                 new_spent = inv.slot_chapters_spent.get(slot.name, 0)
 
             # Claim candy якщо є токен (через сесію, не через окремий ask)
-            if reward_data.get("token"):
-                candy = await bot.safe_session.claim_candy(reward_data["token"])
-                if not candy.ok:
-                    log.warning("[Reader] claim_candy провалився")
+            if token := reward_data.get("token"):
+                return RequestResult.approve(data={
+                    "token":     token,
+                    "slot":      slot.name,
+                    "new_count": new_count,
+                    "new_spent": new_spent,
+                    "cap":       slot.max_chapters_per_slot,
+                    "daily_limit": slot.daily_limit,
+                })
 
             return RequestResult.approve(data={
                 "slot":      slot.name,
@@ -288,7 +298,12 @@ class ReaderProfession(BaseProfession):
             if not token:
                 raise ValueError("token обов'язковий")
             
-            reward = await bot.safe_session.claim_candy(token)
+            reader_cfg = bot.app_config.reader
+            last_manga_read = self._last_manga_read
+            
+            reward = await bot.safe_session.claim_candy(
+                token, last_manga_read, reader_cfg
+            )
             if not reward.ok:
                 return RequestResult.deny("claim_candy провалився")
             return RequestResult.approve(data={"reward": reward.data})

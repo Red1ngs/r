@@ -13,7 +13,6 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.monitoring.monitor import BaseMonitor
-from src.utils.time import now
 
 if TYPE_CHECKING:
     from src.core.runtime.scheduler import EventDrivenScheduler
@@ -58,6 +57,7 @@ class DailyMonitor(BaseMonitor):
         self._account_id: str                               = ""
         self._scheduler:  Optional["EventDrivenScheduler"] = None
         self._wakeup_task: Optional[asyncio.Task[None]]    = None
+        self._last_attempt_failed: bool                    = False
 
     async def attach(
         self,
@@ -140,6 +140,15 @@ class DailyMonitor(BaseMonitor):
             return max(0.0, delay)
 
         if now >= target_today:
+            if self._last_attempt_failed:
+                # Пауза у разі помилки для уникнення зациклення
+                cooldown = 300.0
+                get_account_logger(self._account_id).warning(
+                    f"[DailyMonitor] Попередня спроба збору завершилась невдало. "
+                    f"Наступна спроба відкладена на {int(cooldown)}с (cooldown)"
+                )
+                return cooldown
+
             # Час збору настав або минув, а бонуси не зібрані — запускаємо негайно
             get_account_logger(self._account_id).info(
                 f"[DailyMonitor] Настав час збору бонусів ({scheduled_time} UTC) — запуск негайно"
@@ -169,6 +178,20 @@ class DailyMonitor(BaseMonitor):
 
         if not res.approved:
             log.warning(f"[DailyMonitor] Спроба збору відхилена професією: {res.reason}")
+            self._last_attempt_failed = True
+        else:
+            # Перевіряємо за станом інвентарю, чи завершився збір успішно
+            bot = self._scheduler.get_bot(self._account_id)
+            if bot:
+                inv = bot.inventory.daily
+                to_day = bot.inventory.personal.to_day
+                all_done = (
+                    inv.last_daily_claimed == to_day
+                    and inv.last_calendar_claimed == to_day
+                )
+                self._last_attempt_failed = not all_done
+            else:
+                self._last_attempt_failed = False
 
         # Після спроби збору (успішної чи ні) плануємо наступний крок
         await self._schedule_next()
@@ -179,4 +202,5 @@ class DailyMonitor(BaseMonitor):
         get_account_logger(self._account_id).info(
             "[DailyMonitor] Отримано сигнал force_claim → позачерговий запуск негайно"
         )
+        self._last_attempt_failed = False
         await self._schedule_next(delay=0.0)

@@ -188,21 +188,21 @@ class SchedulerService:
         )
 
     async def _build_info(self, acc_id: str, scheduler: EventDrivenScheduler) -> Optional[AccountInfo]:
-        bot    = scheduler.get_bot(acc_id)
+        container = scheduler.get_container(acc_id)
         status = scheduler.status(acc_id)
-        if bot is None or status is None:
+        if container is None or status is None:
             return None
 
         profs = scheduler.profession_names(acc_id)
-        auth = bot.bot_config.client.auth 
+        auth = container.bot.bot_config.client.auth 
 
         active_monitors = []
-        am = scheduler._monitors.get(acc_id)
-        if am is not None:
-            active_monitors = am.active_ids()
+        
+        am = container.monitors
+        active_monitors = am.active_ids()
             
-        user_name = bot.inventory.personal.user_name or "—"
-        user_id = bot.inventory.personal.user_id or "—"
+        user_name = container.bot.inventory.personal.user_name or "—"
+        user_id = container.bot.inventory.personal.user_id or "—"
         buff_info = MangabuffInfo(
             user_name=user_name,
             user_id=user_id
@@ -211,13 +211,13 @@ class SchedulerService:
         return AccountInfo(
             account_id   = acc_id,
             email        = auth.email if auth else "—",
-            proxy        = bot.bot_config.network.proxy or "",
+            proxy        = container.bot.bot_config.network.proxy or "",
             status       = status.name,
             mangabuff    = buff_info,
             queue_size   = 0,
             professions  = profs,
             monitors     = active_monitors,
-            is_connected = bot.is_connected,
+            is_connected = container.bot.is_connected,
         )
 
     async def account_ids(self) -> list[str]:

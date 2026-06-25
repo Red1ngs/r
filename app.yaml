@@ -56,4 +56,4 @@ quiz:
   answer_delay: 6.0
 
 mining:
-  delay: 1.5
+  delay: 2.0

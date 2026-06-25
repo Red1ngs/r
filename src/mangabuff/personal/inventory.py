@@ -71,11 +71,10 @@ class PersonalInventory(BaseInventory):
         else:
             self.data.pop("user_name", None)
             
-    
     @property
-    def user_id(self) -> str | None:
+    def user_id(self) -> str:
         """ID користувача на сайті. Зберігається AuthService після авторизації."""
-        return self.data.get("user_id")
+        return self.data.get("user_id", "")
 
     @user_id.setter
     def user_id(self, value: str | None) -> None:

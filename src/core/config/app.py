@@ -107,47 +107,67 @@ class ReadingModeDef:
             fallback_interval_s=float(d.get("fallback_interval_s", 5400.0)),
         )
 
+@dataclass(frozen=True)
+class ReaderUrls:
+    catalog:      str
+    manga_page:   str
+    api_load:     str
+    api_history:  str
+    api_candy:    str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ReaderUrls":
+        return cls(
+            catalog=str(d.get("catalog", "/manga")),
+            manga_page=str(d.get("manga_page", "/manga/{translit_name}")),
+            api_load=str(d.get("api_load", "/chapters/load")),
+            api_history=str(d.get("api_history", "/addHistory")),
+            api_candy=str(d.get("api_candy", "/halloween/takeCandy?r=822")),
+        )
+
+@dataclass(frozen=True)
+class ReaderParsing:
+    reward_selector:  str
+    reward_type_attr: str
+    reward_id_attr:   str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ReaderParsing":
+        return cls(
+            reward_selector=str(d.get("reward_selector", ".reward-item")),
+            reward_type_attr=str(d.get("reward_type_attr", "data-reward-type")),
+            reward_id_attr=str(d.get("reward_id_attr", "data-reward-id")),
+        )
 
 @dataclass(frozen=True)
 class ReaderAppCfg:
-    url_add_history:      str
+    urls:                 ReaderUrls
+    parsing:              ReaderParsing
     update_interval_days: int
-    parsing:              ParsingConfig
     reward_slots:         tuple[RewardSlotCfg, ...]
     reading_modes:        dict[str, ReadingModeDef]
     default_mode:         str
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ReaderAppCfg":
-        reward_slots = tuple(
-            RewardSlotCfg.from_dict(s) for s in d.get("reward_slots", [])
-        )
-
-        raw_modes: dict[str, Any] = d.get("reading_modes", {})
-        reading_modes = {
-            name: ReadingModeDef.from_dict(name, cfg)
-            for name, cfg in raw_modes.items()
-        }
-
-        # Якщо reading_modes не задано — генеруємо мінімальний fallback
+        # Спершу дістаємо вкладені структури
+        urls = ReaderUrls.from_dict(d.get("urls", {}))
+        parsing = ReaderParsing.from_dict(d.get("parsing", {}))
+        
+        reward_slots = tuple(RewardSlotCfg.from_dict(s) for s in d.get("reward_slots", []))
+        
+        raw_modes = d.get("reading_modes", {})
+        reading_modes = {name: ReadingModeDef.from_dict(name, cfg) for name, cfg in raw_modes.items()}
         if not reading_modes:
-            reading_modes = {
-                "standard": ReadingModeDef(
-                    name="standard",
-                    slots=(),
-                    fallback_interval_s=5400.0,
-                )
-            }
-
-        default_mode = str(d.get("default_mode", next(iter(reading_modes))))
+            reading_modes = {"standard": ReadingModeDef("standard", (), 5400.0)}
 
         return cls(
-            url_add_history=str(d.get("url_add_history", "/addHistory")),
+            urls=urls,
+            parsing=parsing,
             update_interval_days=int(d.get("update_interval_days", 1)),
-            parsing=ParsingConfig.from_dict(d.get("parsing", {})),
             reward_slots=reward_slots,
             reading_modes=reading_modes,
-            default_mode=default_mode,
+            default_mode=str(d.get("default_mode", next(iter(reading_modes)))),
         )
 
     def get_mode(self, name: str) -> ReadingModeDef:
@@ -215,7 +235,23 @@ class ReaderAppCfg:
 
 
 @dataclass(frozen=True)
+class QuizUrls:
+    quiz_page: str
+    start:     str
+    answer:    str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "QuizUrls":
+        return cls(
+            quiz_page=str(d.get("quiz_page", "/quiz")),
+            start=str(d.get("start", "/quiz/start")),
+            answer=str(d.get("answer", "/quiz/answer")),
+        )
+        
+        
+@dataclass(frozen=True)
 class QuizCfg:
+    urls:         QuizUrls
     mode:         str
     answer_limit: int
     answer_delay: float
@@ -223,6 +259,7 @@ class QuizCfg:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "QuizCfg":
         return cls(
+            urls=QuizUrls.from_dict(d.get("urls", {})),
             mode=str(d.get("mode", "daily")),
             answer_limit=int(d.get("answer_limit", 5)),
             answer_delay=float(d.get("answer_delay", 8.0)),
@@ -230,20 +267,30 @@ class QuizCfg:
 
 
 @dataclass(frozen=True)
+class DailyUrls:
+    balance:   str
+    ping:      str
+    api_calendar: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "DailyUrls":
+        return cls(
+            balance=str(d.get("balance", "/balance")),
+            ping=str(d.get("ping", "/visit/ping")),
+            api_calendar=str(d.get("api_claim", "/balance/claim/{}")),
+        )
+
+@dataclass(frozen=True)
 class DailyCfg:
-    url_balance:        str
-    url_ping:           str
-    url_calendar_claim: str
-    item_selector:      str
-    claim_text:         str
-    day_attr:           str
+    urls:          DailyUrls
+    item_selector: str
+    claim_text:    str
+    day_attr:      str
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "DailyCfg":
         return cls(
-            url_balance=str(d.get("url_balance", "/balance")),
-            url_ping=str(d.get("url_ping", "/visit/ping")),
-            url_calendar_claim=str(d.get("url_calendar_claim", "/balance/claim/{}")),
+            urls=DailyUrls.from_dict(d.get("urls", {})),
             item_selector=str(d.get("item_selector", ".daily-rewards .daily-rewards-item")),
             claim_text=str(d.get("claim_text", "Забрать")),
             day_attr=str(d.get("day_attr", "data-day")),
@@ -251,14 +298,30 @@ class DailyCfg:
                
 
 @dataclass(frozen=True)
+class MiningUrls:
+    mining_page:   str
+    hit:           str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "MiningUrls":
+        return cls(
+            mining_page=str(d.get("mining_page", "/mine")),
+            hit=str(d.get("hit", "/mine/hit")),
+        )
+        
+        
+@dataclass(frozen=True)
 class MiningCfg:
     delay: float
+    urls:  MiningUrls
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "MiningCfg":
         return cls(
-            delay=float(d.get("delay", 2.1))
+            delay=float(d.get("delay", 2.1)),
+            urls=MiningUrls.from_dict(d.get("urls", {})),
         )
+
 
 @dataclass(frozen=True)
 class StartupCfg:
@@ -282,17 +345,37 @@ class StartupCfg:
             connect_timeout=float(d.get("connect_timeout", 30.0)),
             skip_failed=bool(d.get("skip_failed", True)),
         )
+ 
+@dataclass(frozen=True)
+class PersonalUrls:
+    user_page:   str
 
-
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PersonalUrls":
+        return cls(
+            user_page=str(d.get("user_page", "/users/{user_id}"))
+        )
+               
+@dataclass(frozen=True)
+class PersonalCfg:
+    urls: PersonalUrls
+    
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PersonalCfg":
+        return cls(
+            urls=PersonalUrls.from_dict(d.get("urls", {})),
+        )
+    
 @dataclass(frozen=True)
 class AppConfig:
     base_url: str
-    reader:  ReaderAppCfg
-    daily:   DailyCfg
-    quiz:    QuizCfg
-    mining:    MiningCfg
-    startup: StartupCfg
-
+    reader:   ReaderAppCfg
+    daily:    DailyCfg
+    quiz:     QuizCfg
+    mining:   MiningCfg
+    startup:  StartupCfg
+    personal: PersonalCfg
+    
     @classmethod
     def from_dict(cls, raw_data: dict[str, Any]) -> "AppConfig":
         return cls(
@@ -302,6 +385,7 @@ class AppConfig:
             quiz=QuizCfg.from_dict(raw_data.get("quiz", {})),
             mining=MiningCfg.from_dict(raw_data.get("mining", {})),
             startup=StartupCfg.from_dict(raw_data.get("startup", {})),
+            personal=PersonalCfg.from_dict(raw_data.get("personal", {})),
         )
 
     @classmethod
