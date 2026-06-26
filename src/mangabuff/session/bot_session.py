@@ -241,7 +241,12 @@ class BotSession:
     async def claim_calendar(self, day: int | str, daily: DailyCfg) -> HttpResult[dict[str, Any]]:
         url  = daily.urls.api_calendar
         room = daily.urls.balance
-        r = await self.post(url.format(day=day), room=room, timeout=15)
+        try:
+            formatted_url = url.format(day=day)
+        except (IndexError, KeyError, ValueError):
+            formatted_url = url.format(day)
+
+        r = await self.post(formatted_url, room=room, timeout=15)
         if r.status_code == 200:
             log().info("  → отримано")
             return http_success(self.http._json(r))

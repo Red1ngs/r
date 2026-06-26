@@ -277,7 +277,7 @@ class DailyUrls:
         return cls(
             balance=str(d.get("balance", "/balance")),
             ping=str(d.get("ping", "/visit/ping")),
-            api_calendar=str(d.get("api_claim", "/balance/claim/{}")),
+            api_calendar=str(d.get("api_calendar", d.get("api_claim", "/balance/claim/{}"))),
         )
 
 @dataclass(frozen=True)
