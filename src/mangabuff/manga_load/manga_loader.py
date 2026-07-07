@@ -3,7 +3,7 @@ farmer/manga_loader.py — MangaLoaderProfession.
 
 Архітектура:
     MangaLoaderProfession
-        • Отримує батч транслітерацій через handle_request("load_batch").
+        • Отримує батч транслітерацій через handle_request("update_mangas").
         • Парсить глави кожної манги, зберігає в БД.
         • Після завершення емітить broadcast «loader.chapters_ready».
 
@@ -32,7 +32,7 @@ class MangaLoaderProfession(BaseProfession):
     Profession «Манга-лоадер».
 
     Відповідальність:
-        • Отримує батч транслітерацій через handle_request("load_batch").
+        • Отримує батч транслітерацій через handle_request("update_mangas").
         • Парсить глави кожної манги, зберігає в БД.
         • Емітить broadcast «loader.chapters_ready» — всі читачі прокидаються.
         • Знімає глобальний лок після завершення.
@@ -69,13 +69,13 @@ class MangaLoaderProfession(BaseProfession):
         data:   dict[str, Any],
         ctx:    "RequestContext",
     ) -> RequestResult:
-        if intent == "load_batch":
-            return await self._handle_load_batch(data, ctx)
+        if intent == "update_mangas":
+            return await self._handle_update_mangas(data, ctx)
         if intent == "force_parse":
             return await self._handle_force_parse(data, ctx)
         return RequestResult.deny(f"unknown intent: {intent!r}")
 
-    async def _handle_load_batch(
+    async def _handle_update_mangas(
         self,
         data: dict[str, Any],
         ctx:  "RequestContext",

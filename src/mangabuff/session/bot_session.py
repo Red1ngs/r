@@ -372,7 +372,7 @@ class BotSession:
                 log().warning(f"  → mine: missing required mining fields: {', '.join(missing)}")
                 return http_fail(FailReason.BAD_DATA)
             return http_success(data)
-        log().warning(f"  → mine_hit: {r.status_code}")
+        log().warning(f"  → mine: {r.status_code}")
         return http_fail(FailReason.SERVER)
 
     @http_call
@@ -383,4 +383,43 @@ class BotSession:
         if r.status_code == 200:
             return http_success(self.http._json(r))
         log().warning(f"  → mine_hit: {r.status_code}")
+        return http_fail(FailReason.SERVER)
+    
+    @http_call
+    async def upgrade_pickaxe(self, mining: MiningCfg) -> HttpResult[dict[str, int]]: 
+        url  = mining.urls.upgrade
+        room = mining.urls.mining_page
+        r = await self.post(url, room, timeout=15)
+        if r.status_code == 200:
+            return http_success(self.http._json(r))
+        elif r.status_code == 400:
+            log().warning(f"  → upgrade_pickaxe: {r.status_code} (403 Forbidden)")
+            return http_fail(FailReason.DENIED)
+        log().warning(f"  → upgrade_pickaxe: {r.status_code}")
+        return http_fail(FailReason.SERVER)
+    
+    @http_call
+    async def buy_strong_hit(self, mining: MiningCfg) -> HttpResult[dict[str, int]]: 
+        url  = mining.urls.buy_strong_hit
+        room = mining.urls.mining_page
+        r = await self.post(url, room, timeout=15)
+        if r.status_code == 200:
+            return http_success(self.http._json(r))
+        elif r.status_code == 400:
+            log().warning(f"  → buy_strong_hit: {r.status_code} (403 Forbidden)")
+            return http_fail(FailReason.DENIED)
+        log().warning(f"  → buy_strong_hit: {r.status_code}")
+        return http_fail(FailReason.SERVER)
+    
+    @http_call
+    async def exchange_ore(self, mining: MiningCfg, diamonds: int) -> HttpResult[dict[str, int]]: 
+        url  = mining.urls.exchange
+        room = mining.urls.mining_page
+        r = await self.post(url, room, payload={"diamonds": diamonds}, timeout=15)
+        if r.status_code == 200:
+            return http_success(self.http._json(r))
+        elif r.status_code == 400:
+            log().warning(f"  → exchange_ore: {r.status_code} (403 Forbidden)")
+            return http_fail(FailReason.DENIED)
+        log().warning(f"  → exchange_ore: {r.status_code}")
         return http_fail(FailReason.SERVER)

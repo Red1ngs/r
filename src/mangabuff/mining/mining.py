@@ -59,8 +59,15 @@ class MiningProfession(BaseProfession):
     ) -> RequestResult:
         if intent == "start_mining":
             return await self._handle_start_mining(ctx)
-        if intent == "mining_hit":
+        elif intent == "mining_hit":
             return await self._handle_mining_hit(ctx)
+        elif intent == "mining_upgrade":
+            return await self._handle_upgrade_pickaxe(ctx)
+        elif intent == "mining_buy_strong_hit":
+            return await self._handle_buy_strong_hit(ctx)
+        elif intent == "mining_exchange":
+            return await self._handle_mining_exchange(ctx, data)
+
         return RequestResult.deny(f"unknown intent: {intent!r}")
 
     async def _handle_start_mining(self, ctx: "RequestContext") -> RequestResult:
@@ -90,9 +97,9 @@ class MiningProfession(BaseProfession):
 
             # 3. Перевірка обов'язкових полів
             # Використовуємо set для перевірки наявності ключів
-            required_keys = {"hits_left", "ore", "max_hits"}
-            if not required_keys.issubset(data.keys()) or any(data[k] is None for k in required_keys):
-                missing = [k for k in required_keys if data.get(k) is None]
+            required_keys = {"hits_left", "ore", "max_hits", "upgrade_cost", "upgrade_max", "power_cost", "power_bought", "exchange_ore_cost", "exchange_diamonds_get"}
+            missing = [k for k in required_keys if k not in data]
+            if missing:
                 raise ValueError(f"API не повернуло обов'язкові поля: {', '.join(missing)}")
             
             log.info(f"⛏️ Майнінг статус: Ударів: {data["hits_left"]}, Руди: {data["ore"]}")
@@ -132,7 +139,7 @@ class MiningProfession(BaseProfession):
             missing_fields = [field for field in required_fields if data.get(field) is None]
             
             if missing_fields:
-                raise ValueError(f"Відсутні обов'язкові поля в API: {', '.join(missing_fields)}")
+                raise ValueError(f"Відсутні обов'язкові поля в API: {', '.join(missing_fields)}, data={data}")
 
             # 4. Оновлення інвентарю
             inv: MiningInventory = bot.inventory.mining
@@ -140,9 +147,130 @@ class MiningProfession(BaseProfession):
             inv.hits_used = data["hits_used"]
             inv.ore       = data["ore"]
             inv.added     = data["added"]
-                
+
             return RequestResult.approve(data=data)
             
         except Exception as exc:
             log.exception("mining_hit: критична помилка")
             return RequestResult.deny(f"Помилка обробки майнінгу: {exc}")
+        
+    async def _handle_upgrade_pickaxe(self, ctx: "RequestContext") -> RequestResult:
+        log = get_account_logger(self._account_id)
+        try:
+            # 1. Перевірка внутрішнього стану
+            if self._scheduler is None:
+                raise ValueError("Scheduler не ініціалізовано")
+            
+            bot = self._scheduler.get_bot(ctx.account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+            
+            cfg = bot.app_config.mining
+            
+             # 2. Виконання запиту
+            log.info("📝 Mining: надсилаємо запит на покращення кайлу…")
+            result = await bot.safe_session.upgrade_pickaxe(cfg)
+
+            if not result.ok:
+                log.warning(f"⚠️ /mine/upgrade провалився: {result.reason}")
+                raise ValueError(f"Помилка покращення кайлу: {result.reason}")
+            
+            data = result.data
+            if data is None:
+                raise ValueError("API повернуло порожні дані (data is None)")
+            
+            # 3. Перевірка обов'язкових полів
+            # Використовуємо set для перевірки наявності ключів
+            required_keys = {"ore", "pickaxe_level", "message"}
+            missing = [k for k in required_keys if k not in data]
+            if missing:
+                raise ValueError(f"API не повернуло обов'язкові поля: {', '.join(missing)}, data={data}")
+         
+            return RequestResult.approve(data=data)
+                        
+        except Exception as exc:
+            log.exception("mining_upgrade: критична помилка")
+            return RequestResult.deny(f"Помилка обробки покращення шахти: {exc}")
+        
+    async def _handle_buy_strong_hit(self, ctx: "RequestContext") -> RequestResult:
+        log = get_account_logger(self._account_id)
+        try:
+            # 1. Перевірка внутрішнього стану
+            if self._scheduler is None:
+                raise ValueError("Scheduler не ініціалізовано")
+            
+            bot = self._scheduler.get_bot(ctx.account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+            
+            cfg = bot.app_config.mining
+            
+             # 2. Виконання запиту
+            log.info("📝 Mining: надсилаємо запит на покупку сильного удару…")
+            result = await bot.safe_session.buy_strong_hit(cfg)
+
+            if not result.ok:
+                log.warning(f"⚠️ /mine/buy-strong-hit провалився: {result.reason}")
+                raise ValueError(f"Помилка покупки сильного удару: {result.reason}")
+            
+            data = result.data
+            if data is None:
+                raise ValueError("API повернуло порожні дані (data is None)")
+            
+            # 3. Перевірка обов'язкових полів
+            # Використовуємо set для перевірки наявності ключів
+            required_keys = {"ore", "pickaxe_level", "message"}
+            missing = [k for k in required_keys if k not in data]
+            if missing:
+                raise ValueError(f"API не повернуло обов'язкові поля: {', '.join(missing)}, data={data}")
+         
+            return RequestResult.approve(data=data)
+                        
+        except Exception as exc:
+            log.exception("mining_buy_strong_hit: критична помилка")
+            return RequestResult.deny(f"Помилка обробки покупки сильного удару: {exc}")
+        
+    async def _handle_mining_exchange(self, ctx: "RequestContext", data: dict[str, Any]) -> RequestResult:
+        log = get_account_logger(self._account_id)
+        try:
+            diamonds = data.get("diamonds")
+            if diamonds is None:
+                raise ValueError("Не вказано кількість діамантів для обміну")
+            
+            # 1. Перевірка внутрішнього стану
+            if self._scheduler is None:
+                raise ValueError("Scheduler не ініціалізовано")
+            
+            bot = self._scheduler.get_bot(ctx.account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+            
+            cfg = bot.app_config.mining
+            
+             # 2. Виконання запиту
+            log.info("📝 Mining: надсилаємо запит на обмін руди на діаманти…")
+            result = await bot.safe_session.exchange_ore(cfg, diamonds=diamonds)
+
+            if not result.ok:
+                log.warning(f"⚠️ /mine/exchange провалився: {result.reason}")
+                raise ValueError(f"Помилка обміну руди на діаманти: {result.reason}")
+                
+            result_data = result.data
+            if result_data is None:
+                raise ValueError("API повернуло порожні дані (data is None)")
+            
+            # 3. Перевірка обов'язкових полів
+            # Використовуємо set для перевірки наявності ключів
+            required_keys = {"ore", "diamonds", "message"}
+            missing = [k for k in required_keys if k not in result_data]
+            if missing:
+                raise ValueError(f"API не повернуло обов'язкові поля: {', '.join(missing)}, data={result_data}")
+         
+            return RequestResult.approve(data=result_data)
+                        
+        except Exception as exc:
+            log.exception("mining_exchange: критична помилка")
+            return RequestResult.deny(f"Помилка обробки обміну руди на діаманти: {exc}")
+        
+        
+    

@@ -11,7 +11,7 @@ farmer/catalog_loader.py — CatalogLoaderProfession.
 Універсальний розподіл задач:
     scheduler.dispatch_work(
         profession_id = "manga_loader",
-        intent        = "load_batch",
+        intent        = "update_mangas",
         items         = translits,
         item_key      = "translits",
     )
@@ -146,6 +146,7 @@ class CatalogLoaderProfession(BaseProfession):
         for data_id, manga in mangas.items():
             if data_id in existing_ids:
                 continue
+            
             bot.repo.mangas.upsert(
                 data_id, 
                 manga.translit_name, 
@@ -204,7 +205,7 @@ class CatalogLoaderProfession(BaseProfession):
 
             dispatched = await self._scheduler.dispatch_work(
                 profession_id = "manga_loader",
-                intent        = "load_batch",
+                intent        = "update_mangas",
                 items         = translits,
                 item_key      = "translits",
                 caller        = self._account_id,

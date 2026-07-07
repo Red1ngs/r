@@ -67,6 +67,59 @@ class MiningInventory(BaseInventory):
         self.data["mining_complete"] = value
         
     @property
+    def upgrade_cost(self) -> Optional[int]:
+        value = self.data.get("upgrade_cost")
+        return int(value) if value is not None else None
+    
+    @upgrade_cost.setter
+    def upgrade_cost(self, value: int) -> None:
+        self.data["upgrade_cost"] = int(value)
+        
+    @property
+    def upgrade_max(self) -> Optional[int]:
+        value = self.data.get("upgrade_max")
+        return int(value) if value is not None else None
+
+    @upgrade_max.setter
+    def upgrade_max(self, value: int) -> None:
+        self.data["upgrade_max"] = int(value)
+
+    @property
+    def power_cost(self) -> Optional[int]:
+        value = self.data.get("power_cost")
+        return int(value) if value is not None else None
+
+    @power_cost.setter
+    def power_cost(self, value: int) -> None:
+        self.data["power_cost"] = int(value)
+
+    @property
+    def power_bought(self) -> bool:
+        return bool(self.data.get("power_bought"))
+
+    @power_bought.setter
+    def power_bought(self, value: bool) -> None:
+        self.data["power_bought"] = value
+        
+    @property
+    def exchange_ore_cost(self) -> Optional[int]:
+        value = self.data.get("exchange_ore_cost")
+        return int(value) if value is not None else None
+
+    @exchange_ore_cost.setter
+    def exchange_ore_cost(self, value: int) -> None:
+        self.data["exchange_ore_cost"] = int(value)
+
+    @property
+    def exchange_diamonds_get(self) -> Optional[int]:
+        value = self.data.get("exchange_diamonds_get")
+        return int(value) if value is not None else None
+
+    @exchange_diamonds_get.setter
+    def exchange_diamonds_get(self, value: int) -> None:
+        self.data["exchange_diamonds_get"] = int(value)
+
+    @property
     def mining_params(self) -> dict[str, Any]:
         return self.data.get("mining_params", {})
     

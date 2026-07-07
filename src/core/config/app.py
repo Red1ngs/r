@@ -299,14 +299,20 @@ class DailyCfg:
 
 @dataclass(frozen=True)
 class MiningUrls:
-    mining_page:   str
-    hit:           str
+    mining_page:    str
+    hit:            str
+    upgrade:        str
+    buy_strong_hit: str
+    exchange:       str
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "MiningUrls":
         return cls(
             mining_page=str(d.get("mining_page", "/mine")),
             hit=str(d.get("hit", "/mine/hit")),
+            upgrade=str(d.get("upgrade", "/mine/upgrade")),
+            buy_strong_hit=str(d.get("buy_strong_hit", "/mine/buy-strong-hit")),
+            exchange=str(d.get("exchange", "/mine/exchange")),
         )
         
         

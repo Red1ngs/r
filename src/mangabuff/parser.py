@@ -100,19 +100,93 @@ def parse_ore(soup: BeautifulSoup) -> Optional[int]:
     
     return parse_int(element.text)
 
+def parse_upgrade_card(soup: BeautifulSoup) -> tuple[Optional[int], bool]:
+    """
+    Парсить картку 'Улучшение кирки' (upgrade).
+    Повертає ціну та прапорець досягнення максимуму.
+    """
+    card = soup.find('div', class_='mine-shop__card--upgrade')
+    if not card:
+        return None, False
+
+    card_text = card.get_text().lower()
+    is_max = "максимум" in card_text
+
+    cost = None
+    price_element = card.find('div', class_='mine-shop__price')
+    if price_element:
+        cost = parse_int(price_element.text)
+
+    return cost, is_max
+
+
+def parse_power_card(soup: BeautifulSoup) -> tuple[Optional[int], bool]:
+    """
+    Парсить картку 'Сильный удар' (power).
+    Повертає ціну та прапорець купівлі.
+    """
+    card = soup.find('div', class_='mine-shop__card--power')
+    if not card:
+        return None, False
+
+    card_text = card.get_text().lower()
+    is_bought = "куплено" in card_text
+
+    cost = None
+    price_element = card.find('div', class_='mine-shop__price')
+    if price_element:
+        cost = parse_int(price_element.text)
+
+    return cost, is_bought
+
+
+def parse_exchange_info(soup: BeautifulSoup) -> tuple[Optional[int], Optional[int]]:
+    """
+    Парсить блок обміну руди на алмази.
+    Повертає (кількість_руди_що_спишеться, кількість_алмазів_що_отримаємо).
+    """
+    card = soup.find('div', class_='mine-shop__card--exchange')
+    if not card:
+        return None, None
+
+    # Отримуємо кількість руди, яка спишеться згідно з поточним вибором
+    ore_elem = card.find('span', class_='mine-shop__exchange-ore')
+    # Отримуємо кількість алмазів, які буде отримано
+    diamonds_elem = card.find('span', class_='mine-shop__exchange-diamonds')
+
+    ore_cost = parse_int(ore_elem.text) if ore_elem else None
+    diamonds_get = parse_int(diamonds_elem.text) if diamonds_elem else None
+
+    return ore_cost, diamonds_get
+
+
 def parse_mining_page(html: str) -> dict[str, Any]:
     soup = BeautifulSoup(html, 'html.parser')
     
     mine_count = parse_hits_count(soup)
-    
     ore = parse_ore(soup)
-    
     max_hits = parse_mine_count(soup)
+    
+    upgrade_cost, upgrade_max = parse_upgrade_card(soup)
+    power_cost, power_bought = parse_power_card(soup)
+    
+    # Парсимо дані обміну
+    exchange_ore_cost, exchange_diamonds_get = parse_exchange_info(soup)
     
     data: dict[str, Any] = {
         "hits_left": mine_count,
         "ore": ore,
-        "max_hits": max_hits
+        "max_hits": max_hits,
+        
+        "upgrade_cost": upgrade_cost,
+        "upgrade_max": upgrade_max,
+        
+        "power_cost": power_cost,
+        "power_bought": power_bought,
+        
+        # Нові дані для обміну
+        "exchange_ore_cost": exchange_ore_cost,
+        "exchange_diamonds_get": exchange_diamonds_get
     }
     
     return data
