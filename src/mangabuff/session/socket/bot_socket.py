@@ -61,7 +61,7 @@ class BotSocket:
     """
 
     WSS_URL          = "wss://wss10.mangabuff.ru:443/"
-    DEFAULT_MAX_TABS = 3
+    DEFAULT_MAX_TABS = 1
 
     _PASSIVE_EVENTS: tuple[str, ...] = (
         "new-notify", "new-notifyClubNewCard", "new-sendNewReplyComment",
