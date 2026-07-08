@@ -100,24 +100,34 @@ def parse_ore(soup: BeautifulSoup) -> Optional[int]:
     
     return parse_int(element.text)
 
-def parse_upgrade_card(soup: BeautifulSoup) -> tuple[Optional[int], bool]:
+def parse_upgrade_card(soup: BeautifulSoup) -> tuple[Optional[int], Optional[int], bool]:
     """
     Парсить картку 'Улучшение кирки' (upgrade).
-    Повертає ціну та прапорець досягнення максимуму.
+    Повертає ціну, поточний рівень та прапорець досягнення максимуму.
     """
     card = soup.find('div', class_='mine-shop__card--upgrade')
     if not card:
-        return None, False
+        return None, None, False
 
     card_text = card.get_text().lower()
     is_max = "максимум" in card_text
 
+    # Шукаємо поточний рівень
+    level = None
+    level_element = card.find('div', class_='mine-shop__card-text')
+    if level_element:
+        # Значення рівня лежить всередині тегу <b>
+        b_element = level_element.find('b')
+        if b_element:
+            level = parse_int(b_element.text)
+
+    # Шукаємо ціну
     cost = None
     price_element = card.find('div', class_='mine-shop__price')
     if price_element:
         cost = parse_int(price_element.text)
 
-    return cost, is_max
+    return cost, level, is_max
 
 
 def parse_power_card(soup: BeautifulSoup) -> tuple[Optional[int], bool]:
@@ -167,10 +177,10 @@ def parse_mining_page(html: str) -> dict[str, Any]:
     ore = parse_ore(soup)
     max_hits = parse_mine_count(soup)
     
-    upgrade_cost, upgrade_max = parse_upgrade_card(soup)
+    # Тепер отримуємо також і рівень кирки (upgrade_level)
+    upgrade_cost, upgrade_level, upgrade_max = parse_upgrade_card(soup)
     power_cost, power_bought = parse_power_card(soup)
     
-    # Парсимо дані обміну
     exchange_ore_cost, exchange_diamonds_get = parse_exchange_info(soup)
     
     data: dict[str, Any] = {
@@ -178,13 +188,16 @@ def parse_mining_page(html: str) -> dict[str, Any]:
         "ore": ore,
         "max_hits": max_hits,
         
+        # Дані покращення кирки
         "upgrade_cost": upgrade_cost,
+        "upgrade_level": upgrade_level,
         "upgrade_max": upgrade_max,
         
+        # Дані сильного удару
         "power_cost": power_cost,
         "power_bought": power_bought,
         
-        # Нові дані для обміну
+        # Дані обміну
         "exchange_ore_cost": exchange_ore_cost,
         "exchange_diamonds_get": exchange_diamonds_get
     }

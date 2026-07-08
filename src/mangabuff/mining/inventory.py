@@ -76,6 +76,15 @@ class MiningInventory(BaseInventory):
         self.data["upgrade_cost"] = int(value)
         
     @property
+    def upgrade_level(self) -> Optional[int]:
+        value = self.data.get("upgrade_level")
+        return int(value) if value is not None else None
+    
+    @upgrade_level.setter
+    def upgrade_level(self, value: int) -> None:
+        self.data["upgrade_level"] = int(value)
+        
+    @property
     def upgrade_max(self) -> Optional[int]:
         value = self.data.get("upgrade_max")
         return int(value) if value is not None else None

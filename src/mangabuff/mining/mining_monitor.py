@@ -456,6 +456,8 @@ class MiningMonitor(BaseMonitor):
             inv.ore = cast(int, data["ore"])
         if "upgrade_cost" in data:
             inv.upgrade_cost = cast(Optional[int], data["upgrade_cost"])
+        if "upgrade_level" in data:
+            inv.upgrade_level = cast(Optional[int], data["upgrade_level"])
         if "upgrade_max" in data:
             inv.upgrade_max = cast(bool, data["upgrade_max"])
         if "power_cost" in data:

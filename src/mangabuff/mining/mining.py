@@ -97,7 +97,7 @@ class MiningProfession(BaseProfession):
 
             # 3. Перевірка обов'язкових полів
             # Використовуємо set для перевірки наявності ключів
-            required_keys = {"hits_left", "ore", "max_hits", "upgrade_cost", "upgrade_max", "power_cost", "power_bought", "exchange_ore_cost", "exchange_diamonds_get"}
+            required_keys = {"hits_left", "ore", "max_hits", "upgrade_cost", "upgrade_level", "upgrade_max", "power_cost", "power_bought", "exchange_ore_cost", "exchange_diamonds_get"}
             missing = [k for k in required_keys if k not in data]
             if missing:
                 raise ValueError(f"API не повернуло обов'язкові поля: {', '.join(missing)}")
