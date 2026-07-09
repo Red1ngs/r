@@ -61,7 +61,7 @@ class MiningProfession(BaseProfession):
             return await self._handle_start_mining(ctx)
         elif intent == "mining_hit":
             return await self._handle_mining_hit(ctx)
-        elif intent == "mining_upgrade":
+        elif intent == "upgrade_pickaxe":
             return await self._handle_upgrade_pickaxe(ctx)
         elif intent == "mining_buy_strong_hit":
             return await self._handle_buy_strong_hit(ctx)
@@ -189,7 +189,7 @@ class MiningProfession(BaseProfession):
             return RequestResult.approve(data=data)
                         
         except Exception as exc:
-            log.exception("mining_upgrade: критична помилка")
+            log.exception("upgrade_pickaxe: критична помилка")
             return RequestResult.deny(f"Помилка обробки покращення шахти: {exc}")
         
     async def _handle_buy_strong_hit(self, ctx: "RequestContext") -> RequestResult:
