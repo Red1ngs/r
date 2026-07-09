@@ -172,13 +172,18 @@ def log_payload_curl(
     _log().debug(f"  ↑  {method:<5} {url}  {' | '.join(parts)}")
 
 
-def log_request_curl(method: str, url: str, headers: dict, body: Any = None) -> float:
+def log_request_curl(method: str, url: str, headers: dict[str, str], body: Any = None) -> float:
     """
     Крок 2: логує сам HTTP-запит (METHOD URL).
     Повертає monotonic timestamp для розрахунку elapsed у log_response_curl.
 
     Примітка: body тут ігнорується — payload вже залогований у log_payload_curl.
     Параметр залишено для зворотної сумісності.
+
+    headers типізовано як dict[str, str] (було голе `dict`, тобто
+    dict[Unknown, Unknown]) — саме це й було джерелом reportUnknownVariableType
+    на виклику в http_client.py: тип "t" тягнув Unknown із сигнатури,
+    хоча сама функція завжди повертає float.
     """
     t = time.monotonic()
     _log().debug(f"  →  {method:<5} {url}")

@@ -4,7 +4,7 @@ src/mangabuff/session/bot_socket.py
 WebSocket-клієнт для wss://wss10.mangabuff.ru:443/
 
 Відповідає ТІЛЬКИ за:
-  - підтримку кількох WS-з'єднань одночасно ("вкладки", LRU)
+  - підтримку кількох WS-з'єднань одночасно ("вкладки", idle-based TTL)
   - joinRoom при connect і reconnect кожної вкладки
   - маршрутизацію вхідних подій до зареєстрованих callbacks
 
@@ -15,14 +15,16 @@ WebSocket-клієнт для wss://wss10.mangabuff.ru:443/
 МОДЕЛЬ "КІЛЬКА ВКЛАДОК"
 
 Кожна сторінка сайту тримає одну кімнату (room == window.location.pathname).
-BotSocket моделює це через LRU OrderedDict:
-  - use_room(room): перемикає або відкриває вкладку, evict найстарішу при перевищенні ліміту
+BotSocket моделює це через OrderedDict:
+  - use_room(room): перемикає або відкриває вкладку, оновлює час використання
+  - idle-reaper: закриває вкладки, які не використовуються довше TTL
   - мережевий реконект — та сама вкладка повторює joinRoom (не навігація)
 ────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Awaitable, Optional
@@ -38,8 +40,9 @@ HOME_ROOM = "/"
 @dataclass
 class _Tab:
     """Одна "вкладка" — одне незалежне socket.io-з'єднання, одна кімната."""
-    sio:       "socketio.AsyncClient"
-    connected: bool = False
+    sio:          "socketio.AsyncClient"
+    connected:    bool = False
+    last_used_at: float = 0.0
 
 
 def _make_debug_handler(event: str) -> Callable[[Any], Awaitable[None]]:
@@ -61,7 +64,8 @@ class BotSocket:
     """
 
     WSS_URL          = "wss://wss10.mangabuff.ru:443/"
-    DEFAULT_MAX_TABS = 1
+    DEFAULT_MAX_TABS = 5     # Стеля-запобіжник для аномалій
+    DEFAULT_TTL      = 300.0  # Час життя неактивної вкладки в секундах (5 хвилин)
 
     _PASSIVE_EVENTS: tuple[str, ...] = (
         "new-notify", "new-notifyClubNewCard", "new-sendNewReplyComment",
@@ -74,16 +78,22 @@ class BotSocket:
         "battle-manual-matched", "battle-manual-attack",
     )
 
-    def __init__(self, max_tabs: int = DEFAULT_MAX_TABS) -> None:
+    def __init__(self, max_tabs: int = DEFAULT_MAX_TABS, ttl: float = DEFAULT_TTL) -> None:
         self._max_tabs:      int                                  = max(1, max_tabs)
+        self._ttl:           float                                = ttl
         self._tabs:          OrderedDict[str, _Tab]               = OrderedDict()
         self._user_id:       Optional[str]                        = None
         self._cookies:       dict[str, str]                       = {}
         self._extra_headers: dict[str, str]                       = {}
         self._listeners:     dict[str, list[SocketEventCallback]] = {}
         self._lock:          asyncio.Lock                         = asyncio.Lock()
+        self._reaper_task:   Optional[asyncio.Task[None]]         = None
 
     # ── Властивості ───────────────────────────────────────────────────────────
+    
+    @property
+    def user_id(self) -> Optional[str]:
+        return self._user_id
 
     @property
     def is_connected(self) -> bool:
@@ -117,14 +127,17 @@ class BotSocket:
     async def use_room(self, room: str) -> bool:
         """
         Гарантує живу вкладку з кімнатою `room`.
-        Якщо вкладка вже відкрита — перемикається на неї (LRU move_to_end).
-        Якщо немає — відкриває нову, evict найдавнішої при перевищенні ліміту.
+        Якщо вкладка вже відкрита — перемикається на неї та оновлює час використання.
+        Якщо немає — відкриває нову, перевіряючи загороджувальний ліміт.
         """
+        now = time.monotonic()
         async with self._lock:
             tab = self._tabs.get(room)
             if tab is not None and tab.connected:
+                tab.last_used_at = now
                 self._tabs.move_to_end(room)
                 log().debug(f"[socket] перемкнувся на {room!r} (open={list(self._tabs)})")
+                self._start_reaper_if_needed()
                 return True
             if tab is not None:
                 del self._tabs[room]   # мертва вкладка — видаляємо
@@ -132,10 +145,16 @@ class BotSocket:
             if not await self._open_tab(room):
                 return False
 
+            if room in self._tabs:
+                self._tabs[room].last_used_at = now
+
+            # Запобіжник на випадок аномального накопичення відкритих вкладок
             while len(self._tabs) > self._max_tabs:
                 old_room, old_tab = self._tabs.popitem(last=False)
-                log().debug(f"[socket] LRU evict {old_room!r} (ліміт {self._max_tabs})")
+                log().warning(f"[socket] ЗАПОБІЖНИК: Перевищено ліміт вкладок ({self._max_tabs}). Evict {old_room!r}")
                 await self._close_tab(old_tab)
+
+            self._start_reaper_if_needed()
             return True
 
     def on(self, event: str, callback: SocketEventCallback) -> None:
@@ -156,6 +175,9 @@ class BotSocket:
     async def close(self) -> None:
         """Закрити всі вкладки і скинути весь стан."""
         async with self._lock:
+            if self._reaper_task:
+                self._reaper_task.cancel()
+                self._reaper_task = None
             await self._close_all_tabs()
             self._listeners.clear()
             self._user_id       = None
@@ -171,7 +193,7 @@ class BotSocket:
             reconnection_delay=3, reconnection_delay_max=15,
             logger=False, engineio_logger=False,
         )
-        tab = _Tab(sio=sio)
+        tab = _Tab(sio=sio, last_used_at=time.monotonic())
         self._register_handlers(tab, room)
 
         cookie_str = "; ".join(f"{k}={v}" for k, v in self._cookies.items())
@@ -208,8 +230,6 @@ class BotSocket:
         async def connect() -> None:  # type: ignore
             tab.connected = True
             log().info(f"[socket] вкладка підключена (user_id={self._user_id}, room={room!r})")
-            # Спрацьовує і після першого підключення, і після мережевого реконекту —
-            # в обох випадках сервер бачить новий sid і не пам'ятає стару кімнату.
             await self._safe_emit(tab, "joinRoom", {"room": room, "userId": self._user_id})
 
         @sio.event  # type: ignore
@@ -244,3 +264,43 @@ class BotSocket:
                 await tab.sio.emit(event, data)  # type: ignore
             except Exception as e:
                 log().error(f"[socket] emit [{event}] failed: {e}")
+
+    # ── Reaper Loop ───────────────────────────────────────────────────────────
+
+    def _start_reaper_if_needed(self) -> None:
+        if self._reaper_task is None or self._reaper_task.done():
+            self._reaper_task = asyncio.create_task(self._reap_loop())
+
+    async def _reap_loop(self) -> None:
+        """Фоновий процес перевірки вкладок на предмет простою."""
+        try:
+            while True:
+                await asyncio.sleep(10)  # Інтервал перевірки простою
+                to_remove: list[tuple[str, _Tab]] = []
+
+                async with self._lock:
+                    if not self._tabs:
+                        break
+                    now = time.monotonic()
+                    for room, tab in self._tabs.items():
+                        if now - tab.last_used_at > self._ttl:
+                            to_remove.append((room, tab))
+
+                    # Видаляємо з колекції під локом
+                    for room, _ in to_remove:
+                        del self._tabs[room]
+
+                # Закриваємо з'єднання поза локом, щоб не блокувати використання інших вкладок
+                for room, tab in to_remove:
+                    log().info(f"[socket] idle evict {room!r} (простій {time.monotonic() - tab.last_used_at:.1f}с, TTL {self._ttl}с)")
+                    await self._close_tab(tab)
+
+                async with self._lock:
+                    if not self._tabs:
+                        break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log().error(f"[socket] помилка в reaper loop: {e}")
+        finally:
+            self._reaper_task = None

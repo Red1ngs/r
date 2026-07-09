@@ -15,7 +15,11 @@ src/mangabuff/session/http_client.py
   - бізнес-ендпоінти (це BotSession)
 
 Кожен запит проходить через proxy_queue_manager.enqueue_coro() —
-гарантує послідовне виконання per-proxy без 429-колізій.
+гарантує послідовне виконання per-proxy без 429-колізій, з пріоритетом
+(Priority.AUTH/CRITICAL/NORMAL/BACKGROUND) та circuit breaker на
+мережеві збої. За замовчуванням пріоритет NORMAL; auth-флоу (BotAuth)
+явно передає Priority.AUTH, щоб логін/реєстрація завжди йшли
+попереду черги.
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ from urllib.parse import unquote
 from curl_cffi.requests import AsyncSession, Response
 
 from src.core.config.bot import BotConfig
-from src.core.runtime.proxy_queue import proxy_queue_manager, RateLimitedError
+from src.core.runtime.proxy_queue import proxy_queue_manager, RateLimitedError, Priority
 from src.database.repository.session import SessionRepository
 from src.mangabuff.session.http_result import HttpMethodStr
 from src.mangabuff.session.request_headers import RequestHeaders, ReauthCallback
@@ -145,7 +149,14 @@ class BotHttpClient:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _json(r: Response) -> dict[str, Any]:
+    def json_body(r: Response) -> dict[str, Any]:
+        """
+        Парсить тіло відповіді як JSON.
+
+        Публічний метод (не _json): BotSession свідомо викликає його
+        ззовні як частину контракту "сирий HTTP → бізнес-результат" —
+        це не випадковий доступ до внутрішньої деталі реалізації.
+        """
         return r.json()  # type: ignore[no-any-return]
 
     def _url(self, url: str) -> str:
@@ -154,9 +165,14 @@ class BotHttpClient:
         return f"{self.bot_config.client.base_url.rstrip('/')}/{url.lstrip('/')}"
 
     async def _reauth_retry(
-        self, method: HttpMethodStr, url: str, full_url: str, label: str, **kw: Any
+        self, method: HttpMethodStr, url: str, full_url: str, label: str,
+        priority: Priority = Priority.AUTH, **kw: Any
     ) -> Response:
-        """Повторний запит після успішного re-login — оновлює CSRF у заголовках."""
+        """
+        Повторний запит після успішного re-login — оновлює CSRF у заголовках.
+        Виконується з AUTH-пріоритетом за замовчуванням: це продовження
+        auth-флоу (419/401 recovery), тож має обганяти звичайні бізнес-запити.
+        """
         if "headers" in kw:
             if self.headers.csrf_token:
                 kw["headers"]["X-CSRF-TOKEN"] = self.headers.csrf_token
@@ -164,15 +180,20 @@ class BotHttpClient:
                 kw["headers"]["X-XSRF-TOKEN"] = self.headers.xsrf_token
         log_payload_curl(method, full_url, params=kw.get("params"), data=kw.get("data"), json_body=kw.get("json"))
         t = log_request_curl(method, full_url, kw.get("headers", {}))
+        assert self._client is not None
         r = await proxy_queue_manager.enqueue_coro(
             proxy=self.bot_config.network.proxy,
-            coro=self._client.request(method, full_url, **kw),  # type: ignore[union-attr]
+            coro_factory=lambda: self._client.request(method, full_url, **kw),  # type: ignore[union-attr]
             label=f"{method} {url} ({label})",
+            priority=priority,
         )
         log_response_curl(r.status_code, full_url, r.content, r.headers.get("content-type", ""), t)
         return r
 
-    async def _request(self, method: HttpMethodStr, url: str, **kw: Any) -> Response:
+    async def _request(
+        self, method: HttpMethodStr, url: str,
+        priority: Priority = Priority.NORMAL, **kw: Any
+    ) -> Response:
         assert self._client
         full_url = self._url(url)
 
@@ -183,8 +204,9 @@ class BotHttpClient:
         t = log_request_curl(method, full_url, kw.get("headers", {}))
         r = await proxy_queue_manager.enqueue_coro(
             proxy=self.bot_config.network.proxy,
-            coro=self._client.request(method, full_url, **kw),  # type: ignore[union-attr]
+            coro_factory=lambda: self._client.request(method, full_url, **kw),  # type: ignore[union-attr]
             label=f"{method} {url}",
+            priority=priority,
         )
         log_response_curl(r.status_code, full_url, r.content, r.headers.get("content-type", ""), t)
 
@@ -221,10 +243,10 @@ class BotHttpClient:
 
     # ── Публічний API ─────────────────────────────────────────────────────────
 
-    async def get(self, url: str, **kw: Any) -> Response:
+    async def get(self, url: str, priority: Priority = Priority.NORMAL, **kw: Any) -> Response:
         kw.setdefault("headers", self.headers.get_navigation())
-        return await self._request("GET", url, **kw)
+        return await self._request("GET", url, priority=priority, **kw)
 
-    async def post(self, url: str, **kw: Any) -> Response:
+    async def post(self, url: str, priority: Priority = Priority.NORMAL, **kw: Any) -> Response:
         kw.setdefault("headers", self.headers.get_ajax(is_post=True))
-        return await self._request("POST", url, **kw)
+        return await self._request("POST", url, priority=priority, **kw)

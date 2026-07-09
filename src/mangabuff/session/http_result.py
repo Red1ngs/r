@@ -9,7 +9,7 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Awaitable, Callable, Generic, Literal, Optional, TypeVar, ParamSpec, Concatenate
+from typing import Any, Awaitable, Callable, Generic, Literal, Optional, TypeVar, ParamSpec, Concatenate, cast
 
 from src.utils.logging import get_logger as log
 
@@ -55,9 +55,20 @@ def http_success(data: T) -> HttpResult[T]:
     return HttpResult(ok=True, data=data)
 
 
-def http_success_none() -> HttpResult[None]:
-    """Створює успішний HttpResult без даних."""
-    return HttpResult(ok=True, data=None)
+def http_success_none() -> "HttpResult[T]":
+    """
+    Створює успішний HttpResult без даних, типізований під очікуваний T
+    у місці виклику.
+
+    HttpResult.data — Optional[T] для будь-якого T, тож runtime-значення
+    None коректне незалежно від T. Але голий `-> HttpResult[T]" де T
+    з'являється лише в поверненні — reportInvalidTypeVarUse (Pyright не
+    гарантує виведення такого T). Тому будуємо конкретний HttpResult[None]
+    і cast'уємо тип статично — це чесний спосіб сказати "я знаю, що це
+    безпечно для будь-якого T", а не покладатись на непідтримувану
+    поведінку виведення.
+    """
+    return cast("HttpResult[T]", HttpResult(ok=True, data=None))
 
 
 def http_fail(reason: FailReason) -> HttpResult[Any]:

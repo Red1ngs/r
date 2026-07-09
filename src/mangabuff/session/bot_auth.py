@@ -15,12 +15,27 @@ BotHttpClient своєю чергою викликає login() через Reauth
 419/401 — двостороння залежність розірвана callback-ом.
 
 НЕ знає про MessageSocket, inventory, Account, бізнес-методи.
+
+── Priority (core/runtime/proxy_queue.py) ───────────────────────────────────
+Повна шкала пріоритетів черги, від найвищого до найнижчого:
+    AUTH (0)          ← цей файл (BotAuth) — завжди тут, і ТІЛЬКИ тут.
+    TIME_CRITICAL (5)     BotSession.quiz_start/quiz_answer — секундне вікно.
+    CRITICAL (10)         BotSession: send_message, claim_daily/calendar.
+    NORMAL (20)           BotSession: mining.
+    BACKGROUND (30)       BotSession: reader (каталог, історія, цукерки).
+
+BotAuth завжди працює з Priority.AUTH і ніколи не піднімається/опускається
+залежно від того, хто спричинив re-login (quiz, mining, reader — не
+важливо) — без валідної сесії будь-який запит все одно поверне 401/419,
+тож auth має лишатись СТРОГО вище за TIME_CRITICAL, інакше сама причина
+для re-login (протухла сесія) заблокує чергу для всіх, включно з квізом.
 """
 from __future__ import annotations
 
 from typing import Optional
 
 from src.core.config.bot import BotConfig
+from src.core.runtime.proxy_queue import Priority
 from src.database.repository.session import SessionRepository
 from src.mangabuff.parser import parse_main_page
 from src.mangabuff.session.socket.bot_socket import BotSocket, HOME_ROOM
@@ -99,10 +114,12 @@ class BotAuth:
         Оновлює user_id у сокеті, зберігає cookies у БД.
         """
         try:
-            self._socket.set_identity(self._socket._user_id, self._http.cookies)
+            self._socket.set_identity(self._socket.user_id, self._http.cookies)
             await self._socket.use_room(HOME_ROOM)
 
-            r = await self._http.get("/", headers=self.headers.get_navigation())
+            r = await self._http.get(
+                "/", headers=self.headers.get_navigation(), priority=Priority.AUTH
+            )
             if r.status_code != 200:
                 return False
 
@@ -135,7 +152,9 @@ class BotAuth:
     async def _fetch_csrf(self) -> bool:
         """GET /login → витягуємо csrf_token з <meta> і XSRF-TOKEN з cookies."""
         try:
-            r = await self._http.get("/login", headers=self.headers.get_navigation())
+            r = await self._http.get(
+                "/login", headers=self.headers.get_navigation(), priority=Priority.AUTH
+            )
             r.raise_for_status()
             data  = parse_main_page(r.text, only_token=True)
             token = data.pop("csrf_token")
@@ -162,6 +181,7 @@ class BotAuth:
             r = await self._http.post(
                 "/login", data=payload,
                 headers=self.headers.get_ajax(is_post=True),
+                priority=Priority.AUTH,
             )
             if r.status_code not in (200, 204, 302):
                 log().warning(f"  → login POST → {r.status_code}")
