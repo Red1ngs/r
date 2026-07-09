@@ -89,7 +89,12 @@ def account_text(info: AccountInfo) -> str:
 
 # ── Клавіатури ────────────────────────────────────────────────────────────────
 
-def accounts_list_kb(accounts: list[AccountInfo]) -> InlineKeyboardMarkup:
+def accounts_list_kb(
+    accounts: list[AccountInfo],
+    *,
+    show_add: bool = True,
+    extra_rows: Optional[list[list[InlineKeyboardButton]]] = None,
+) -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for acc in accounts:
@@ -103,7 +108,10 @@ def accounts_list_kb(accounts: list[AccountInfo]) -> InlineKeyboardMarkup:
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton(text="➕ Додати акаунт", callback_data="acc:add")])
+    if extra_rows:
+        buttons.extend(extra_rows)
+    if show_add:
+        buttons.append([InlineKeyboardButton(text="➕ Додати акаунт", callback_data="acc:add")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -150,13 +158,15 @@ def account_menu_kb(
             callback_data=f"acc:professions:{acc_id}",
         )])
 
-    # ── Profession-специфічні пункти (автогенерація з реєстру)
+    # ── Налаштування активних професій — окреме вікно
+    # (раніше пункти професій додавались просто в це меню; тепер вони
+    # згруповані по професіях і відкриваються окремим екраном)
     if not is_dead and active_professions:
-        prof_items = profession_menu_registry.items_for(active_professions)
-        for item in prof_items:
+        profs_with_tools = profession_menu_registry.professions_with_items(active_professions)
+        if profs_with_tools:
             rows.append([InlineKeyboardButton(
-                text=item.label,
-                callback_data=item.build_callback(acc_id),
+                text="🛠 Налаштування професій",
+                callback_data=f"acc:prof_tools:{acc_id}",
             )])
 
     # ── Службові кнопки
@@ -171,6 +181,8 @@ def account_menu_kb(
 def professions_manage_kb(
     acc_id: str,
     active: list[str],
+    *,
+    query: Optional[str] = None,
 ) -> InlineKeyboardMarkup:
     all_names = profession_registry.known_ids()
     rows: list[list[InlineKeyboardButton]] = []
@@ -197,6 +209,22 @@ def professions_manage_kb(
         )])
 
     available = [n for n in all_names if n not in active]
+    if query:
+        q = query.lower()
+        available = [n for n in available if q in n.lower()]
+
+    # ── Пошук серед доступних для додавання професій (корисно, якщо їх багато)
+    if query:
+        rows.append([InlineKeyboardButton(
+            text=f"🔎 «{query}»  ·  ✖ скинути",
+            callback_data=f"acc:prof_search_reset:{acc_id}",
+        )])
+    elif len(all_names) - len(active) > 6:
+        rows.append([InlineKeyboardButton(
+            text="🔎 Пошук професії",
+            callback_data=f"acc:prof_search:{acc_id}",
+        )])
+
     if available:
         rows.append([InlineKeyboardButton(
             text="── Додати ──", callback_data="noop",
@@ -206,6 +234,10 @@ def professions_manage_kb(
                 text=f"➕ {name}",
                 callback_data=f"acc:prof_add:{acc_id}:{name}",
             )])
+    elif query:
+        rows.append([InlineKeyboardButton(
+            text="Нічого не знайдено", callback_data="noop",
+        )])
 
     rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data=f"acc:menu:{acc_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

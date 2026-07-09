@@ -158,7 +158,8 @@ class Account:
             if self.bot_config.network.proxy:
                 if not await session.http.check_proxy():
                     await session.close()
-                    return self._fail("Проксі недоступне або не працює")
+                    self.mark_dead("Проксі недоступне або не працює")
+                    return False
 
             await session.auth.authenticate()
             self._session = session

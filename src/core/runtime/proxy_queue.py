@@ -427,14 +427,23 @@ class ProxyQueueManager:
     def _key(self, proxy: Optional[str]) -> str:
         if not proxy:
             return _NO_PROXY_KEY
+
+        proxy_str = proxy.strip()
+        if not proxy_str:
+            return _NO_PROXY_KEY
+
         try:
             from urllib.parse import urlparse
-            p = urlparse(proxy)
+            if "://" not in proxy_str:
+                proxy_str = f"http://{proxy_str}"
+            p = urlparse(proxy_str)
             host = p.hostname or ""
+            if not host:
+                return proxy_str
             port = f":{p.port}" if p.port else ""
-            return f"{p.scheme}://{host}{port}"
+            return f"{p.scheme.lower()}://{host.lower()}{port}"
         except Exception:
-            return proxy
+            return proxy_str
 
     def ensure(self, proxy: Optional[str]) -> _ProxyWorker:
         key = self._key(proxy)

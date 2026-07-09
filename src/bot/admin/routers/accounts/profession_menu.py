@@ -36,5 +36,20 @@ class ProfessionMenuRegistry:
         active_set = set(active_professions)
         return [item for item in self._items if item.profession_id in active_set]
 
+    def professions_with_items(self, active_professions: list[str]) -> list[str]:
+        """Активні професії (у порядку пріоритету), для яких є хоч один пункт налаштувань."""
+        registered = {item.profession_id for item in self._items}
+        seen: set[str] = set()
+        result: list[str] = []
+        for pid in active_professions:
+            if pid in registered and pid not in seen:
+                seen.add(pid)
+                result.append(pid)
+        return result
+
+    def items_for_profession(self, profession_id: str) -> list[ProfessionMenuItem]:
+        """Усі зареєстровані пункти налаштувань для однієї конкретної професії."""
+        return [item for item in self._items if item.profession_id == profession_id]
+
 
 profession_menu_registry = ProfessionMenuRegistry()

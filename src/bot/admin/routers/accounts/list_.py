@@ -25,6 +25,11 @@ _EMPTY_KB = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="➕ Додати акаунт", callback_data="acc:add"),
 ]])
 
+_NAV_ROW = [
+    InlineKeyboardButton(text="🔎 Пошук", callback_data="acc:search:menu"),
+    InlineKeyboardButton(text="🗂 Категорії", callback_data="acc:group:menu"),
+]
+
 
 @router.message(Command("accounts"))
 async def cmd_accounts(message: Message, state: FSMContext, svc: SchedulerService) -> None:
@@ -35,7 +40,7 @@ async def cmd_accounts(message: Message, state: FSMContext, svc: SchedulerServic
         await nav_answer(
             message, state,
             f"<b>Акаунти ({snapshot.total_accounts})</b>\nОбери акаунт або додай новий:",
-            accounts_list_kb(snapshot.accounts),
+            accounts_list_kb(snapshot.accounts, extra_rows=[_NAV_ROW]),
         )
 
 
@@ -47,6 +52,6 @@ async def cb_list(call: CallbackQuery, svc: SchedulerService) -> None:
     else:
         await call.message.edit_text(  # type: ignore[union-attr]
             f"<b>Акаунти ({snapshot.total_accounts})</b>\nОбери акаунт або додай новий:",
-            reply_markup=accounts_list_kb(snapshot.accounts),
+            reply_markup=accounts_list_kb(snapshot.accounts, extra_rows=[_NAV_ROW]),
         )
     await call.answer()
