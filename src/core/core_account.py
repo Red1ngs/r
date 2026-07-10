@@ -22,6 +22,8 @@ from src.core.status import AccountStatus
 from src.core.logging.loggers import get_account_logger
 from src.core.runtime.event_bus import EventBus
 
+from src.core.runtime.proxy_queue import ProxyFatalError
+
 if TYPE_CHECKING:
     from src.mangabuff.session import BotSession
     from src.core.runtime.core_service import CoreService
@@ -153,6 +155,11 @@ class Account:
                 self.repo.sessions,
                 self.account_id,
                 on_auth_success=on_auth_success,
+                # Миттєва реакція на фатальну поломку проксі — і під час
+                # реєстрації/логіну (login/check_auth нижче), і пізніше під
+                # час звичайної роботи (mining, quiz, reader тощо), бо
+                # BotSession/BotHttpClient живуть увесь час підключення.
+                on_proxy_fatal=self.mark_dead,
             )
 
             if self.bot_config.network.proxy:
@@ -178,6 +185,14 @@ class Account:
             set_http_logger(get_account_logger(self.account_id))
             self._log.info("✅ Підключено")
             return True
+        except ProxyFatalError as e:
+            # on_proxy_fatal (self.mark_dead) вже спрацював у BotHttpClient
+            # у момент виникнення помилки — цей except лише підстраховка на
+            # випадок, якщо ProxyFatalError прийшла раніше, ніж колбек встиг
+            # відпрацювати (напр. подія з ще не повністю ініціалізованої
+            # сесії). status лишається DEAD незалежно від шляху.
+            self.mark_dead(f"Проксі непрацездатне: {e.detail}")
+            return False
         except PermissionError:
             return self._fail("Авторизація провалилась")
         except Exception as e:
@@ -208,6 +223,11 @@ class Account:
         self._log.critical(f"💀 {reason}")
 
     def _fail(self, reason: str) -> bool:
+        if self.status == AccountStatus.DEAD:
+            # Акаунт вже позначений мертвим (напр. ProxyFatalError, що
+            # спрацював глибше по стеку, всередині authenticate()) —
+            # ERROR не повинен затирати DEAD. DEAD знімається лише вручну.
+            return False
         self.status = AccountStatus.ERROR
         self.error  = reason
         self._log.error(f"❌ {reason}")

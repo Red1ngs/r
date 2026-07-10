@@ -1,6 +1,3 @@
-
-
-
 from typing import Any, Optional
 
 from src.core.core_account import Account
@@ -9,6 +6,7 @@ from src.core.runtime.profession import BaseProfession, RequestResult
 from src.core.runtime.request_router import RequestContext
 from src.core.runtime.scheduler import EventDrivenScheduler
 from src.mangabuff.mining.inventory import MiningInventory
+from src.mangabuff.session.http_result import FailReason
 
 
 class MiningProfession(BaseProfession):
@@ -126,6 +124,22 @@ class MiningProfession(BaseProfession):
             result = await bot.safe_session.mine_hit(cfg)
 
             if not result.ok:
+                if result.reason == FailReason.LIMIT_EXHAUSTED:
+                    # локальний лічильник ударів розійшовся з реальним станом на сайті (403 «Лимит
+                    # ударов на сегодня исчерпан»). Це не помилка виконання —
+                    # примусово фіксуємо hits_left=0 в інвентарі, щоб
+                    # MiningMonitor коректно зупинив цикл до daily.claimed.
+                    log.warning(
+                        "⚠️ Розбіжність лічильника ударів із сайтом — "
+                        "ліміт на сьогодні вже вичерпано, hits_left=0"
+                    )
+                    inv: MiningInventory = bot.inventory.mining
+                    inv.hits_left = 0
+                    inv.mining_complete = True
+                    return RequestResult.deny(
+                        "Ліміт ударів вичерпано (розбіжність з сайтом)",
+                        data={"hits_left": 0},
+                    )
                 log.warning(f"⚠️ /mining провалився: {result.reason}")
                 return RequestResult.deny(str(result.reason))
 
@@ -271,6 +285,3 @@ class MiningProfession(BaseProfession):
         except Exception as exc:
             log.exception("mining_exchange: критична помилка")
             return RequestResult.deny(f"Помилка обробки обміну руди на діаманти: {exc}")
-        
-        
-    

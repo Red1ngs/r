@@ -50,12 +50,14 @@ core/runtime/proxy_queue.py — черга HTTP-запитів per-proxy з пр
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import logging
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Callable, Coroutine, Dict, Optional, TypeVar
+from urllib.parse import urlparse
 
 T = TypeVar("T")
 
@@ -103,10 +105,65 @@ class CircuitOpenError(Exception):
         )
 
 
+class ProxyFatalError(Exception):
+    """
+    Проксі визнано фатально непрацездатним (а не тимчасово недоступним).
+
+    На відміну від звичайних мережевих помилок (таймаут, розрив з'єднання —
+    ретраються з backoff'ом і circuit breaker'ом), ProxyFatalError означає,
+    що подальші спроби через це проксі безглузді: сам проксі-сервер не
+    приймає з'єднання, не резолвиться, вимагає авторизацію тощо. Піднімається
+    одразу, без retry, і worker переводить circuit breaker у OPEN.
+
+    Caller (BotHttpClient) на цей виняток одразу сигналізує
+    ProxyFatalCallback — типово Account.mark_dead() — щоб акаунт миттєво
+    перейшов у DEAD, ще до того, як звичайна обробка помилок (re-login,
+    FailReason.NETWORK тощо) встигне замаскувати справжню причину.
+    """
+    def __init__(self, key: str, detail: str) -> None:
+        self.key = key
+        self.detail = detail
+        super().__init__(f"[ProxyWorker:{key}] fatal proxy error: {detail}")
+
+
 # Мережеві помилки (curl_cffi/aiohttp тощо) — ретраюємо і рахуємо в circuit breaker.
 # Використовуємо duck-typing замість жорсткої залежності від curl_cffi,
 # щоб цей модуль лишався транспортно-агностичним.
 _NETWORK_EXC_BASES = (asyncio.TimeoutError, ConnectionError, OSError)
+
+# Ознаки того, що зламалось саме ПРОКСІ (а не цільовий сайт) і відновлення
+# неможливе без заміни проксі: невдале резолвлення/з'єднання з самим
+# проксі-сервером, відмова в авторизації на ньому, зірваний CONNECT-тунель.
+# Розпізнаємо за текстом помилки — curl_cffi не завжди дає окремий клас
+# на кожен випадок, а формулювання достатньо стабільні для CURL-помилок.
+_PROXY_FATAL_PATTERNS = (
+    "couldn't resolve proxy",
+    "could not resolve proxy",
+    "couldn't connect to proxy",
+    "could not connect to proxy",
+    "failed to connect to proxy",
+    "proxy connect aborted",
+    "proxy connection failed",
+    "proxy connection refused",
+    "unsupported proxy",
+    "proxy authentication",
+    "407 proxy authentication required",
+    "tunnel connection failed",
+    "socks connect",
+    "socks5",
+    "proxy_ssl",
+)
+
+
+def _is_proxy_fatal_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    if any(pattern in msg for pattern in _PROXY_FATAL_PATTERNS):
+        return True
+    mod = type(exc).__module__
+    name = type(exc).__name__
+    if "curl_cffi" in mod and "Proxy" in name:
+        return True
+    return False
 
 
 def _is_network_error(exc: BaseException) -> bool:
@@ -190,6 +247,15 @@ class _CircuitBreaker:
     @property
     def is_probe_slot(self) -> bool:
         return self._state == _CircuitState.HALF_OPEN
+
+    def force_open(self) -> None:
+        """
+        Негайно відкриває circuit — проксі визнано фатально непрацездатним
+        (ProxyFatalError), а не просто тимчасово недоступним. Наступні
+        завдання цього воркера швидко відмовляються, поки хтось (оператор)
+        не замінить проксі і не перепідключить акаунт.
+        """
+        self._open(escalate=False)
 
 
 _SENTINEL_PRIORITY = -1000  # завжди попереду всього — для швидкого shutdown
@@ -389,6 +455,18 @@ class _ProxyWorker:
                 return
 
             except Exception as exc:
+                if _is_proxy_fatal_error(exc):
+                    # Проксі фатально непрацездатне — ретраї безглузді.
+                    # Одразу відкриваємо circuit і піднімаємо ProxyFatalError,
+                    # щоб BotHttpClient міг миттєво позначити акаунт DEAD.
+                    self._circuit.force_open()
+                    log.error(
+                        f"[ProxyWorker:{self._key}] FATAL proxy error on {label!r}: {exc}"
+                    )
+                    if not task.future.done():
+                        task.future.set_exception(ProxyFatalError(self._key, str(exc)))
+                    return
+
                 if _is_network_error(exc):
                     just_opened = self._circuit.record_failure()
                     log.warning(
@@ -425,6 +503,30 @@ class ProxyQueueManager:
         self._workers: Dict[str, _ProxyWorker] = {}
 
     def _key(self, proxy: Optional[str]) -> str:
+        """
+        Обчислює ключ воркера для проксі.
+
+        КРИТИЧНО: ключ повинен однозначно ідентифікувати САМЕ ПРОКСІ
+        (реальний вихідний IP), а не просто мережеву адресу шлюзу.
+
+        У ротаційних проксі-провайдерів (Bright Data, IPRoyal, SOAX,
+        Oxylabs тощо) усі акаунти зазвичай ходять через ОДИН і той самий
+        host:port (шлюз), а РЕАЛЬНИЙ вихідний IP/сесію визначають саме
+        user:pass у самому proxy-рядку (напр. session-id закодований у
+        username). Якщо будувати ключ лише з host:port — два різні акаунти
+        з різними сесіями (різними реальними проксі) фізично зіллються в
+        ОДИН воркер: серіалізуються один за одним, ділять один і той самий
+        circuit breaker (поламана сесія одного акаунта відкриває circuit і
+        миттєво фейлить запити зовсім іншого, здорового акаунта) — це і
+        є причина «акаунти потрапляють не в ту чергу».
+
+        Тому ключ = людинозрозумілий префікс (scheme://host:port, лише для
+        зручності читання логів) + fingerprint (короткий sha1) від ПОВНОГО
+        сирого рядка проксі (включно з credentials). Однакові рядки проксі
+        завжди дають однаковий ключ (навмисне спільне проксі коректно
+        серіалізується), а будь-яка відмінність у рядку — гарантовано інший
+        ключ. Пароль у відкритому вигляді в лог/ключ не потрапляє.
+        """
         if not proxy:
             return _NO_PROXY_KEY
 
@@ -432,18 +534,22 @@ class ProxyQueueManager:
         if not proxy_str:
             return _NO_PROXY_KEY
 
+        fingerprint = hashlib.sha1(proxy_str.encode("utf-8")).hexdigest()[:10]
+
         try:
-            from urllib.parse import urlparse
-            if "://" not in proxy_str:
-                proxy_str = f"http://{proxy_str}"
-            p = urlparse(proxy_str)
+            normalized = proxy_str if "://" in proxy_str else f"http://{proxy_str}"
+            p = urlparse(normalized)
             host = p.hostname or ""
             if not host:
-                return proxy_str
+                # Не вдалось витягти host — не намагаємось нормалізувати
+                # далі: fingerprint сирого рядка вже гарантує унікальність.
+                return f"raw#{fingerprint}"
             port = f":{p.port}" if p.port else ""
-            return f"{p.scheme.lower()}://{host.lower()}{port}"
+            prefix = f"{p.scheme.lower()}://{host.lower()}{port}"
         except Exception:
-            return proxy_str
+            return f"raw#{fingerprint}"
+
+        return f"{prefix}#{fingerprint}"
 
     def ensure(self, proxy: Optional[str]) -> _ProxyWorker:
         key = self._key(proxy)

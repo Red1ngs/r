@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Awaitable, Callable, Generic, Literal, Optional, TypeVar, ParamSpec, Concatenate, cast
 
+from src.core.runtime.proxy_queue import ProxyFatalError
 from src.utils.logging import get_logger as log
 
 
@@ -24,12 +25,17 @@ HttpMethodStr = Literal["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
 
 
 class FailReason(Enum):
-    NETWORK   = auto()   # таймаут, з'єднання відхилено, будь-який виняток
-    AUTH      = auto()   # 419 після retry, PermissionError
-    NOT_FOUND = auto()   # 404
-    SERVER    = auto()   # 5xx або неочікуваний статус
-    BAD_DATA  = auto()   # 200, але тіло порожнє або не те що очікували
-    DENIED    = auto()   # сервер явно відмовив (403, success=false тощо)
+    NETWORK        = auto()   # таймаут, з'єднання відхилено, будь-який виняток
+    AUTH           = auto()   # 419 після retry, PermissionError
+    NOT_FOUND      = auto()   # 404
+    SERVER         = auto()   # 5xx або неочікуваний статус
+    BAD_DATA       = auto()   # 200, але тіло порожнє або не те що очікували
+    DENIED         = auto()   # сервер явно відмовив (403, success=false тощо)
+    LIMIT_EXHAUSTED = auto()  # 403 «ліміт на сьогодні вичерпано» — не помилка,
+                               # а розбіжність з реальним станом на сайті;
+                               # caller фіксує лічильник (напр. hits_left=0)
+    PROXY_FATAL    = auto()   # проксі фатально непрацездатне (ProxyFatalError);
+                               # акаунт вже позначено DEAD на момент повернення
 
 
 @dataclass(frozen=True)
@@ -71,9 +77,15 @@ def http_success_none() -> "HttpResult[T]":
     return cast("HttpResult[T]", HttpResult(ok=True, data=None))
 
 
-def http_fail(reason: FailReason) -> HttpResult[Any]:
-    """Створює невдалий HttpResult."""
-    return HttpResult(ok=False, reason=reason)
+def http_fail(reason: FailReason, data: Optional[Any] = None) -> HttpResult[Any]:
+    """
+    Створює невдалий HttpResult.
+
+    data — опційний контекст для caller'а навіть при невдачі (напр.
+    LIMIT_EXHAUSTED несе {"hits_left": 0}, щоб інвентар зафіксував реальний
+    стан, а не лишався в застарілому значенні до наступного успішного запиту).
+    """
+    return HttpResult(ok=False, reason=reason, data=data)
 
 
 # ── Декоратор ────────────────────────────────────────────────────────────────
@@ -90,6 +102,13 @@ def http_call(
     async def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> HttpResult[R]:
         try:
             return await func(self, *args, **kwargs)
+        except ProxyFatalError as e:
+            # BotHttpClient._handle_proxy_fatal() вже сигналізував
+            # on_proxy_fatal (Account.mark_dead) до того, як цей виняток
+            # дійшов сюди — акаунт вже DEAD. Тут лише гасимо виняток у
+            # звичний HttpResult, щоб профессії не падали з traceback.
+            log().critical(f"  → {func.__name__}: проксі фатально непрацездатне: {e.detail}")
+            return http_fail(FailReason.PROXY_FATAL)
         except PermissionError:
             log().error(f"  → {func.__name__}: auth error")
             return http_fail(FailReason.AUTH)

@@ -43,7 +43,7 @@ from src.mangabuff.session.socket.bot_socket import BotSocket
 from src.mangabuff.session.http_client import BotHttpClient
 from src.mangabuff.session.http_result import HttpResult, FailReason, http_call, http_success, http_fail, http_success_none
 from src.mangabuff.session.socket.message_socket import MessageSocket
-from src.mangabuff.session.request_headers import RequestHeaders, AuthSuccessCallback
+from src.mangabuff.session.request_headers import RequestHeaders, AuthSuccessCallback, ProxyFatalCallback
 from src.utils.logging import get_logger as log
 
 
@@ -65,6 +65,7 @@ class BotSession:
         session_repo:    SessionRepository,
         account_id:      str,
         on_auth_success: Optional[AuthSuccessCallback] = None,
+        on_proxy_fatal:  Optional[ProxyFatalCallback]   = None,
         max_tabs:        int = BotSocket.DEFAULT_MAX_TABS,
     ) -> None:
         self._headers = RequestHeaders(bot_config)
@@ -75,6 +76,7 @@ class BotSession:
             session_repo=session_repo,
             account_id=account_id,
             headers=self._headers,
+            on_proxy_fatal=on_proxy_fatal,
         )
         self.socket = BotSocket(max_tabs=max_tabs)
         self.msg    = MessageSocket()
@@ -428,6 +430,11 @@ class BotSession:
         log().warning(f"  → mine: {r.status_code}")
         return http_fail(FailReason.SERVER)
 
+    # Текст повідомлення сервера, коли реальний ліміт ударів на сьогодні вже
+    # вичерпано, але локальний інвентар (через рідкісну розбіжність з
+    # сайтом) ще вважає, що удари лишились.
+    _HITS_LIMIT_EXHAUSTED_MESSAGE = "Лимит ударов на сегодня исчерпан"
+
     @http_call
     async def mine_hit(self, mining: MiningCfg) -> HttpResult[dict[str, int]]:
         url  = mining.urls.hit
@@ -435,6 +442,22 @@ class BotSession:
         r = await self.post(url, room, priority=Priority.NORMAL, timeout=15)
         if r.status_code == 200:
             return http_success(self.http.json_body(r))
+
+        if r.status_code == 403:
+            body = self.http.json_body(r) if r.content else {}
+            message = body.get("message", "") if isinstance(body, dict) else ""
+            if message == self._HITS_LIMIT_EXHAUSTED_MESSAGE:
+                # Рідкісна розбіжність: локальний лічильник ударів не
+                # збігається з реальним станом на сайті. Це не збій —
+                # фіксуємо ліміт як вичерпаний, а не ретраїмо/падаємо.
+                log().warning(
+                    f"  → mine_hit: 403 {message!r} — розбіжність лічильника, "
+                    f"примусово встановлюємо hits_left=0"
+                )
+                return http_fail(FailReason.LIMIT_EXHAUSTED, data={"hits_left": 0})
+            log().warning(f"  → mine_hit: 403 {message!r}")
+            return http_fail(FailReason.DENIED)
+
         log().warning(f"  → mine_hit: {r.status_code}")
         return http_fail(FailReason.SERVER)
     

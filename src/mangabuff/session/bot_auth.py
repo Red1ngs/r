@@ -35,7 +35,7 @@ from __future__ import annotations
 from typing import Optional
 
 from src.core.config.bot import BotConfig
-from src.core.runtime.proxy_queue import Priority
+from src.core.runtime.proxy_queue import Priority, ProxyFatalError
 from src.database.repository.session import SessionRepository
 from src.mangabuff.parser import parse_main_page
 from src.mangabuff.session.socket.bot_socket import BotSocket, HOME_ROOM
@@ -143,6 +143,11 @@ class BotAuth:
 
             log().info(f"  → check_auth ok (user_id={user_id})")
             return True
+        except ProxyFatalError:
+            # BotHttpClient вже сигналізував on_proxy_fatal (акаунт DEAD) —
+            # тут лише не гасимо помилку до звичайного "логін не вдався",
+            # щоб не запускати марні повторні спроби через мертве проксі.
+            raise
         except Exception as e:
             log().error(f"  → check_auth: {e}")
             return False
@@ -164,6 +169,8 @@ class BotAuth:
             if xsrf := self._http.get_xsrf_cookie():
                 self.headers.xsrf_token = xsrf
             return True
+        except ProxyFatalError:
+            raise
         except Exception as e:
             log().error(f"  → _fetch_csrf: {e}")
             return False
@@ -190,6 +197,8 @@ class BotAuth:
             if not ok:
                 log().warning("  → login POST ok але check_auth провалився")
             return ok
+        except ProxyFatalError:
+            raise
         except Exception as e:
             log().error(f"  → _submit_login: {e}")
             return False

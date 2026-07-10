@@ -29,10 +29,10 @@ from urllib.parse import unquote
 from curl_cffi.requests import AsyncSession, Response
 
 from src.core.config.bot import BotConfig
-from src.core.runtime.proxy_queue import proxy_queue_manager, RateLimitedError, Priority
+from src.core.runtime.proxy_queue import proxy_queue_manager, RateLimitedError, ProxyFatalError, Priority
 from src.database.repository.session import SessionRepository
 from src.mangabuff.session.http_result import HttpMethodStr
-from src.mangabuff.session.request_headers import RequestHeaders, ReauthCallback
+from src.mangabuff.session.request_headers import RequestHeaders, ReauthCallback, ProxyFatalCallback
 from src.utils.logging import log_request_curl, log_response_curl, log_payload_curl
 from src.utils.logging import get_logger as log
 
@@ -49,20 +49,42 @@ class BotHttpClient:
         session_repo:     SessionRepository,
         account_id:       str,
         headers:          RequestHeaders,
-        on_reauth_needed: Optional[ReauthCallback] = None,
+        on_reauth_needed: Optional[ReauthCallback]     = None,
+        on_proxy_fatal:   Optional[ProxyFatalCallback]  = None,
     ) -> None:
         self.bot_config        = bot_config
         self.session_repo      = session_repo
         self.account_id        = account_id
         self.headers           = headers
-        self._client:           Optional[AsyncSession]   = None
-        self._on_reauth_needed: Optional[ReauthCallback] = on_reauth_needed
+        self._client:           Optional[AsyncSession]       = None
+        self._on_reauth_needed: Optional[ReauthCallback]     = on_reauth_needed
+        self._on_proxy_fatal:   Optional[ProxyFatalCallback] = on_proxy_fatal
         # Реєстрація воркера відкладена до першого enqueue() — завжди у правильному loop.
         self.recreate_client()
 
     def set_reauth_callback(self, callback: ReauthCallback) -> None:
         """BotAuth викликає це після свого створення — розриває circular init."""
         self._on_reauth_needed = callback
+
+    def set_proxy_fatal_callback(self, callback: ProxyFatalCallback) -> None:
+        """Дозволяє прив'язати колбек вже після створення клієнта (за потреби)."""
+        self._on_proxy_fatal = callback
+
+    def _handle_proxy_fatal(self, exc: "ProxyFatalError") -> None:
+        """
+        Єдина точка реакції на фатальну поломку проксі — незалежно від того,
+        стався це під час логіну/реєстрації (BotAuth) чи під час звичайної
+        бізнес-роботи (mining, quiz, reader тощо). Викликається ДО того, як
+        виняток піде далі по стеку — щоб акаунт гарантовано встиг перейти в
+        DEAD раніше, ніж будь-який зовнішній try/except встигне перетворити
+        цю помилку на звичайний ERROR/retry.
+        """
+        log().critical(f"[{self.account_id}] 💀 Проксі фатально непрацездатне: {exc.detail}")
+        if self._on_proxy_fatal is not None:
+            try:
+                self._on_proxy_fatal(f"Проксі непрацездатне: {exc.detail}")
+            except Exception as cb_exc:
+                log().error(f"[{self.account_id}] on_proxy_fatal callback error: {cb_exc}")
 
     # ── Властивості ───────────────────────────────────────────────────────────
 
@@ -181,12 +203,16 @@ class BotHttpClient:
         log_payload_curl(method, full_url, params=kw.get("params"), data=kw.get("data"), json_body=kw.get("json"))
         t = log_request_curl(method, full_url, kw.get("headers", {}))
         assert self._client is not None
-        r = await proxy_queue_manager.enqueue_coro(
-            proxy=self.bot_config.network.proxy,
-            coro_factory=lambda: self._client.request(method, full_url, **kw),  # type: ignore[union-attr]
-            label=f"{method} {url} ({label})",
-            priority=priority,
-        )
+        try:
+            r = await proxy_queue_manager.enqueue_coro(
+                proxy=self.bot_config.network.proxy,
+                coro_factory=lambda: self._client.request(method, full_url, **kw),  # type: ignore[union-attr]
+                label=f"{method} {url} ({label})",
+                priority=priority,
+            )
+        except ProxyFatalError as exc:
+            self._handle_proxy_fatal(exc)
+            raise
         log_response_curl(r.status_code, full_url, r.content, r.headers.get("content-type", ""), t)
         return r
 
@@ -202,12 +228,16 @@ class BotHttpClient:
 
         log_payload_curl(method, full_url, params=kw.get("params"), data=kw.get("data"), json_body=kw.get("json"))
         t = log_request_curl(method, full_url, kw.get("headers", {}))
-        r = await proxy_queue_manager.enqueue_coro(
-            proxy=self.bot_config.network.proxy,
-            coro_factory=lambda: self._client.request(method, full_url, **kw),  # type: ignore[union-attr]
-            label=f"{method} {url}",
-            priority=priority,
-        )
+        try:
+            r = await proxy_queue_manager.enqueue_coro(
+                proxy=self.bot_config.network.proxy,
+                coro_factory=lambda: self._client.request(method, full_url, **kw),  # type: ignore[union-attr]
+                label=f"{method} {url}",
+                priority=priority,
+            )
+        except ProxyFatalError as exc:
+            self._handle_proxy_fatal(exc)
+            raise
         log_response_curl(r.status_code, full_url, r.content, r.headers.get("content-type", ""), t)
 
         if r.status_code == 419:
