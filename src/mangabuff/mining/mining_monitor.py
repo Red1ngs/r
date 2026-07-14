@@ -354,14 +354,11 @@ class MiningMonitor(LoopingMonitor):
 
     async def _mining_complete(self) -> Optional[bool]:
         scheduler = self.scheduler
-        bot       = self.bot
-
+        bot = self.bot
         inv = bot.inventory.mining
-        
         hits_left = inv.hits_left
         if hits_left is None:
-            return hits_left
-        
+            return None
         if hits_left > 0:
             inv.mining_complete = False
             return False
@@ -374,10 +371,11 @@ class MiningMonitor(LoopingMonitor):
                     {"account_id": self._account_id},
                     source=self._account_id,
                 )
+                await self._persist_inventory(bot)
             return True
         else:
             raise ValueError(f"hits_left не може бути {hits_left}")
-    
+        
     def _update_inventory(self, data: dict[str, Any]) -> None:
         """Оновлює локальний інвентар шахти на основі отриманих від ask() даних."""
         bot = self.bot

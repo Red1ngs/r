@@ -200,6 +200,11 @@ class Account:
 
     async def disconnect(self) -> None:
         if self._session:
+            # Зберегти інвентар
+            try:
+                self.repo.inventory.save(self.account_id, self.inventories)
+            except Exception as e:
+                self._log.warning(f"Failed to save inventory on disconnect: {e}")
             # Даємо CoreService шанс прибрати свої socket-listeners
             # ДО того як session.close() знищить сам socket.
             for svc in self.core_services:
