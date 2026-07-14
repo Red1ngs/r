@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Dict, List, Type
 if TYPE_CHECKING:
     from src.core.runtime.scheduler import EventDrivenScheduler
 
+from src.core.core_account import Account
 from src.core.logging.loggers import get_logger
 
 log = get_logger("core.monitoring")
@@ -105,6 +106,17 @@ class BaseMonitor(ABC):
         scheduler.unsubscribe_owner(self) — не потрібно робити вручну.
         """
         ...
+        
+    async def _persist_inventory(self, bot: "Account") -> None:
+        """Негайне асинхронне збереження інвентарю."""
+        try:
+            if bot.repo and bot.repo.inventory:
+               bot.repo.inventory.save(bot.account_id, bot.inventory)
+        except Exception as exc:
+            get_logger("core.monitoring").warning(
+                f"[{bot.account_id}] immediate inventory persist failed: {exc}"
+            )
+
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} id={self.monitor_id!r}>"

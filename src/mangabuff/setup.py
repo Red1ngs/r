@@ -33,7 +33,7 @@ from src.mangabuff.manga_load.catalog_loader import CatalogLoaderProfession
 from src.mangabuff.reader.reader import ReaderProfession
 from src.mangabuff.daily.daily_monitor import DailyMonitor
 from src.mangabuff.daily.build import DailyProfession
-from src.mangabuff.quiz.build import QuizProfession
+from src.mangabuff.quiz.quiz import QuizProfession
 from src.mangabuff.mining.mining import MiningProfession
 
 # CoreService

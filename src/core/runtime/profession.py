@@ -131,6 +131,18 @@ class BaseProfession(ABC):
         """
         return True
 
+    def _persist_inventory(self, bot: "Account") -> None:
+        """
+        Негайно зберігає поточний інвентар акаунта в БД.
+        Використовується для критичних змін стану, які мають бути
+        відновлені навіть якщо процес зупиниться під час наступного кроку.
+        """
+        try:
+            if getattr(bot, "repo", None) is not None and getattr(bot.repo, "inventory", None) is not None:
+                bot.repo.inventory.save(bot.account_id, bot.inventory)  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - defensive path
+            log.warning(f"[{self.profession_id}] immediate inventory persist failed: {exc}")
+
     # ── Repr ──────────────────────────────────────────────────────────────────
 
     def __repr__(self) -> str:

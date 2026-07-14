@@ -53,7 +53,7 @@ daily:
 quiz:
   mode:         "daily"
   answer_limit: 10
-  answer_delay: 6.0
+  answer_delay: 12
 
 mining:
   delay: 2.0

@@ -116,7 +116,8 @@ class QuizInventory(BaseInventory):
     @property
     def answers_today(self) -> int:
         """Правильних за сьогодні (daily-режим)."""
-        return int(self.data.get("answers_today", 0))
+        answers_today = self.data.get("answers_today")
+        return int(answers_today) if answers_today is not None else 0
 
     @answers_today.setter
     def answers_today(self, value: int) -> None:
@@ -132,9 +133,11 @@ class QuizInventory(BaseInventory):
         self.data["answers_done"] = value
 
     @property
-    def answers_reset_date(self) -> Optional[str]:
+    def answers_reset_date(self) -> str:
         """Дата скидання answers_today ("YYYY-MM-DD" UTC)."""
-        return self.data.get("answers_reset_date")
+        answers_reset_date = self.data.get("answers_reset_date")
+        assert answers_reset_date is not None, "answers_reset_date не ініціалізовано"
+        return answers_reset_date
 
     @answers_reset_date.setter
     def answers_reset_date(self, value: str) -> None:

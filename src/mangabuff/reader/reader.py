@@ -24,6 +24,7 @@ mangabuff/reader/reader.py — ReaderProfession.
 """
 from __future__ import annotations
 
+from logging import Logger
 from typing import TYPE_CHECKING, Any, Optional
 
 from src.core.runtime.profession import BaseProfession, RequestResult
@@ -79,26 +80,46 @@ class ReaderProfession(BaseProfession):
         data:   dict[str, Any],
         ctx:    "RequestContext",
     ) -> RequestResult:
-        if intent == "do_read":
-            return await self._handle_do_read(data, ctx)
-        if intent == "account_reward":
-            return await self._handle_account_reward(data, ctx)
-        if intent == "claim_candy":
-            return await self._handle_claim_candy(data, ctx)
-        if intent == "get_state":
-            return await self._handle_get_state(ctx)
-        if intent == "set_reading_params":
-            return await self._handle_set_reading_params(data, ctx)
-        if intent == "mark_read":
-            return await self._handle_mark_read(data, ctx)
-        return RequestResult.deny(f"unknown intent: {intent!r}")
+        log = get_account_logger(self._account_id)
+        try:
+            if self._scheduler is None:
+                raise ValueError("Scheduler не доступний")
+            
+            if ctx.account_id != self._account_id:
+                raise ValueError(
+                    f"account_id {ctx.account_id} не збігається з {self._account_id}"
+                )
+            
+            shelduler = self._scheduler
+            bot = self._scheduler.get_bot(self._account_id)
+            if bot is None:
+                raise ValueError(f"Бот для акаунта {self._account_id} не знайдений")
+            
+            if intent == "do_read":
+                return await self._handle_do_read(data, shelduler, bot, log)
+            if intent == "account_reward":
+                return await self._handle_account_reward(data, bot, log)
+            if intent == "claim_candy":
+                return await self._handle_claim_candy(data, bot)
+            if intent == "get_state":
+                return await self._handle_get_state(bot)
+            if intent == "set_reading_params":
+                return await self._handle_set_reading_params(data, bot, log)
+            if intent == "mark_read":
+                return await self._handle_mark_read(data, shelduler, bot, log)
+            return RequestResult.deny(f"unknown intent: {intent!r}")
+        except Exception as exc:
+            log.exception(f"{intent}: критична помилка")
+            return RequestResult.deny(f"Помилка {intent} : {exc}")
 
     # ── do_read ───────────────────────────────────────────────────────────────
 
     async def _handle_do_read(
         self,
         data: dict[str, Any],
-        ctx:  "RequestContext",
+        scheduler: "EventDrivenScheduler",
+        bot: "Account",
+        log: "Logger",
     ) -> RequestResult:
         """
         Один цикл читання.
@@ -112,98 +133,86 @@ class ReaderProfession(BaseProfession):
         include_tags: Optional[list[str]] = data.get("include_tags") or None
         exclude_tags: Optional[list[str]] = data.get("exclude_tags") or None
         active_slot:  Optional[str]       = data.get("active_slot") or None
+        
+        sequence, mangas = bot.repo.chapters.get_chapter_sequence(
+            account_id   = bot.account_id,
+            limit        = limit,
+            include_tags = include_tags,
+            exclude_tags = exclude_tags,
+        )
 
-        log = get_account_logger(self._account_id)
-        try:
-            # 1. Валідація системних об'єктів
-            if self._scheduler is None:
-                raise ValueError("Scheduler не доступний")
-            
-            bot = self._scheduler.get_bot(ctx.account_id)
-            if bot is None:
-                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
-
-            sequence, mangas = bot.repo.chapters.get_chapter_sequence(
-                account_id   = bot.account_id,
-                limit        = limit,
-                include_tags = include_tags,
-                exclude_tags = exclude_tags,
-            )
-
-            if not sequence:
-                log.info("📖 Непрочитаних глав немає → chapters_exhausted")
-                await self._scheduler.emit_event(
-                    "reader.chapters_exhausted",
-                    {"account_id": bot.account_id},
-                    source=bot.account_id,
-                )
-                return RequestResult.approve(data={"read": 0, "mangas": []})
-
-            log.info(f"📖 Знайдено непрочитані глави ({len(sequence)}): {', '.join(mangas)}")
-
-            items = [
-                {"manga_id": ch["manga_id"], "chapter_id": ch["chapter_id"]}
-                for ch in sequence
-            ]
-            last_manga = mangas[-1]
-            self._last_manga_read = last_manga
-            reader_cfg = bot.app_config.reader
-            reward = await bot.safe_session.submit_add_history(items, last_manga, reader_cfg)
-
-            if not reward.ok:
-                log.warning("📖 submit_add_history провалився")
-                return RequestResult.deny("submit_add_history failed")
-
-            reward_data = reward.data or {}
-
-            for ch in sequence:
-                bot.repo.chapters.mark_chapter_read(bot.account_id, int(ch["chapter_id"]))
-
-            reward_str = f" | нагорода: {reward_data}" if reward_data else ""
-            log.info(f"📖 Прочитано {len(sequence)} глав: {', '.join(mangas)}{reward_str}")
-
-            # Без reward — списуємо глави прямо тут (auto-save захопить при approve)
-            chapters_spent_new: Optional[int] = None
-            if active_slot and not reward_data:
-                inv: ReaderInventory = bot.inventory.reader
-                chapters_spent_new = inv.add_slot_chapters_spent(active_slot, len(sequence))
-
-            await self._scheduler.emit_event(
-                "reader.chapters_read",
-                {"account_id": bot.account_id, "count": len(sequence), "mangas": mangas},
+        if not sequence:
+            log.info("📖 Непрочитаних глав немає → chapters_exhausted")
+            await scheduler.emit_event(
+                "reader.chapters_exhausted",
+                {"account_id": bot.account_id},
                 source=bot.account_id,
             )
-            if reward_data:
-                # Монітор підхопить і зробить ask("account_reward") →
-                # списання глав відбудеться там, теж під auto-save
-                await self._scheduler.emit_event(
-                    "reader.reward_received",
-                    {
-                        "account_id":    bot.account_id,
-                        "reward":        reward_data,
-                        "chapters_read": len(sequence),
-                        "active_slot":   active_slot,
-                    },
-                    source=bot.account_id,
-                )
+            return RequestResult.approve(data={"read": 0, "mangas": []})
 
-            return RequestResult.approve(data={
-                "read":                len(sequence),
-                "mangas":              mangas,
-                "reward":              reward_data,
-                "active_slot":         active_slot,
-                "slot_chapters_spent": chapters_spent_new,  # None якщо reward
-            })
-        except Exception as exc:
-            log.exception("do_read: критична помилка")
-            return RequestResult.deny(f"Помилка при читанні: {exc}")
+        log.info(f"📖 Знайдено непрочитані глави ({len(sequence)}): {', '.join(mangas)}")
+
+        items = [
+            {"manga_id": ch["manga_id"], "chapter_id": ch["chapter_id"]}
+            for ch in sequence
+        ]
+        last_manga = mangas[-1]
+        self._last_manga_read = last_manga
+        reader_cfg = bot.app_config.reader
+        reward = await bot.safe_session.submit_add_history(items, last_manga, reader_cfg)
+
+        if not reward.ok:
+            log.warning("📖 submit_add_history провалився")
+            return RequestResult.deny("submit_add_history failed")
+
+        reward_data = reward.data or {}
+
+        for ch in sequence:
+            bot.repo.chapters.mark_chapter_read(bot.account_id, int(ch["chapter_id"]))
+
+        reward_str = f" | нагорода: {reward_data}" if reward_data else ""
+        log.info(f"📖 Прочитано {len(sequence)} глав: {', '.join(mangas)}{reward_str}")
+
+        # Без reward — списуємо глави прямо тут (auto-save захопить при approve)
+        chapters_spent_new: Optional[int] = None
+        if active_slot and not reward_data:
+            inv: ReaderInventory = bot.inventory.reader
+            chapters_spent_new = inv.add_slot_chapters_spent(active_slot, len(sequence))
+
+        await scheduler.emit_event(
+            "reader.chapters_read",
+            {"account_id": bot.account_id, "count": len(sequence), "mangas": mangas},
+            source=bot.account_id,
+        )
+        if reward_data:
+            # Монітор підхопить і зробить ask("account_reward") →
+            # списання глав відбудеться там, теж під auto-save
+            await scheduler.emit_event(
+                "reader.reward_received",
+                {
+                    "account_id":    bot.account_id,
+                    "reward":        reward_data,
+                    "chapters_read": len(sequence),
+                    "active_slot":   active_slot,
+                },
+                source=bot.account_id,
+            )
+
+        return RequestResult.approve(data={
+            "read":                len(sequence),
+            "mangas":              mangas,
+            "reward":              reward_data,
+            "active_slot":         active_slot,
+            "slot_chapters_spent": chapters_spent_new,  # None якщо reward
+        })
 
     # ── account_reward ────────────────────────────────────────────────────────
 
     async def _handle_account_reward(
         self,
         data: dict[str, Any],
-        ctx:  "RequestContext",
+        bot: "Account",
+        log: "Logger",
     ) -> RequestResult:
         """
         Обробляє нагороду що прийшла від сайту.
@@ -222,121 +231,82 @@ class ReaderProfession(BaseProfession):
         """
         reward_data:   dict[str, Any]  = data.get("reward", {})
         chapters_read: int             = int(data.get("chapters_read", 0))
+        
+        cfg = bot.app_config.reader
 
-        log = get_account_logger(self._account_id)
-        try:
-            # 1. Валідація системних об'єктів
-            if self._scheduler is None:
-                raise ValueError("Scheduler не доступний")
-            
-            bot = self._scheduler.get_bot(ctx.account_id)
-            if bot is None:
-                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
-            cfg = bot.app_config.reader
+        slot = cfg.find_slot(reward_data)
+        if slot is None:
+            log.debug(f"[Reader] account_reward: слот не знайдено для {reward_data}")
+            return RequestResult.approve(data={"slot": None})
 
-            slot = cfg.find_slot(reward_data)
-            if slot is None:
-                log.debug(f"[Reader] account_reward: слот не знайдено для {reward_data}")
-                return RequestResult.approve(data={"slot": None})
+        inv: ReaderInventory = bot.inventory.reader
 
-            inv: ReaderInventory = bot.inventory.reader
+        new_count = inv.increment_slot_count(slot.name)
+        log.info(f"[Reader] slot={slot.name!r} count={new_count}/{slot.daily_limit}")
 
-            new_count = inv.increment_slot_count(slot.name)
-            log.info(f"[Reader] slot={slot.name!r} count={new_count}/{slot.daily_limit}")
+        new_spent: int = 0
+        if chapters_read > 0:
+            new_spent = inv.add_slot_chapters_spent(slot.name, chapters_read)
+            cap = slot.max_chapters_per_slot
+            cap_str = f"/{cap}" if cap > 0 else ""
+            log.info(f"[Reader] slot={slot.name!r} chapters_spent={new_spent}{cap_str}")
+        else:
+            new_spent = inv.slot_chapters_spent.get(slot.name, 0)
 
-            new_spent: int = 0
-            if chapters_read > 0:
-                new_spent = inv.add_slot_chapters_spent(slot.name, chapters_read)
-                cap = slot.max_chapters_per_slot
-                cap_str = f"/{cap}" if cap > 0 else ""
-                log.info(f"[Reader] slot={slot.name!r} chapters_spent={new_spent}{cap_str}")
-            else:
-                new_spent = inv.slot_chapters_spent.get(slot.name, 0)
-
-            # Claim candy якщо є токен (через сесію, не через окремий ask)
-            if token := reward_data.get("token"):
-                return RequestResult.approve(data={
-                    "token":     token,
-                    "slot":      slot.name,
-                    "new_count": new_count,
-                    "new_spent": new_spent,
-                    "cap":       slot.max_chapters_per_slot,
-                    "daily_limit": slot.daily_limit,
-                })
-
+        # Claim candy якщо є токен (через сесію, не через окремий ask)
+        if token := reward_data.get("token"):
             return RequestResult.approve(data={
+                "token":     token,
                 "slot":      slot.name,
                 "new_count": new_count,
                 "new_spent": new_spent,
                 "cap":       slot.max_chapters_per_slot,
                 "daily_limit": slot.daily_limit,
             })
-            
-        except Exception as exc:
-            log.exception("handle_reward: критична помилка")
-            return RequestResult.deny(f"Помилка при зборі нагороди: {exc}")
+
+        return RequestResult.approve(data={
+            "slot":      slot.name,
+            "new_count": new_count,
+            "new_spent": new_spent,
+            "cap":       slot.max_chapters_per_slot,
+            "daily_limit": slot.daily_limit,
+        })
 
     # ── claim_candy ───────────────────────────────────────────────────────────
 
     async def _handle_claim_candy(
         self,
         data: dict[str, Any],
-        ctx:  "RequestContext",
+        bot: "Account",
     ) -> RequestResult:
         token: str = data.get("token", "")
-        log = get_account_logger(self._account_id)
-        try:
-            # 1. Валідація системних об'єктів
-            if self._scheduler is None:
-                raise ValueError("Scheduler не доступний")
             
-            bot = self._scheduler.get_bot(ctx.account_id)
+        if not token:
+            raise ValueError("token обов'язковий")
             
-            if bot is None:
-                raise ValueError(f"Бот для акаунта {ctx.account_id} не знайдений")
+        reader_cfg = bot.app_config.reader
+        last_manga_read = self._last_manga_read
             
-            if not token:
-                raise ValueError("token обов'язковий")
-            
-            reader_cfg = bot.app_config.reader
-            last_manga_read = self._last_manga_read
-            
-            reward = await bot.safe_session.claim_candy(
-                token, last_manga_read, reader_cfg
-            )
-            if not reward.ok:
-                return RequestResult.deny("claim_candy провалився")
-            return RequestResult.approve(data={"reward": reward.data})
-        except Exception as exc:
-            log.exception("claim_candy: критична помилка")
-            return RequestResult.deny(f"Помилка при зборі цукерки: {exc}")
+        reward = await bot.safe_session.claim_candy(
+            token, last_manga_read, reader_cfg
+        )
+        if not reward.ok:
+            return RequestResult.deny("claim_candy провалився")
+        return RequestResult.approve(data={"reward": reward.data})
 
     # ── get_state ─────────────────────────────────────────────────────────────
 
-    async def _handle_get_state(self, ctx: "RequestContext") -> RequestResult:
-        log = get_account_logger(self._account_id)
-        try:
-            # 1. Валідація системних об'єктів
-            if self._scheduler is None:
-                raise ValueError("Scheduler не доступний")
-            
-            bot = self._scheduler.get_bot(ctx.account_id)
-            
-            if bot is None:
-                raise ValueError("bot не доступний")
-            
-            inv = bot.inventory.reader
-            return RequestResult.approve(data={"reading_params": inv.reading_params})
-        except Exception as exc:
-            log.exception("claim_candy: критична помилка")
-            return RequestResult.deny(f"Помилка при зборі цукерки: {exc}")
+    async def _handle_get_state(self, bot: "Account") -> RequestResult:
+        inv = bot.inventory.reader
+        return RequestResult.approve(data={"reading_params": inv.reading_params})
 
     # ── set_reading_params ────────────────────────────────────────────────────
 
     async def _handle_set_reading_params(
         self,
         data: dict[str, Any],
-        ctx:  "RequestContext",
+        bot: "Account",
+        log: "Logger",
     ) -> RequestResult:
         from src.mangabuff.reader.reading_monitor import ReadingParams
 
@@ -345,70 +315,42 @@ class ReaderProfession(BaseProfession):
             include_tags = data.get("include_tags") or None,
             exclude_tags = data.get("exclude_tags") or None,
         )
-        
-        log = get_account_logger(self._account_id)
-        try:
-            # 1. Валідація системних об'єктів
-            if self._scheduler is None:
-                raise ValueError("Scheduler не доступний")
             
-            bot = self._scheduler.get_bot(ctx.account_id)
-            
-            if bot is None:
-                raise ValueError("bot не доступний")
-            
-            inv: ReaderInventory = bot.inventory.reader
-            inv.data["reading_params"] = params.to_dict()
+        inv: ReaderInventory = bot.inventory.reader
+        inv.data["reading_params"] = params.to_dict()
 
-            get_account_logger(ctx.account_id).info(
-                f"[Reader] reading_params оновлено → {params}"
-            )
-            return RequestResult.approve(data={"reading_params": params.to_dict()})
-        except Exception as exc:
-            log.exception("set_reading_params: критична помилка")
-            return RequestResult.deny(f"Помилка при установці параметрів читання: {exc}")
+        log.info(
+            f"[Reader] reading_params оновлено → {params}"
+        )
+        return RequestResult.approve(data={"reading_params": params.to_dict()})
 
     # ── mark_read ─────────────────────────────────────────────────────────────
 
     async def _handle_mark_read(
         self,
         data: dict[str, Any],
-        ctx:  "RequestContext",
+        scheduler: "EventDrivenScheduler",
+        bot: "Account",
+        log: "Logger",
     ) -> RequestResult:
-        log = get_account_logger(self._account_id)
-        try:
-            # 1. Валідація системних об'єктів
-            if self._scheduler is None:
-                raise ValueError("Scheduler не доступний")
-            
-            bot = self._scheduler.get_bot(ctx.account_id)
-            
-            if bot is None:
-                raise ValueError("bot не доступний")
-            
-            targets: list[str] = data.get("targets", [])
-            log = get_account_logger(ctx.account_id)
+        targets: list[str] = data.get("targets", [])
 
-            if not targets:
-                return RequestResult.deny("targets (список translit_name) обов'язковий")
+        if not targets:
+            return RequestResult.deny("targets (список translit_name) обов'язковий")
 
-            valid: list[str] = []
-            for name in targets:
-                if bot.repo.mangas.get_by_translit_name(name) is None:
-                    log.warning(f"mark_read: manga {name!r} не знайдено — пропускаємо")
-                else:
-                    valid.append(name)
+        valid: list[str] = []
+        for name in targets:
+            if bot.repo.mangas.get_by_translit_name(name) is None:
+                log.warning(f"mark_read: manga {name!r} не знайдено — пропускаємо")
+            else:
+                valid.append(name)
 
-            if not valid:
-                return RequestResult.approve(data={"marked": 0, "mangas": []})
+        if not valid:
+            return RequestResult.approve(data={"marked": 0, "mangas": []})
 
-            total = bot.repo.chapters.mark_mangas_read(
-                account_id     = ctx.account_id,
-                translit_names = valid,
-            )
-            log.info(f"mark_read: {total} глав позначено для {valid}")
-            return RequestResult.approve(data={"marked": total, "mangas": valid})
-
-        except Exception as exc:
-            log.exception("mark_read: помилка")
-            return RequestResult.deny(str(exc))
+        total = bot.repo.chapters.mark_mangas_read(
+            account_id     = self._account_id,
+            translit_names = valid,
+        )
+        log.info(f"mark_read: {total} глав позначено для {valid}")
+        return RequestResult.approve(data={"marked": total, "mangas": valid})

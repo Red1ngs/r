@@ -150,25 +150,37 @@ def parse_power_card(soup: BeautifulSoup) -> tuple[Optional[int], bool]:
     return cost, is_bought
 
 
-def parse_exchange_info(soup: BeautifulSoup) -> tuple[Optional[int], Optional[int]]:
+def parse_exchange_info(soup: BeautifulSoup) -> Optional[int]:
     """
     Парсить блок обміну руди на алмази.
-    Повертає (кількість_руди_що_спишеться, кількість_алмазів_що_отримаємо).
+    Повертає кількість руди, необхідну для отримання 1 алмаза.
     """
-    card = soup.find('div', class_='mine-shop__card--exchange')
-    if not card:
-        return None, None
+    card_text_element = soup.find("div", class_="mine-shop__card-text")
+    if not card_text_element:
+        return None
 
-    # Отримуємо кількість руди, яка спишеться згідно з поточним вибором
-    ore_elem = card.find('span', class_='mine-shop__exchange-ore')
-    # Отримуємо кількість алмазів, які буде отримано
-    diamonds_elem = card.find('span', class_='mine-shop__exchange-diamonds')
+    text = card_text_element.get_text().strip()  # Отримуємо "100 руды = 1 алмаз"
+    
+    # Регулярний вираз шукає групи цифр перед і після знака "="
+    match = re.search(r"([\d\s]+)[^=]+=\s*([\d\s]+)", text)
+    if not match:
+        return None
 
-    ore_cost = parse_int(ore_elem.text) if ore_elem else None
-    diamonds_get = parse_int(diamonds_elem.text) if diamonds_elem else None
+    try:
+        # Видаляємо можливі пробіли з чисел та перетворюємо в int
+        ore_amount = int(match.group(1).replace(" ", ""))
+        diamonds_amount = int(match.group(2).replace(" ", ""))
+        
+        if diamonds_amount == 0:
+            print("Помилка: кількість алмазів у співвідношенні дорівнює нулю.")
+            return None
+            
+        # Обчислюємо ціну за 1 алмаз за допомогою цілочисельного ділення
+        price_per_diamond = ore_amount // diamonds_amount
+        return price_per_diamond
 
-    return ore_cost, diamonds_get
-
+    except ValueError:
+        return None
 
 def parse_mining_page(html: str) -> dict[str, Any]:
     soup = BeautifulSoup(html, 'html.parser')
@@ -181,7 +193,7 @@ def parse_mining_page(html: str) -> dict[str, Any]:
     upgrade_cost, upgrade_level, upgrade_max = parse_upgrade_card(soup)
     power_cost, power_bought = parse_power_card(soup)
     
-    exchange_ore_cost, exchange_diamonds_get = parse_exchange_info(soup)
+    exchange_diamond_cost = parse_exchange_info(soup)
     
     data: dict[str, Any] = {
         "hits_left": mine_count,
@@ -198,8 +210,7 @@ def parse_mining_page(html: str) -> dict[str, Any]:
         "power_bought": power_bought,
         
         # Дані обміну
-        "exchange_ore_cost": exchange_ore_cost,
-        "exchange_diamonds_get": exchange_diamonds_get
+        "exchange_diamond_cost": exchange_diamond_cost,
     }
     
     return data

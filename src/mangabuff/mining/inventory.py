@@ -111,13 +111,13 @@ class MiningInventory(BaseInventory):
         self.data["power_bought"] = value
         
     @property
-    def exchange_ore_cost(self) -> Optional[int]:
-        value = self.data.get("exchange_ore_cost")
+    def exchange_diamond_cost(self) -> Optional[int]:
+        value = self.data.get("exchange_diamond_cost")
         return int(value) if value is not None else None
 
-    @exchange_ore_cost.setter
-    def exchange_ore_cost(self, value: int) -> None:
-        self.data["exchange_ore_cost"] = int(value)
+    @exchange_diamond_cost.setter
+    def exchange_diamond_cost(self, value: int) -> None:
+        self.data["exchange_diamond_cost"] = int(value)
 
     @property
     def exchange_diamonds_get(self) -> Optional[int]:
@@ -136,4 +136,12 @@ class MiningInventory(BaseInventory):
     def mining_params(self, value: dict[str, Any]) -> None:
         self.data["mining_params"] = value
         
-    
+    @property
+    def last_mining_claimed(self) -> Optional[str]:
+        value = self.data.get("last_mining_claimed")
+        return value
+
+    @last_mining_claimed.setter
+    def last_mining_claimed(self, value: str) -> None:
+        self.data["last_mining_claimed"] = value
+        

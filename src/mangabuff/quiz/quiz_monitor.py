@@ -41,17 +41,19 @@ quiz/quiz_monitor.py — QuizMonitor.
 from __future__ import annotations
 
 import asyncio
+from logging import Logger
 from typing import TYPE_CHECKING, Any, Optional
 
-from src.core.monitoring.monitor import BaseMonitor
+from src.core.monitoring.looping_monitor import LoopingMonitor
 from src.core.logging.loggers import get_account_logger
+from src.utils.time import is_next_day
 
 if TYPE_CHECKING:
     from src.core.runtime.scheduler import EventDrivenScheduler
     from src.core.core_account import Account
 
 
-class QuizMonitor(BaseMonitor):
+class QuizMonitor(LoopingMonitor):
     """
     Монітор квіза. Веде цикл open/answer для одного акаунта.
 
@@ -65,11 +67,10 @@ class QuizMonitor(BaseMonitor):
         return "quiz"
 
     def __init__(self) -> None:
+        super().__init__()
         self._account_id: str                              = ""
         self._scheduler:  Optional["EventDrivenScheduler"] = None
         self._bot:        Optional["Account"]              = None
-        self._cycle_task: Optional[asyncio.Task[None]]     = None
-        self._active:     bool                             = True  # False → fixed_done
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -85,43 +86,75 @@ class QuizMonitor(BaseMonitor):
         scheduler.subscribe("daily.claimed",        self._on_daily_claimed)
         scheduler.subscribe("quiz.limit_reached",   self._on_limit_reached)
         scheduler.subscribe("quiz.session_ended",   self._on_session_ended)
+        
+        self._prepare_cycle()
 
         # Відновлення після перезапуску
         if self._bot:
             delay = self._bot.inventory.quiz.answer_delay
         else:
             delay = 1.0
-        self._start_cycle(delay=delay)
+        await self._schedule_next(delay=delay)
 
     async def detach(
         self,
         scheduler:  "EventDrivenScheduler",
         account_id: str,
     ) -> None:
-        self._active = False
-        self._cancel_cycle()
+        self._stop_loop()
         self._scheduler = None
 
     # ── Cycle scheduling ──────────────────────────────────────────────────────
+    #
+    # Власне планування (delay/скасування) винесено у LoopingMonitor.
+    # _run_cycle() нижче лишається бізнес-логікою: один прохід open → answer × N.
 
-    def _start_cycle(self, delay: float = 0.0) -> None:
-        """Запускає новий цикл open/answer через delay секунд."""
-        self._cancel_cycle()
+    def _loop_logger(self) -> Logger:
+        return get_account_logger(self._account_id)
+    
+    async def _interval(self) -> float:
+        """
+        QuizMonitor завжди явно передає delay у _schedule_next()
+        (answer_delay при attach/reset_daily), тому окремого
+        обчислення інтервалу не потрібно. Реалізовано лише щоб
+        _schedule_next() без аргументу не впав на NotImplementedError,
+        а безпечно не планував цикл.
+        """
+        return self._get_answer_delay()
 
-        scheduler = self._scheduler
-        if scheduler is None or not self._active:
-            return
+    def _prepare_cycle(self) -> None:
+        """
+        Перевіряє чи треба скинути лічильник (daily) і логування стану монітора після перезапуску.
+        Викликається при attach()
+        """
+        bot = self._bot
+        
+        if self._scheduler is None:
+            raise ValueError("Scheduler не доступний")
+        
+        if bot is None:
+            raise ValueError("Scheduler не доступний")
+        
+        inv = bot.inventory.quiz 
+        personal = bot.inventory.personal
+        to_day = personal.to_day
+        
+        if inv.mode == "daily" and is_next_day(inv.answers_reset_date, to_day):
+            inv.reset_daily_counter(to_day)
+            inv.session_active   = False
+            inv.current_question = None
+            get_account_logger(self._account_id).info(
+                "Quiz(daily): новий день → лічильник скинуто"
+            )
 
-        async def _run() -> None:
-            await asyncio.sleep(delay)
-            await self._run_cycle()
-
-        self._cycle_task = asyncio.ensure_future(_run())
-
-    def _cancel_cycle(self) -> None:
-        if self._cycle_task and not self._cycle_task.done():
-            self._cycle_task.cancel()
-        self._cycle_task = None
+        get_account_logger(self._account_id).info(
+            f"QuizProfession відновлено: "
+            f"mode={inv.mode!r} "
+            f"counter={inv.current_counter()}/{inv.answer_limit} "
+            f"delay={inv.answer_delay}s "
+            f"session_active={inv.session_active} "
+            f"fixed_done={inv.fixed_done}"
+        )
 
     # ── Cycle logic ───────────────────────────────────────────────────────────
 
@@ -136,18 +169,11 @@ class QuizMonitor(BaseMonitor):
             щоб сервер встиг "охолонути" після попередньої сесії.
         """
         scheduler = self._scheduler
-        if scheduler is None or not self._active:
+        if scheduler is None or not self._loop_enabled:
             return
 
-        log = get_account_logger(self._account_id)
-
-        if self._waiting_for_daily():
-            log.info(
-                "[QuizMonitor] daily ще не зібрано — "
-                "чекаємо daily.claimed (не плануємо наступний цикл)"
-            )
-            return
-
+        log = self._loop_logger()
+        
         if not self._should_run():
             log.debug("[QuizMonitor] _run_cycle: умова запуску не виконана → пропускаємо")
             return
@@ -173,7 +199,7 @@ class QuizMonitor(BaseMonitor):
                 await asyncio.sleep(answer_delay)
 
         # ── Цикл відповідей ────────────────────────────────────────────────────
-        while self._active and self._should_run():
+        while self._loop_enabled and self._should_run():
             inv = self._bot.inventory.quiz if self._bot else None
             if inv is None or not inv.session_active:
                 break
@@ -214,22 +240,24 @@ class QuizMonitor(BaseMonitor):
           - Якщо daily зібрано сьогодні (last_daily_claimed == to_day) → False.
           - Інакше → True.
         """
-        scheduler = self._scheduler
-        if scheduler is None:
-            return False
+        bot = self._bot
 
-        if not scheduler.has_profession(self._account_id, "daily"):
-            return False
-
-        bot = scheduler.get_bot(self._account_id)
+        if self._scheduler is None:
+            raise ValueError("Scheduler не доступний")
+        
         if bot is None:
+            raise ValueError("Account не доступний")
+        
+        if not self._scheduler.has_profession(self._account_id, "daily"):
             return False
-
-        daily_inv = bot.inventory.daily
+        
         personal = bot.inventory.personal
-        to_day = personal.to_day
+        daily = bot.inventory.daily
+        assert daily.last_daily_claimed is not None
+        
+        result = is_next_day(daily.last_daily_claimed, personal.to_day, strictly_tomorrow=False)
 
-        return daily_inv.last_daily_claimed != to_day
+        return result
 
     def _should_run(self) -> bool:
         """
@@ -238,22 +266,30 @@ class QuizMonitor(BaseMonitor):
         daily: ліміт не вичерпано сьогодні і daily вже зібрано
         fixed: fixed_done == False
         """
-        bot = self._bot if self._bot else None
-        inv = bot.inventory.quiz if bot else None
-        personal = bot.inventory.personal if bot else None
+        log = self._loop_logger()
+        bot = self._bot
+
+        if self._scheduler is None:
+            raise ValueError("Scheduler не доступний")
         
-        if inv is None or personal is None:
-            return False
+        if bot is None:
+            raise ValueError("Account не доступний")
+        
+        inv = bot.inventory.quiz
 
         if inv.mode == "fixed":
             return not inv.fixed_done
+        
+        if inv.answer_limit == inv.answers_today:
+            log.info("[QuizMonitor] ліміт відповідей досягнуто → цикл не стартує")
+            return False
 
         # daily — чекаємо поки бонус не зібрано
         if self._waiting_for_daily():
-            return False
-
-        if inv.answers_reset_date != personal.to_day:
-            # Новий день — daily.claimed ще не прийшов, чекаємо
+            log.info(
+                "[QuizMonitor] daily ще не зібрано — "
+                "чекаємо daily.claimed (не плануємо наступний цикл)"
+            )
             return False
         
         return inv.current_counter() < inv.answer_limit
@@ -277,7 +313,7 @@ class QuizMonitor(BaseMonitor):
         if scheduler is None:
             return
 
-        log = get_account_logger(self._account_id)
+        log = self._loop_logger()
         log.info("[QuizMonitor] daily.claimed → ask quiz reset_daily")
 
         result = await scheduler.ask(
@@ -292,11 +328,11 @@ class QuizMonitor(BaseMonitor):
             return
 
         # Якщо старий цикл ще не завершився (спить після 429) —
-        # _start_cycle скасує його через _cancel_cycle(), але новий
+        # _schedule_next скасує його через _cancel_wakeup(), але новий
         # стартує з answer_delay затримкою, щоб не бити в "гарячий" сервер.
         delay = self._get_answer_delay()
         log.info(f"[QuizMonitor] reset_daily approved → стартуємо цикл (delay={delay}s)")
-        self._start_cycle(delay=delay)
+        await self._schedule_next(delay=delay)
 
     async def _on_limit_reached(self, payload: dict[str, Any]) -> None:
         """Ліміт досягнуто → зупиняємо поточний цикл."""
@@ -311,10 +347,12 @@ class QuizMonitor(BaseMonitor):
         )
 
         if mode == "fixed":
-            # fixed_done=True вже виставлено в profession — монітор більше не стартує
-            self._active = False
-
-        self._cancel_cycle()
+            # fixed_done=True вже виставлено в profession — монітор більше
+            # не має планувати нові цикли, навіть якщо щось спробує його
+            # розбудити (напр. запізнілий daily.claimed).
+            self._stop_loop()
+        else:
+            self._cancel_wakeup()
 
     async def _on_session_ended(self, payload: dict[str, Any]) -> None:
         """Сервер скинув сесію (restart) → зупиняємо поточний цикл."""
@@ -324,4 +362,4 @@ class QuizMonitor(BaseMonitor):
         get_account_logger(self._account_id).info(
             "[QuizMonitor] quiz.session_ended → зупиняємо цикл до наступного daily.claimed"
         )
-        self._cancel_cycle()
+        self._cancel_wakeup()

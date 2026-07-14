@@ -39,23 +39,33 @@ class DailyInventory(BaseInventory):
     @can_claim_calendar.setter
     def can_claim_calendar(self, value: bool) -> None:
         self.data["can_claim_calendar"] = value
+        
+    @property
+    def can_claim_daily(self) -> bool:
+        return self.data.get("can_claim_daily", True)
+    
+    @can_claim_daily.setter
+    def can_claim_daily(self, value: bool) -> None:
+        self.data["can_claim_daily"] = value
 
     @property
-    def last_daily_claimed(self) -> str | None:
+    def last_daily_claimed(self) -> str:
         """UTC дата останнього збору звичайного щоденного бонусу."""
-        return self.data.get("last_daily_claimed")
+        last_daily_claimed = self.data.get("last_daily_claimed", "")
+        return last_daily_claimed
 
     @last_daily_claimed.setter
-    def last_daily_claimed(self, value: str | None) -> None:
+    def last_daily_claimed(self, value: str) -> None:
         self.data["last_daily_claimed"] = value
 
     @property
-    def last_calendar_claimed(self) -> str | None:
+    def last_calendar_claimed(self) -> str:
         """UTC дата останнього збору календарного (streak) бонусу."""
-        return self.data.get("last_calendar_claimed")
+        last_calendar_claimed = self.data.get("last_calendar_claimed", "")
+        return last_calendar_claimed
 
     @last_calendar_claimed.setter
-    def last_calendar_claimed(self, value: str | None) -> None:
+    def last_calendar_claimed(self, value: str) -> None:
         self.data["last_calendar_claimed"] = value
 
     def __repr__(self) -> str:

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
 from src.core.config.app import AppConfig
-from src.core.config.bot import AuthConfig, BotConfig, ClientConfig, NetworkConfig
+from src.core.config.bot import AuthConfig, NetworkConfig
 from src.core.runtime.scheduler import EventDrivenScheduler
 from src.core.core_account import Account
 from src.core.runtime.profession import BaseProfession
