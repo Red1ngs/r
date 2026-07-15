@@ -40,6 +40,14 @@ class AccountRepository:
         ).fetchall()
         return [self._to_model(r) for r in rows]
 
+    def get_by_email(self, email: str) -> Optional[AccountRow]:
+        """Знайти акаунт за email."""
+        row = self._conn.execute(
+            "SELECT id, email, professions, updated_at FROM accounts WHERE email = ?",
+            (email,),
+        ).fetchone()
+        return self._to_model(row) if row else None
+
     # ── Writes ────────────────────────────────────────────────────────────────
 
     def upsert(
@@ -48,8 +56,20 @@ class AccountRepository:
         email:       str,
         professions: Optional[list[str]] = None,
     ) -> None:
-        """Створює або оновлює акаунт. professions=None → зберігає наявний список."""
+        """Створює або оновлює акаунт. professions=None → зберігає наявний список.
+        
+        Raises:
+            ValueError: Якщо email вже зайнято іншим аккаунтом.
+        """
         with self._lock:
+            # Перевіримо чи email вже займає інший account
+            existing = self.get_by_email(email)
+            if existing and existing.id != account_id:
+                raise ValueError(
+                    f"Email '{email}' вже зареєстрований для аккаунту '{existing.id}'. "
+                    f"Використайте інший email або видаліть попередній аккаунт."
+                )
+            
             if professions is None:
                 # Не чіпаємо professions якщо не передано явно
                 self._conn.execute(

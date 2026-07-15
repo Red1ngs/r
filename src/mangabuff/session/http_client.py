@@ -49,7 +49,7 @@ class BotHttpClient:
         session_repo:     SessionRepository,
         account_id:       str,
         headers:          RequestHeaders,
-        on_reauth_needed: Optional[ReauthCallback]     = None,
+        on_reauth_needed: Optional[ReauthCallback]      = None,
         on_proxy_fatal:   Optional[ProxyFatalCallback]  = None,
     ) -> None:
         self.bot_config        = bot_config

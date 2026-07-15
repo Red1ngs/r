@@ -82,12 +82,22 @@ async def fsm_wait_id(message: Message, state: FSMContext, svc: SchedulerService
 # ── Крок 2: Email ─────────────────────────────────────────────────────────────
 
 @router.message(AddAccountFSM.wait_email)
-async def fsm_wait_email(message: Message, state: FSMContext) -> None:
+async def fsm_wait_email(message: Message, state: FSMContext, svc: SchedulerService) -> None:
     email = (message.text or "").strip()
     _edit = make_editor(message, await state.get_data())
 
     if "@" not in email:
         await _edit(_TITLE + "❌ Схоже, це не email.\nКрок 2/4: Спробуй ще раз:", cancel_add_kb())
+        return
+
+    # Перевіримо чи email вже використовується
+    existing = svc._repo.accounts.get_by_email(email)
+    if existing:
+        await _edit(
+            _TITLE + f"❌ Email <code>{email}</code> вже використовується аккаунтом <code>{existing.id}</code>.\n\n"
+            "Крок 2/4: Введи інший email:",
+            cancel_add_kb(),
+        )
         return
 
     await state.update_data(email=email)

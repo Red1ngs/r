@@ -314,8 +314,12 @@ class SchedulerService:
     ) -> tuple[bool, str]:
         """Hot-add: зберігає credentials якщо передані, потім всі три кроки."""
         if password:
-            _save_credentials(account_id, password, proxy)
-            self._repo.accounts.upsert(account_id, email, professions=None)
+            try:
+                _save_credentials(account_id, password, proxy)
+                self._repo.accounts.upsert(account_id, email, professions=None)
+            except ValueError as e:
+                # Email вже зайнято іншим аккаунтом
+                return False, str(e)
 
         ok, err = await self._register(account_id, email)
         if not ok:
